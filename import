@@ -1,0 +1,152 @@
+import time
+import logging
+import requests
+import MySQLdb
+import asyncio
+import websockets
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from datetime import datetime
+from dotenv import load_dotenv
+from pytz import timezone
+
+# Load environment variables
+load_dotenv()
+
+# LINE credentials
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+USER_ID = os.getenv('USER_ID')
+
+# Binance credentials
+BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
+BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
+
+# Setup Binance client
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
+# Logging
+logging.basicConfig(filename='btc_purchase_log.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# MySQL
+db = MySQLdb.connect(host="localhost", user="kiriyah", passwd="F25igu@h1Marn", db="btc_dca")
+cursor = db.cursor()
+
+# WebSocket endpoint
+WEBSOCKET_URI = "ws://localhost:8000/ws"
+
+# === WebSocket ===
+async def send_websocket_message(message):
+    try:
+        async with websockets.connect(WEBSOCKET_URI) as websocket:
+            await websocket.send(message)
+    except Exception as e:
+        logging.error(f"WebSocket error: {e}")
+
+# === LINE Notify ===
+def send_line_message(message):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+    }
+    payload = {
+        "to": USER_ID,
+        "messages": [{"type": "text", "text": message}]
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code != 200:
+        logging.error(f"Failed to send message: {response.text}")
+    else:
+        logging.info("Message sent to LINE successfully.")
+
+# === Purchase BTC ===
+def purchase_btc(now):
+    try:
+        cursor.execute("SELECT purchase_amount FROM config WHERE id = 1")
+        purchase_amount = float(cursor.fetchone()[0])
+
+        symbol = 'BTCUSDT'
+        symbol_info = client.get_symbol_info(symbol)
+        min_notional = float([f['minNotional'] for f in symbol_info['filters'] if f['filterType'] == 'NOTIONAL'][0])
+
+        if purchase_amount < min_notional:
+            raise ValueError(f"Amount ({purchase_amount}) less than minimum notional ({min_notional})")
+
+        order = client.order_market_buy(symbol=symbol, quoteOrderQty=purchase_amount)
+
+        filled_price = float(order['fills'][0]['price'])
+        filled_quantity = float(order['fills'][0]['qty'])
+
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        formatted_quantity = f"{filled_quantity:.8f}"
+
+        message = (
+            f"✅ DCA BTC Success\n"
+            f"{current_time} - Purchased {purchase_amount} USDT\n"
+            f"BUY: {formatted_quantity}, BTC Price: ฿{filled_price}\n"
+            f"Order ID: {order['orderId']}"
+        )
+
+        logging.info(message)
+        print(message)
+        send_line_message(message)
+        asyncio.run(send_websocket_message(message))
+
+        cursor.execute("""
+            INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id)
+            VALUES (NOW(), %s, %s, %s, %s)
+        """, (purchase_amount, filled_quantity, filled_price, order['orderId']))
+        db.commit()
+
+    except BinanceAPIException as e:
+        error_message = f"BinanceAPIException: {e.message}"
+        logging.error(error_message)
+        send_line_message(error_message)
+        asyncio.run(send_websocket_message(error_message))
+
+    except ValueError as e:
+        error_message = f"ValueError: {e}"
+        logging.error(error_message)
+        send_line_message(error_message)
+        asyncio.run(send_websocket_message(error_message))
+
+# === Main Scheduler Loop ===
+def run_loop_scheduler():
+    print("⏳ Real-time BTC DCA scheduler started...")
+    last_run_time = None
+
+    while True:
+        try:
+            now = datetime.now(timezone('Asia/Bangkok'))
+            current_day = now.strftime("%A").lower()
+            current_time_str = now.strftime("%H:%M")
+
+            cursor.execute("SELECT schedule_time, schedule_day FROM config WHERE id = 1")
+            schedule_time_raw, schedule_day = cursor.fetchone()
+
+            # รองรับทั้ง str และ datetime.time
+            if isinstance(schedule_time_raw, str):
+                schedule_time_str = schedule_time_raw[:5]
+            else:
+                schedule_time_str = schedule_time_raw.strftime("%H:%M")
+
+            schedule_days = [d.strip().lower() for d in schedule_day.split(",")]
+
+            logging.info(f"[CHECK] Now: {current_day} {current_time_str} | Config: {schedule_days} {schedule_time_str}")
+
+            if current_day in schedule_days and current_time_str == schedule_time_str:
+                if last_run_time != current_time_str:
+                    logging.info(f"⏰ Matched schedule at {current_time_str}, running purchase...")
+                    purchase_btc(now)
+                    last_run_time = current_time_str
+                else:
+                    logging.info("⏳ Already executed for this minute.")
+            time.sleep(30)
+
+        except Exception as e:
+            logging.error(f"Error in scheduler loop: {e}")
+            time.sleep(30)
+
+if __name__ == "__main__":
+    run_loop_scheduler()
+

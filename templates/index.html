@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTC DCA Dashboard</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        h1, h2 {
+            color: #4CAF50;
+            margin: 0 0 10px 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #444;
+        }
+        th {
+            background-color: #1e1e1e;
+        }
+        tr:nth-child(even) {
+            background-color: #2c2c2c;
+        }
+        tr:hover {
+            background-color: #444;
+        }
+        .container {
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .scheduler-status {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .scheduler-status.running {
+            background-color: #2e7d32;
+        }
+        .scheduler-status.error {
+            background-color: #d32f2f;
+        }
+        .form-container {
+            margin-top: 20px;
+            background-color: #1e1e1e;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .form-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            width: 150px;
+            font-weight: bold;
+        }
+        .form-container input,
+        .form-container select {
+            background-color: #2c2c2c;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 8px;
+            font-size: 14px;
+            width: 200px;
+            border-radius: 4px;
+        }
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .checkbox-group label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-weight: normal;
+            width: auto;
+        }
+        .form-container button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .form-container button:hover {
+            background-color: #45a049;
+        }
+        .alert {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .alert-success {
+            background-color: #2e7d32;
+            color: #ffffff;
+        }
+        .alert-error {
+            background-color: #d32f2f;
+            color: #ffffff;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 24px;
+            }
+            .container {
+                padding: 10px;
+            }
+            .scheduler-status {
+                font-size: 14px;
+            }
+            .form-container {
+                padding: 15px;
+            }
+            .form-group {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .form-group label {
+                width: auto;
+            }
+            .form-container input,
+            .form-container select {
+                width: 100%;
+                font-size: 16px;
+            }
+            .form-container button {
+                font-size: 14px;
+                width: 100%;
+            }
+            table {
+                font-size: 14px;
+            }
+            th, td {
+                padding: 8px;
+            }
+            .checkbox-group {
+                flex-direction: column;
+            }
+        }
+
+        @media (max-width: 480px) {
+            h1 {
+                font-size: 20px;
+            }
+            .scheduler-status {
+                font-size: 12px;
+            }
+            .form-container {
+                padding: 10px;
+            }
+            .form-container input,
+            .form-container select {
+                font-size: 14px;
+                padding: 10px;
+            }
+            .form-container button {
+                font-size: 12px;
+                padding: 8px;
+            }
+            table {
+                font-size: 12px;
+            }
+            th, td {
+                padding: 6px;
+            }
+        }
+    </style>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>BTC DCA Dashboard</h1>
+
+        <!-- Scheduler Status -->
+        <div class="scheduler-status" id="scheduler-status">
+            Scheduler Status: <span id="status-text">Checking...</span>
+        </div>
+
+        <!-- Config Display -->
+        <div>
+            <p>Day of Purchase: <strong>{{ config[1] }}</strong></p>
+            <p>Purchase Time: <strong>{{ config[2] }}</strong></p>
+            <p>Amount to Purchase: <strong>{{ config[0] }} USDT</strong></p>
+        </div>
+
+        <!-- Config Form -->
+        <div class="form-container">
+            <h2>Update Purchase Settings</h2>
+            {% if get_flashed_messages() %}
+                {% for message in get_flashed_messages() %}
+                    <div class="alert {% if 'Error' in message %}alert-error{% else %}alert-success{% endif %}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+            <form action="/update" method="POST" onsubmit="return validateForm()">
+                <div class="form-group">
+                    <label for="amount">Amount to Purchase (USDT):</label>
+                    <input type="number" name="amount" id="amount" step="0.01" value="{{ config[0] }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="time">Purchase Time:</label>
+                    <input type="time" name="time" id="time" value="{{ config[2] }}" required>
+                </div>
+                <div class="form-group">
+                    <label>Day of Purchase:</label>
+                    <div class="checkbox-group">
+                        {% set selected_days = config[1].lower().split(',') %}
+                        {% for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] %}
+                            <label>
+                                <input type="checkbox" name="day" value="{{ day.lower() }}"
+                                    {% if day.lower() in selected_days %}checked{% endif %}>
+                                {{ day }}
+                            </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                <button type="submit">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                        <path d="M2 2a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2zm10.03 4.97a.75.75 0 0 1 .011 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 0 1 1.06-1.06L8 9.94l2.97-2.97a.75.75 0 0 1 1.06-.01z"/>
+                    </svg>
+                    Update
+                </button>
+            </form>
+        </div>
+
+        <!-- Purchase History -->
+        <h2>🪙 Real-time BTC Purchase History</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>USDT</th>
+                    <th>BTC</th>
+                    <th>Price</th>
+                    <th>Order ID</th>
+                </tr>
+            </thead>
+            <tbody id="table-body">
+                <tr><td colspan="5">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        function validateForm() {
+            const amount = document.getElementById("amount").value;
+            const time = document.getElementById("time").value;
+            const days = document.querySelectorAll('input[name="day"]:checked');
+
+            if (parseFloat(amount) <= 0) {
+                alert("Please enter a positive amount.");
+                return false;
+            }
+
+            if (!time.match(/^\d{2}:\d{2}$/)) {
+                alert("Please enter a valid time in HH:MM format.");
+                return false;
+            }
+
+            if (days.length === 0) {
+                alert("Please select at least one day.");
+                return false;
+            }
+
+            const oldAmount = "{{ config[0] }}";
+            const oldDay = "{{ config[1] }}";
+            const oldTime = "{{ config[2] }}";
+
+            const newDayArr = Array.from(days).map(el => el.value);
+            const newDay = newDayArr.join(",");
+
+            let message = "You are about to update the settings:\n\n";
+            let hasChange = false;
+
+            if (oldAmount !== amount) {
+                message += `- Amount: ${oldAmount} → ${amount} USDT\n`;
+                hasChange = true;
+            }
+
+            if (oldDay !== newDay) {
+                message += `- Day: ${oldDay} → ${newDay}\n`;
+                hasChange = true;
+            }
+
+            if (oldTime !== time) {
+                message += `- Time: ${oldTime} → ${time}\n`;
+                hasChange = true;
+            }
+
+            if (!hasChange) {
+                message = "No changes detected. Do you want to proceed?";
+            } else {
+                message += "\nDo you want to proceed?";
+            }
+
+            return confirm(message);
+        }
+
+        // Fetch Scheduler Status
+        function fetchSchedulerStatus() {
+            fetch('/scheduler_status')
+                .then(response => response.json())
+                .then(data => {
+                    const statusText = document.getElementById('status-text');
+                    statusText.textContent = data.status;
+                    const statusDiv = document.getElementById('scheduler-status');
+                    statusDiv.className = 'scheduler-status ' + 
+                        (data.status === 'Scheduler is running' ? 'running' : 'error');
+                })
+                .catch(error => {
+                    const statusText = document.getElementById('status-text');
+                    statusText.textContent = 'Scheduler is not responding';
+                    const statusDiv = document.getElementById('scheduler-status');
+                    statusDiv.className = 'scheduler-status error';
+                    console.error('Error fetching scheduler status:', error);
+                });
+        }
+
+        // Initial fetch and periodic update
+        fetchSchedulerStatus();
+        setInterval(fetchSchedulerStatus, 30000);
+
+        // SocketIO
+        const socket = io();
+
+        socket.on('connect', () => {
+            console.log("✅ Connected to SocketIO");
+            socket.emit('request_latest');
+        });
+
+        socket.on('latest_data', (data) => {
+            const table = document.getElementById("table-body");
+            table.innerHTML = ''; // clear table
+
+            if (!data || data.length === 0) {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `<td colspan="5">No data available</td>`;
+                table.appendChild(tr);
+                return;
+            }
+
+            data.forEach(row => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td>${row.purchase_time}</td>
+                    <td>${row.usdt_amount.toFixed(2)}</td>
+                    <td>${row.btc_quantity.toFixed(8)}</td>
+                    <td>${row.btc_price.toFixed(2)}</td>
+                    <td>${row.order_id}</td>
+                `;
+                table.appendChild(tr);
+            });
+        });
+    </script>
+</body>
+</html>
