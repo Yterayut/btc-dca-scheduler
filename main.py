@@ -169,48 +169,128 @@ async def purchase_btc(now: datetime, purchase_amount: float, schedule_id: int) 
         if purchase_amount < min_notional:
             raise ValueError(f"Amount ({purchase_amount}) less than minimum notional ({min_notional})")
 
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-        def place_order():
-            return client.order_market_buy(symbol=symbol, quoteOrderQty=purchase_amount)
+        order = None  # Initialize order to None
+        try:
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+            def place_order_with_retry():
+                return client.order_market_buy(symbol=symbol, quoteOrderQty=purchase_amount)
+            
+            order = place_order_with_retry()
+            logging.info(f"Initial market order response: {order}")
+        except BinanceAPIException as e:
+            logging.error(f"Binance API exception during market buy order: {e.status_code=} {e.code=} {e.message=} {e.response=}")
+            raise  # Re-raise to be caught by the main exception handler
 
-        order = place_order()
-        logging.info(f"Order placed: {order}")
+        order_id_for_get_order = order['orderId']
+        try:
+            logging.info(f"Fetching order details for orderId {order_id_for_get_order} using client.get_order()...")
+            order_details = client.get_order(symbol=symbol, orderId=order_id_for_get_order)
+            logging.info(f"Full order details from client.get_order(): {order_details}")
+        except BinanceAPIException as e:
+            logging.error(f"Binance API exception during get_order for orderId {order_id_for_get_order}: {e.status_code=} {e.code=} {e.message=} {e.response=}")
+            # If get_order fails, we might not have order_details, so we can't proceed with its parsing
+            raise # Re-raise to be caught by the main exception handler
 
-        order_status = client.get_order(symbol=symbol, orderId=order['orderId'])
-        if order_status['status'] != 'FILLED':
-            raise ValueError(f"Order not filled: {order_status['status']}")
+        order_status_from_details = order_details['status']
+        logging.info(f"Order status from client.get_order(): {order_status_from_details}")
+        if order_status_from_details != 'FILLED':
+            # This specific error message is for when the order is found but not 'FILLED'
+            error_msg = f"Order (id: {order_id_for_get_order}) status is '{order_status_from_details}', not 'FILLED', based on client.get_order(). Full details: {order_details}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
 
-        filled_quantity = sum(float(fill['qty']) for fill in order['fills'])
-        total_qty = sum(float(fill['qty']) for fill in order['fills'])
-        total_cost = sum(float(fill['qty']) * float(fill['price']) for fill in order['fills'])
-        filled_price = total_cost / total_qty if total_qty > 0 else float(order['fills'][0]['price'])
+        raw_executed_qty = order_details['executedQty']
+        raw_cummulative_quote_qty = order_details['cummulativeQuoteQty']
+        logging.info(f"Received raw order details from client.get_order() (orderId {order_id_for_get_order}): executedQty='{raw_executed_qty}', cummulativeQuoteQty='{raw_cummulative_quote_qty}'")
+
+        try:
+            executed_qty = float(raw_executed_qty)
+            cummulative_quote_qty = float(raw_cummulative_quote_qty)
+        except ValueError as e:
+            # This error occurs if the string to float conversion fails.
+            error_msg = f"Could not convert executedQty ('{raw_executed_qty}') or cummulativeQuoteQty ('{raw_cummulative_quote_qty}') to float for orderId {order_id_for_get_order}. Error: {e}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+
+
+        if executed_qty <= 0:
+            # This is the check for anomalous 'FILLED' orders
+            error_msg = f"FILLED order (id: {order_id_for_get_order}) has non-positive executed quantity: {executed_qty} based on client.get_order(). Full details: {order_details}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Calculate price and quantity from order_details
+        filled_price = cummulative_quote_qty / executed_qty
+        filled_quantity = executed_qty 
+        # order_id_from_details is the same as order_id_for_get_order at this point if no prior exception.
+        order_id_from_details = order_details['orderId'] 
+        logging.info(f"Calculated from client.get_order() details (orderId {order_id_from_details}): filled_price={filled_price}, filled_quantity={filled_quantity}")
+
 
         current_time = now.strftime("%Y-%m-%d %H:%M:%S")
         formatted_quantity = f"{filled_quantity:.8f}"
 
         message = (
+<<<<<<< HEAD
             f"✅ DCA BTC Success (Schedule ID: {schedule_id})\n"
+=======
+            f"✅ DCA BTC Success (details from client.get_order())\n"
+>>>>>>> 40d1fdef18c34c513b667ba427b04a661ba6c268
             f"{current_time} - Purchased {purchase_amount} USDT\n"
             f"BUY: {formatted_quantity} BTC, Price: ฿{filled_price:.2f}\n"
-            f"Order ID: {order['orderId']}"
+            f"Order ID: {order_id_from_details}"
         )
 
-        logging.info(message)
+        logging.info(f"Success message: {message}")
         print(message)
         send_line_message(message)
 
         cursor.execute("""
+<<<<<<< HEAD
             INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id)
             VALUES (NOW(), %s, %s, %s, %s, %s)
         """, (purchase_amount, filled_quantity, filled_price, order['orderId'], schedule_id))
+=======
+            INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id)
+            VALUES (NOW(), %s, %s, %s, %s)
+        """, (purchase_amount, filled_quantity, filled_price, order_id_from_details))
+>>>>>>> 40d1fdef18c34c513b667ba427b04a661ba6c268
         db.commit()
+        logging.info(f"Purchase record for order ID {order_id_from_details} saved to database.")
 
+<<<<<<< HEAD
     except Exception as e:
         error_message = f"Error in purchase_btc (Schedule ID: {schedule_id}): {e}"
         logging.error(error_message)
+=======
+    except BinanceAPIException as e: # This will catch BinanceAPIExceptions re-raised from inner blocks
+        # The specific logging for BinanceAPIException already happened in the inner try-except blocks
+        error_message = f"Binance API Error in purchase_btc (orderId: {order.get('orderId', 'N/A') if order else 'N/A'}): Code={e.code}, Message='{e.message}'"
+        logging.error(error_message) # Log again with order context if available
+>>>>>>> 40d1fdef18c34c513b667ba427b04a661ba6c268
         print(error_message)
         send_line_message(error_message)
-        raise
+        raise # Important to re-raise to inform the scheduler loop
+    except ValueError as e: # Catch ValueErrors, including from qty checks and float conversions
+        # Specific logging for ValueError would have happened at the point of failure
+        error_message = f"ValueError in purchase_btc (orderId: {order.get('orderId', 'N/A') if order else 'N/A'}): {e}"
+        logging.error(error_message) # Log again with order context
+        print(error_message)
+        send_line_message(error_message)
+        raise # Important to re-raise
+    except Exception as e: # General exception handler for any other unexpected errors
+        # Determine orderId for logging, if available
+        current_order_id = 'N/A'
+        if order and 'orderId' in order:
+            current_order_id = order['orderId']
+        elif 'order_id_for_get_order' in locals() and order_id_for_get_order:
+            current_order_id = order_id_for_get_order
+        
+        error_message = f"Unexpected error in purchase_btc (orderId: {current_order_id}): {type(e).__name__} - {e}"
+        logging.error(error_message, exc_info=True) # exc_info=True will log the stack trace
+        print(error_message)
+        send_line_message(error_message)
+        raise # Important to re-raise
     finally:
         if cursor:
             cursor.close()
