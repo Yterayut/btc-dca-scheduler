@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard - BTC DCA</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #6366f1;
+            --success-color: #10b981;
+            --danger-color: #ef4444;
+            --warning-color: #f59e0b;
+            --bg-primary: #0f0f23;
+            --bg-secondary: #1a1a2e;
+            --bg-tertiary: #16213e;
+            --text-primary: #ffffff;
+            --text-secondary: #a1a1aa;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --gradient-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --gradient-danger: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            --shadow-heavy: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: var(--gradient-primary);
+            padding: 2rem 0;
+            margin-bottom: 2rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+            animation: float 20s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(180deg); }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            position: relative;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .header h1 i {
+            color: #fbbf24;
+            animation: spin 3s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .nav-link {
+            color: var(--text-primary);
+            text-decoration: none;
+            padding: 0.75rem 1.5rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-tertiary);
+            transform: translateY(-2px);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            transition: left 0.5s;
+        }
+
+        .stat-card:hover::before {
+            left: 100%;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-heavy);
+        }
+
+        .stat-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            color: var(--primary-color);
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(45deg, var(--success-color), #059669);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .status-running {
+            background-color: var(--success-color);
+            box-shadow: 0 0 10px var(--success-color);
+        }
+
+        .status-error {
+            background-color: var(--danger-color);
+            box-shadow: 0 0 10px var(--danger-color);
+        }
+
+        .card {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h2 {
+            color: var(--primary-color);
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 2rem;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.3s;
+        }
+
+        .btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-primary {
+            background: var(--gradient-primary);
+            color: white;
+        }
+
+        .btn-secondary {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--warning-color), #d97706);
+            color: white;
+        }
+
+        .btn-danger {
+            background: var(--gradient-danger);
+            color: white;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .alert {
+            padding: 1rem 1.5rem;
+            border-radius: 0.75rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+            backdrop-filter: blur(10px);
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: var(--success-color);
+            color: #6ee7b7;
+        }
+
+        .activity-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            background: var(--bg-secondary);
+            padding: 1rem;
+            margin-bottom: 0.75rem;
+            border-radius: 0.5rem;
+            border-left: 4px solid var(--primary-color);
+            transition: all 0.3s ease;
+        }
+
+        .activity-item:hover {
+            background: var(--bg-tertiary);
+            transform: translateX(5px);
+        }
+
+        .activity-time {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .activity-desc {
+            font-weight: 500;
+        }
+
+        .system-info {
+            background: var(--bg-secondary);
+            padding: 1.5rem;
+            border-radius: 0.75rem;
+            border: 1px solid var(--border-color);
+            margin-top: 1rem;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .info-item {
+            background: var(--bg-tertiary);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .info-label {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .info-value {
+            font-weight: 700;
+            font-size: 1.125rem;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: var(--shadow-heavy);
+        }
+
+        .modal h3 {
+            color: var(--danger-color);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            color: var(--text-primary);
+            margin: 1rem 0;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .modal-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: flex-end;
+            margin-top: 1.5rem;
+        }
+
+        .warning-section {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid var(--warning-color);
+            border-radius: 0.75rem;
+            padding: 1.5rem;
+            margin-top: 1rem;
+        }
+
+        .warning-section h3 {
+            color: var(--warning-color);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 1rem;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .action-buttons {
+                flex-direction: column;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary-color);
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="container">
+            <h1>
+                <i class="fas fa-cogs"></i>
+                Admin Dashboard
+            </h1>
+            <p>System Management & Monitoring</p>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="nav-links">
+            <a href="/" class="nav-link">
+                <i class="fas fa-arrow-left"></i>
+                Back to Dashboard
+            </a>
+            <a href="/health" class="nav-link" target="_blank">
+                <i class="fas fa-heart"></i>
+                Health Check
+            </a>
+            <a href="/api/stats" class="nav-link" target="_blank">
+                <i class="fas fa-chart-bar"></i>
+                API Stats
+            </a>
+        </div>
+
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for message in messages %}
+                    <div class="alert alert-success">
+                        <i class="fas fa-check-circle"></i>
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <!-- System Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-calendar-alt"></i>
+                </div>
+                <div class="stat-value">{{ stats.total_schedules }}</div>
+                <div class="stat-label">Total Schedules</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-play-circle"></i>
+                </div>
+                <div class="stat-value">{{ stats.active_schedules }}</div>
+                <div class="stat-label">Active Schedules</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-shopping-cart"></i>
+                </div>
+                <div class="stat-value">{{ stats.total_purchases }}</div>
+                <div class="stat-label">Total Purchases</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-server"></i>
+                </div>
+                <div class="stat-value">
+                    <span class="status-indicator {% if 'running' in stats.scheduler_status %}status-running{% else %}status-error{% endif %}"></span>
+                    {% if 'running' in stats.scheduler_status %}Online{% else %}Offline{% endif %}
+                </div>
+                <div class="stat-label">Scheduler Status</div>
+            </div>
+        </div>
+
+        <!-- System Actions -->
+        <div class="card">
+            <h2>
+                <i class="fas fa-tools"></i>
+                System Actions
+            </h2>
+            <div class="action-buttons">
+                <form action="/admin/clear_cache" method="POST" style="display: inline;">
+                    <button type="submit" class="btn btn-warning" onclick="return confirm('Clear all cache?')">
+                        <i class="fas fa-trash"></i>
+                        Clear Cache
+                    </button>
+                </form>
+                <a href="/admin/export_data" class="btn btn-secondary">
+                    <i class="fas fa-download"></i>
+                    Export Data
+                </a>
+                <a href="/test_line_notify" class="btn btn-primary">
+                    <i class="fas fa-mobile-alt"></i>
+                    Test Line Notify
+                </a>
+                <button class="btn btn-secondary" onclick="refreshSystemInfo()">
+                    <i class="fas fa-sync-alt"></i>
+                    Refresh Status
+                </button>
+            </div>
+            
+            <div class="warning-section">
+                <h3>
+                    <i class="fas fa-exclamation-triangle"></i>
+                    Dangerous Actions
+                </h3>
+                <div class="action-buttons">
+                    <button class="btn btn-danger" onclick="showForceDeleteModal()">
+                        <i class="fas fa-bomb"></i>
+                        Force Delete Schedule
+                    </button>
+                    <button class="btn btn-danger" onclick="restartScheduler()">
+                        <i class="fas fa-redo"></i>
+                        Restart Scheduler
+                    </button>
+                    <button class="btn btn-danger" onclick="clearAllData()">
+                        <i class="fas fa-nuclear"></i>
+                        Clear All Data
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Activity -->
+        <div class="card">
+            <h2>
+                <i class="fas fa-history"></i>
+                Recent Activity
+            </h2>
+            <div class="activity-list">
+                {% if stats.recent_activity %}
+                    {% for activity in stats.recent_activity %}
+                    <div class="activity-item">
+                        <div class="activity-time">
+                            <i class="fas fa-clock"></i>
+                            {{ activity.timestamp }}
+                        </div>
+                        <div class="activity-desc">{{ activity.description }}</div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                <div class="activity-item">
+                    <div class="activity-desc">
+                        <i class="fas fa-inbox"></i>
+                        No recent activity
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- System Information -->
+        <div class="card">
+            <h2>
+                <i class="fas fa-info-circle"></i>
+                System Information
+            </h2>
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-robot"></i>
+                        Scheduler Status
+                    </div>
+                    <div class="info-value">{{ stats.scheduler_status }}</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-database"></i>
+                        Database
+                    </div>
+                    <div class="info-value" style="color: var(--success-color);">Connected</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-memory"></i>
+                        Cache Size
+                    </div>
+                    <div class="info-value" id="cache-size">Loading...</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-clock"></i>
+                        Uptime
+                    </div>
+                    <div class="info-value" id="uptime">Loading...</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-chart-line"></i>
+                        Performance
+                    </div>
+                    <div class="info-value" style="color: var(--success-color);">Optimal</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">
+                        <i class="fas fa-shield-alt"></i>
+                        Security
+                    </div>
+                    <div class="info-value" style="color: var(--success-color);">Secure</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Force Delete Modal -->
+    <div id="forceDeleteModal" class="modal">
+        <div class="modal-content">
+            <h3>
+                <i class="fas fa-exclamation-triangle"></i>
+                Force Delete Schedule
+            </h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                Enter Schedule ID to force delete. This will permanently delete all purchase history for this schedule.
+            </p>
+            <input type="number" id="forceDeleteId" placeholder="Schedule ID" class="form-control">
+            <div class="modal-buttons">
+                <button onclick="hideForceDeleteModal()" class="btn btn-secondary">
+                    <i class="fas fa-times"></i>
+                    Cancel
+                </button>
+                <button onclick="executeForceDelete()" class="btn btn-danger">
+                    <i class="fas fa-bomb"></i>
+                    Force Delete
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Force Delete Functions
+        function showForceDeleteModal() {
+            document.getElementById('forceDeleteModal').style.display = 'flex';
+        }
+
+        function hideForceDeleteModal() {
+            document.getElementById('forceDeleteModal').style.display = 'none';
+            document.getElementById('forceDeleteId').value = '';
+        }
+
+        function executeForceDelete() {
+            const scheduleId = document.getElementById('forceDeleteId').value;
+            if (!scheduleId) {
+                showAlert('Please enter a Schedule ID', 'error');
+                return;
+            }
+
+            if (confirm(`⚠️ WARNING: This will permanently delete schedule ${scheduleId} and ALL its purchase history. This action cannot be undone!\n\nAre you absolutely sure?`)) {
+                fetch(`/force_delete_schedule/${scheduleId}`, {
+                    method: 'POST'
+                }).then(response => {
+                    if (response.ok) {
+                        showAlert('Schedule force deleted successfully', 'success');
+                        setTimeout(() => window.location.reload(), 1500);
+                    } else {
+                        showAlert('Error deleting schedule', 'error');
+                    }
+                }).catch(error => {
+                    showAlert('Network error: ' + error.message, 'error');
+                });
+            }
+        }
+
+        // Other Admin Functions
+        function restartScheduler() {
+            if (confirm('⚠️ Restart the scheduler service? This may interrupt ongoing operations.')) {
+                showAlert('Scheduler restart feature needs backend implementation', 'warning');
+            }
+        }
+
+        function clearAllData() {
+            const confirmText = 'DELETE ALL DATA';
+            const userInput = prompt(`⚠️ DANGER: This will delete ALL schedules and purchase history!\n\nType "${confirmText}" to confirm:`);
+            
+            if (userInput === confirmText) {
+                showAlert('Clear all data feature needs backend implementation', 'warning');
+            } else if (userInput !== null) {
+                showAlert('Confirmation text does not match. Operation cancelled.', 'error');
+            }
+        }
+
+        function refreshSystemInfo() {
+            const button = event.target;
+            const originalHTML = button.innerHTML;
+            button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Refreshing...';
+            button.disabled = true;
+
+            Promise.all([
+                fetch('/health').then(r => r.json()),
+                fetch('/scheduler_status').then(r => r.json())
+            ]).then(([health, status]) => {
+                document.getElementById('cache-size').textContent = health.cache_size || 'N/A';
+                updateSchedulerStatus(status.status);
+                showAlert('System information refreshed', 'success');
+            }).catch(error => {
+                showAlert('Error refreshing system info', 'error');
+                console.error('Refresh error:', error);
+            }).finally(() => {
+                button.innerHTML = originalHTML;
+                button.disabled = false;
+            });
+        }
+
+        function updateSchedulerStatus(status) {
+            const indicators = document.querySelectorAll('.status-indicator');
+            const statusTexts = document.querySelectorAll('.info-value');
+            
+            indicators.forEach(indicator => {
+                if (status === 'Scheduler is running') {
+                    indicator.className = 'status-indicator status-running';
+                } else {
+                    indicator.className = 'status-indicator status-error';
+                }
+            });
+        }
+
+        function showAlert(message, type = 'info') {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${type}`;
+            alertDiv.innerHTML = `<i class="fas fa-info-circle"></i> ${message}`;
+            
+            const container = document.querySelector('.container');
+            container.insertBefore(alertDiv, container.firstChild);
+            
+            setTimeout(() => alertDiv.remove(), 5000);
+        }
+
+        // Update uptime
+        let startTime = Date.now();
+        function updateUptime() {
+            const uptime = Math.floor((Date.now() - startTime) / 1000);
+            const hours = Math.floor(uptime / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const seconds = uptime % 60;
+            document.getElementById('uptime').textContent = `${hours}h ${minutes}m ${seconds}s`;
+        }
+
+        // Auto-refresh functions
+        function autoRefresh() {
+            fetch('/health')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('cache-size').textContent = data.cache_size || 'N/A';
+                })
+                .catch(error => {
+                    console.error('Auto-refresh error:', error);
+                });
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            updateUptime();
+            autoRefresh();
+            
+            // Set intervals
+            setInterval(updateUptime, 1000);
+            setInterval(autoRefresh, 30000);
+        });
+
+        // Close modal when clicking outside
+        document.getElementById('forceDeleteModal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                hideForceDeleteModal();
+            }
+        });
+
+        // Add keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                hideForceDeleteModal();
+            }
+            if (e.ctrlKey && e.key === 'r') {
+                e.preventDefault();
+                refreshSystemInfo();
+            }
+        });
+
+        // Add loading animations to buttons
+        document.querySelectorAll('.btn').forEach(button => {
+            button.addEventListener('click', function() {
+                if (this.type === 'submit' || this.href) {
+                    const originalHTML = this.innerHTML;
+                    this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+                    
+                    setTimeout(() => {
+                        this.innerHTML = originalHTML;
+                    }, 2000);
+                }
+            });
+        });
+    </script>
+</body>
+</html>

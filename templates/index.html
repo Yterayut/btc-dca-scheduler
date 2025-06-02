@@ -5,374 +5,1347 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BTC DCA Dashboard</title>
     <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        body {
-            background-color: #121212;
-            color: #ffffff;
-            font-family: Arial, sans-serif;
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+        
+        :root {
+            --primary-color: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary-color: #10b981;
+            --danger-color: #ef4444;
+            --warning-color: #f59e0b;
+            --success-color: #10b981;
+            --bg-primary: #0f0f23;
+            --bg-secondary: #1a1a2e;
+            --bg-tertiary: #16213e;
+            --bg-card: rgba(255, 255, 255, 0.02);
+            --text-primary: #ffffff;
+            --text-secondary: #a1a1aa;
+            --text-muted: #71717a;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --shadow-light: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            --shadow-medium: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            --shadow-heavy: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+            --gradient-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --gradient-success: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            --gradient-card: linear-gradient(145deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+        }
+
+        * {
             margin: 0;
             padding: 0;
+            box-sizing: border-box;
         }
-        h1, h2 {
-            color: #4CAF50;
-            margin: 0 0 10px 0;
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
         }
+
+        /* Animated Background */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                radial-gradient(ellipse at top left, rgba(99, 102, 241, 0.1) 0%, transparent 50%),
+                radial-gradient(ellipse at bottom right, rgba(16, 185, 129, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* Header */
+        .header {
+            background: var(--gradient-primary);
+            padding: 2rem 0;
+            margin-bottom: 2rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+            animation: float 20s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(180deg); }
+        }
+
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            position: relative;
+            z-index: 2;
+        }
+
+        .header h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(45deg, #ffffff, #e2e8f0);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .header h1 i {
+            color: #fbbf24;
+            -webkit-text-fill-color: #fbbf24;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+
+        .header p {
+            font-size: 1.125rem;
+            opacity: 0.9;
+            font-weight: 300;
+        }
+
+        /* Container */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+        }
+
+        /* Status Bar */
+        .status-bar {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 2rem;
+            margin-bottom: 2rem;
+            padding: 1.5rem;
+            background: var(--gradient-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            box-shadow: var(--shadow-medium);
+        }
+
+        .scheduler-status {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 600;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            box-shadow: 0 0 10px currentColor;
+            animation: glow 2s ease-in-out infinite alternate;
+        }
+
+        @keyframes glow {
+            from { box-shadow: 0 0 5px currentColor; }
+            to { box-shadow: 0 0 20px currentColor; }
+        }
+
+        .status-running { color: var(--success-color); }
+        .status-error { color: var(--danger-color); }
+
+        .total-amount {
+            text-align: right;
+        }
+
+        .total-amount .label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.25rem;
+        }
+
+        .total-amount .value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--success-color);
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--gradient-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            transition: left 0.5s;
+        }
+
+        .stat-card:hover::before {
+            left: 100%;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-heavy);
+            border-color: var(--primary-color);
+        }
+
+        .stat-icon {
+            font-size: 2rem;
+            margin-bottom: 0.75rem;
+            color: var(--primary-color);
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+            background: var(--gradient-success);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            background: var(--bg-secondary);
+            padding: 0.5rem;
+            border-radius: 0.75rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .tab-button {
+            flex: 1;
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            color: var(--text-secondary);
+            border: none;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .tab-button.active {
+            background: var(--gradient-primary);
+            color: white;
+            box-shadow: var(--shadow-light);
+        }
+
+        .tab-button:not(.active):hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-primary);
+        }
+
+        /* Content Sections */
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Cards */
+        .card {
+            background: var(--gradient-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: var(--shadow-medium);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            box-shadow: var(--shadow-heavy);
+        }
+
+        .card h2 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .card h2 i {
+            color: var(--primary-color);
+        }
+
+        /* Tables */
+        .table-container {
+            overflow-x: auto;
+            border-radius: 0.75rem;
+            border: 1px solid var(--border-color);
+            background: var(--bg-card);
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 20px;
         }
-        th, td {
-            padding: 10px;
-            text-align: left;
-            border-bottom: 1px solid #444;
-        }
+
         th {
-            background-color: #1e1e1e;
+            background: var(--bg-secondary);
+            padding: 1rem;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border-color);
         }
-        tr:nth-child(even) {
-            background-color: #2c2c2c;
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            transition: background-color 0.2s ease;
         }
-        tr:hover {
-            background-color: #444;
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
         }
-        .container {
-            padding: 20px;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .scheduler-status {
-            padding: 10px;
-            margin-bottom: 15px;
-            border-radius: 4px;
-            font-weight: bold;
-        }
-        .scheduler-status.running {
-            background-color: #2e7d32;
-        }
-        .scheduler-status.error {
-            background-color: #d32f2f;
-        }
-        .form-container {
-            margin-top: 20px;
-            background-color: #1e1e1e;
-            padding: 20px;
-            border-radius: 8px;
-        }
-        .form-group {
-            display: flex;
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
             align-items: center;
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-        .form-group label {
-            width: 150px;
-            font-weight: bold;
-        }
-        .form-container input,
-        .form-container select {
-            background-color: #2c2c2c;
-            color: #fff;
-            border: 1px solid #555;
-            padding: 8px;
-            font-size: 14px;
-            width: 200px;
-            border-radius: 4px;
-        }
-        .checkbox-group {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-        .checkbox-group label {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            font-weight: normal;
-            width: auto;
-        }
-        .form-container button {
-            padding: 10px 20px;
-            font-size: 16px;
-            background-color: #4CAF50;
-            color: white;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
             border: none;
+            border-radius: 0.5rem;
             cursor: pointer;
-            border-radius: 4px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            font-size: 0.875rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.3s;
+        }
+
+        .btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-primary {
+            background: var(--gradient-primary);
+            color: white;
+            box-shadow: var(--shadow-light);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: var(--shadow-medium);
+        }
+
+        .btn-success {
+            background: var(--gradient-success);
+            color: white;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--danger-color), #dc2626);
+            color: white;
+        }
+
+        .btn-secondary {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-sm {
+            padding: 0.5rem 1rem;
+            font-size: 0.75rem;
+        }
+
+        /* Forms */
+        .form-container {
+            background: var(--gradient-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            box-shadow: var(--shadow-medium);
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+            color: var(--text-primary);
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .checkbox-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 0.75rem;
+            margin-top: 0.5rem;
+        }
+
+        .checkbox-item {
             display: flex;
             align-items: center;
-            gap: 5px;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
-        .form-container button:hover {
-            background-color: #45a049;
+
+        .checkbox-item:hover {
+            background: var(--bg-tertiary);
         }
+
+        .checkbox-item input[type="checkbox"] {
+            accent-color: var(--primary-color);
+        }
+
+        /* Alerts */
         .alert {
-            padding: 10px;
-            margin-bottom: 15px;
+            padding: 1rem 1.5rem;
+            border-radius: 0.75rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+            backdrop-filter: blur(10px);
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: var(--success-color);
+            color: #6ee7b7;
+        }
+
+        .alert-error {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: var(--danger-color);
+            color: #fca5a5;
+        }
+
+        .alert-warning {
+            background: rgba(245, 158, 11, 0.1);
+            border-color: var(--warning-color);
+            color: #fcd34d;
+        }
+
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: var(--shadow-heavy);
+            position: relative;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .modal-header h3 {
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+
+        .close {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+
+        .close:hover {
+            color: var(--text-primary);
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .container {
+                padding: 0 1rem;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .status-bar {
+                grid-template-columns: 1fr;
+                text-align: center;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+            
+            .checkbox-group {
+                grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            }
+        }
+
+        /* Utility Classes */
+        .text-center { text-align: center; }
+        .text-right { text-align: right; }
+        .font-bold { font-weight: 700; }
+        .opacity-75 { opacity: 0.75; }
+        .mt-4 { margin-top: 1rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .hidden { display: none; }
+
+        /* Special Effects */
+        .glow {
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.3);
+        }
+
+        .success-glow {
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.3);
+        }
+
+        .bitcoin-color {
+            color: #f7931a;
+        }
+
+        /* Smooth Scrolling */
+        html {
+            scroll-behavior: smooth;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary-color);
             border-radius: 4px;
         }
-        .alert-success {
-            background-color: #2e7d32;
-            color: #ffffff;
-        }
-        .alert-error {
-            background-color: #d32f2f;
-            color: #ffffff;
-        }
 
-        @media (max-width: 768px) {
-            h1 {
-                font-size: 24px;
-            }
-            .container {
-                padding: 10px;
-            }
-            .scheduler-status {
-                font-size: 14px;
-            }
-            .form-container {
-                padding: 15px;
-            }
-            .form-group {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .form-group label {
-                width: auto;
-            }
-            .form-container input,
-            .form-container select {
-                width: 100%;
-                font-size: 16px;
-            }
-            .form-container button {
-                font-size: 14px;
-                width: 100%;
-            }
-            table {
-                font-size: 14px;
-            }
-            th, td {
-                padding: 8px;
-            }
-            .checkbox-group {
-                flex-direction: column;
-            }
-        }
-
-        @media (max-width: 480px) {
-            h1 {
-                font-size: 20px;
-            }
-            .scheduler-status {
-                font-size: 12px;
-            }
-            .form-container {
-                padding: 10px;
-            }
-            .form-container input,
-            .form-container select {
-                font-size: 14px;
-                padding: 10px;
-            }
-            .form-container button {
-                font-size: 12px;
-                padding: 8px;
-            }
-            table {
-                font-size: 12px;
-            }
-            th, td {
-                padding: 6px;
-            }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary-dark);
         }
     </style>
-    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
 </head>
 <body>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-content">
+            <h1>
+                <i class="fab fa-bitcoin"></i>
+                BTC DCA Dashboard
+            </h1>
+            <p>Automated Dollar Cost Averaging for Bitcoin Investment</p>
+        </div>
+    </div>
+
     <div class="container">
-        <h1>BTC DCA Dashboard</h1>
-
-        <!-- Scheduler Status -->
-        <div class="scheduler-status" id="scheduler-status">
-            Scheduler Status: <span id="status-text">Checking...</span>
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="scheduler-status">
+                <div class="status-indicator {% if 'running' in (stats.scheduler_status if stats else 'unknown') %}status-running{% else %}status-error{% endif %}"></div>
+                <span>Scheduler: {{ stats.scheduler_status if stats else 'Unknown' }}</span>
+            </div>
+            <div class="total-amount">
+                <div class="label">Total Active Amount</div>
+                <div class="value">{{ total_amount|floatformat(2) }} USDT</div>
+            </div>
         </div>
 
-        <!-- Config Display -->
-        <div>
-            <p>Day of Purchase: <strong>{{ config[1] }}</strong></p>
-            <p>Purchase Time: <strong>{{ config[2] }}</strong></p>
-            <p>Amount to Purchase: <strong>{{ config[0] }} USDT</strong></p>
+        <!-- Stats Grid -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-calendar-alt"></i>
+                </div>
+                <div class="stat-value">{{ stats.total_schedules if stats else (schedules|length if schedules else 0) }}</div>
+                <div class="stat-label">Total Schedules</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-play-circle"></i>
+                </div>
+                <div class="stat-value">{{ stats.active_schedules if stats else 0 }}</div>
+                <div class="stat-label">Active Schedules</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-shopping-cart"></i>
+                </div>
+                <div class="stat-value">{{ stats.total_purchases if stats else (history|length if history else 0) }}</div>
+                <div class="stat-label">Total Purchases</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-server"></i>
+                </div>
+                <div class="stat-value">
+                    {% if 'running' in (stats.scheduler_status if stats else 'unknown') %}
+                        <i class="fas fa-check-circle" style="color: var(--success-color);"></i>
+                    {% else %}
+                        <i class="fas fa-exclamation-circle" style="color: var(--danger-color);"></i>
+                    {% endif %}
+                </div>
+                <div class="stat-label">System Status</div>
+            </div>
         </div>
 
-        <!-- Config Form -->
-        <div class="form-container">
-            <h2>Update Purchase Settings</h2>
-            {% if get_flashed_messages() %}
-                {% for message in get_flashed_messages() %}
-                    <div class="alert {% if 'Error' in message %}alert-error{% else %}alert-success{% endif %}">
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for message in messages %}
+                    <div class="alert {% if 'Error' in message or 'error' in message %}alert-error{% elif 'warning' in message %}alert-warning{% else %}alert-success{% endif %}">
+                        <i class="fas fa-info-circle"></i>
                         {{ message }}
                     </div>
                 {% endfor %}
             {% endif %}
-            <form action="/update" method="POST" onsubmit="return validateForm()">
-                <div class="form-group">
-                    <label for="amount">Amount to Purchase (USDT):</label>
-                    <input type="number" name="amount" id="amount" step="0.01" value="{{ config[0] }}" required>
+        {% endwith %}
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('schedules')">
+                <i class="fas fa-calendar-alt"></i>
+                Schedules
+            </button>
+            <button class="tab-button" onclick="switchTab('history')">
+                <i class="fas fa-history"></i>
+                Purchase History
+            </button>
+            <button class="tab-button" onclick="switchTab('analytics')">
+                <i class="fas fa-chart-line"></i>
+                Analytics
+            </button>
+        </div>
+
+        <!-- Schedules Tab -->
+        <div id="schedules" class="tab-content active">
+            <div class="card">
+                <h2>
+                    <i class="fas fa-calendar-alt"></i>
+                    Active Schedules
+                </h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Time</th>
+                                <th>Days</th>
+                                <th>Amount (USDT)</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for schedule in schedules %}
+                            <tr>
+                                <td><span class="font-bold">#{{ schedule[0] }}</span></td>
+                                <td>
+                                    <i class="fas fa-clock"></i>
+                                    {{ schedule[1] }}
+                                </td>
+                                <td>
+                                    <span class="btn btn-secondary btn-sm">{{ schedule[2] }}</span>
+                                </td>
+                                <td>
+                                    <span class="bitcoin-color font-bold">{{ schedule[3]|floatformat(2) }}</span>
+                                </td>
+                                <td>
+                                    {% if schedule[4] %}
+                                        <span class="btn btn-success btn-sm">
+                                            <i class="fas fa-check"></i> Active
+                                        </span>
+                                    {% else %}
+                                        <span class="btn btn-secondary btn-sm">
+                                            <i class="fas fa-pause"></i> Inactive
+                                        </span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <button class="btn btn-primary btn-sm" onclick="openEditModal({{ schedule[0] }}, '{{ schedule[1] }}', '{{ schedule[2] }}', {{ schedule[3] }}, {{ schedule[4] }})">
+                                        <i class="fas fa-edit"></i> Edit
+                                    </button>
+                                    <form action="/delete_schedule/{{ schedule[0] }}" method="POST" style="display:inline;" onsubmit="return confirm('Are you sure?')">
+                                        <button type="submit" class="btn btn-danger btn-sm">
+                                            <i class="fas fa-trash"></i> Delete
+                                        </button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
-                <div class="form-group">
-                    <label for="time">Purchase Time:</label>
-                    <input type="time" name="time" id="time" value="{{ config[2] }}" required>
+            </div>
+
+            <!-- Add Schedule Form -->
+            <div class="form-container">
+                <h2>
+                    <i class="fas fa-plus-circle"></i>
+                    Add New Schedule
+                </h2>
+                <form action="/add_schedule" method="POST" onsubmit="return validateAddForm(event)">
+                    <div class="form-group">
+                        <label for="amount">
+                            <i class="fas fa-dollar-sign"></i>
+                            Amount to Purchase (USDT)
+                        </label>
+                        <input type="number" name="amount" id="amount" class="form-control" step="0.01" required placeholder="Enter amount in USDT">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="time">
+                            <i class="fas fa-clock"></i>
+                            Purchase Time
+                        </label>
+                        <input type="time" name="time" id="time" class="form-control" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>
+                            <i class="fas fa-calendar-week"></i>
+                            Days of Purchase
+                        </label>
+                        <div class="checkbox-group">
+                            {% for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] %}
+                                <label class="checkbox-item">
+                                    <input type="checkbox" name="day" value="{{ day.lower() }}">
+                                    <span>{{ day }}</span>
+                                </label>
+                            {% endfor %}
+                        </div>
+                        <button type="button" class="btn btn-secondary btn-sm mt-4" onclick="selectAllDays()">
+                            <i class="fas fa-check-double"></i>
+                            Select All Days
+                        </button>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="checkbox-item">
+                            <input type="checkbox" name="is_active" value="1" checked>
+                            <span>
+                                <i class="fas fa-power-off"></i>
+                                Active Schedule
+                            </span>
+                        </label>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-plus"></i>
+                        Add Schedule
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- History Tab -->
+        <div id="history" class="tab-content">
+            <div class="card">
+                <h2>
+                    <i class="fas fa-history"></i>
+                    Purchase History
+                </h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>USDT</th>
+                                <th>BTC</th>
+                                <th>Price</th>
+                                <th>Order ID</th>
+                                <th>Schedule</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table">
+                            {% for record in history %}
+                            <tr>
+                                <td>
+                                    <i class="fas fa-calendar"></i>
+                                    {{ record[1].strftime('%Y-%m-%d %H:%M') if record[1] else 'N/A' }}
+                                </td>
+                                <td>
+                                    <span class="bitcoin-color font-bold">{{ record[2]|floatformat(2) if record[2] else '0.00' }}</span>
+                                </td>
+                                <td>
+                                    <span class="font-bold">{{ record[3]|floatformat(8) if record[3] else '0.00000000' }}</span>
+                                </td>
+                                <td>
+                                    <span class="font-bold">฿{{ record[4]|floatformat(2) if record[4] else '0.00' }}</span>
+                                </td>
+                                <td>
+                                    <code style="font-size: 0.75rem;">{{ record[5] if record[5] else 'N/A' }}</code>
+                                </td>
+                                <td>
+                                    {% if record[6] %}
+                                        <span class="btn btn-secondary btn-sm">#{{ record[6] }}</span>
+                                    {% else %}
+                                        <span class="opacity-75">Manual</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="6" class="text-center opacity-75">
+                                    <i class="fas fa-inbox"></i>
+                                    No purchase history yet
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
+            </div>
+        </div>
+
+        <!-- Analytics Tab -->
+        <div id="analytics" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-coins bitcoin-color"></i>
+                    </div>
+                    <div class="stat-value" id="total-invested">0.00</div>
+                    <div class="stat-label">Total Invested (USDT)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fab fa-bitcoin bitcoin-color"></i>
+                    </div>
+                    <div class="stat-value" id="total-btc">0.00000000</div>
+                    <div class="stat-label">Total BTC Acquired</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-chart-line"></i>
+                    </div>
+                    <div class="stat-value" id="avg-price">₿0.00</div>
+                    <div class="stat-label">Average Price</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-percentage"></i>
+                    </div>
+                    <div class="stat-value" id="success-rate">100%</div>
+                    <div class="stat-label">Success Rate</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>
+                    <i class="fas fa-chart-area"></i>
+                    Investment Summary
+                </h2>
+                <div id="investment-chart" class="text-center" style="height: 300px; display: flex; align-items: center; justify-content: center; color: var(--text-secondary);">
+                    <div>
+                        <i class="fas fa-chart-line" style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.3;"></i>
+                        <p>Analytics will be available after first purchase</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>
+                    <i class="fas fa-trophy"></i>
+                    DCA Performance
+                </h2>
+                <div class="stats-grid">
+                    <div style="text-align: center; padding: 2rem;">
+                        <i class="fas fa-rocket" style="font-size: 2rem; color: var(--primary-color); margin-bottom: 1rem;"></i>
+                        <h3>Your DCA Journey</h3>
+                        <p class="opacity-75">Track your Bitcoin accumulation progress over time</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="edit-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>
+                    <i class="fas fa-edit"></i>
+                    Edit Schedule
+                </h3>
+                <button class="close" onclick="closeEditModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <form id="edit-form" method="POST" onsubmit="return validateEditForm(event)">
                 <div class="form-group">
-                    <label>Day of Purchase:</label>
-                    <div class="checkbox-group">
-                        {% set selected_days = config[1].lower().split(',') %}
+                    <label for="edit-amount">
+                        <i class="fas fa-dollar-sign"></i>
+                        Amount to Purchase (USDT)
+                    </label>
+                    <input type="number" name="amount" id="edit-amount" class="form-control" step="0.01" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="edit-time">
+                        <i class="fas fa-clock"></i>
+                        Purchase Time
+                    </label>
+                    <input type="time" name="time" id="edit-time" class="form-control" required>
+                </div>
+                
+                <div class="form-group">
+                    <label>
+                        <i class="fas fa-calendar-week"></i>
+                        Days of Purchase
+                    </label>
+                    <div class="checkbox-group" id="edit-days">
                         {% for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] %}
-                            <label>
-                                <input type="checkbox" name="day" value="{{ day.lower() }}"
-                                    {% if day.lower() in selected_days %}checked{% endif %}>
-                                {{ day }}
+                            <label class="checkbox-item">
+                                <input type="checkbox" name="day" value="{{ day.lower() }}">
+                                <span>{{ day }}</span>
                             </label>
                         {% endfor %}
                     </div>
                 </div>
-                <button type="submit">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
-                        <path d="M2 2a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H2zm10.03 4.97a.75.75 0 0 1 .011 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 0 1 1.06-1.06L8 9.94l2.97-2.97a.75.75 0 0 1 1.06-.01z"/>
-                    </svg>
-                    Update
-                </button>
+                
+                <div class="form-group">
+                    <label class="checkbox-item">
+                        <input type="checkbox" name="is_active" id="edit-is-active" value="1">
+                        <span>
+                            <i class="fas fa-power-off"></i>
+                            Active Schedule
+                        </span>
+                    </label>
+                </div>
+                
+                <div style="display: flex; gap: 1rem; justify-content: flex-end;">
+                    <button type="button" class="btn btn-secondary" onclick="closeEditModal()">
+                        <i class="fas fa-times"></i>
+                        Cancel
+                    </button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-save"></i>
+                        Update Schedule
+                    </button>
+                </div>
             </form>
         </div>
-
-        <!-- Purchase History -->
-        <h2>🪙 Real-time BTC Purchase History</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>USDT</th>
-                    <th>BTC</th>
-                    <th>Price</th>
-                    <th>Order ID</th>
-                </tr>
-            </thead>
-            <tbody id="table-body">
-                <tr><td colspan="5">Loading...</td></tr>
-            </tbody>
-        </table>
     </div>
 
+    <!-- Floating Action Button -->
+    <div style="position: fixed; bottom: 2rem; right: 2rem; z-index: 100;">
+        <button class="btn btn-primary" style="border-radius: 50%; width: 60px; height: 60px; display: flex; align-items: center; justify-content: center; box-shadow: var(--shadow-heavy);" onclick="location.reload()">
+            <i class="fas fa-sync-alt"></i>
+        </button>
+    </div>
+
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    
     <script>
-        function validateForm() {
-            const amount = document.getElementById("amount").value;
-            const time = document.getElementById("time").value;
+        // Tab Switching
+        function switchTab(tabId) {
+            // Remove active class from all tabs and contents
+            document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            
+            // Add active class to selected tab and content
+            event.target.classList.add('active');
+            document.getElementById(tabId).classList.add('active');
+            
+            // Load analytics if analytics tab is selected
+            if (tabId === 'analytics') {
+                loadAnalytics();
+            }
+        }
+
+        // Form Validation
+        function validateAddForm(event) {
+            const amount = document.getElementById('amount').value;
+            const time = document.getElementById('time').value;
             const days = document.querySelectorAll('input[name="day"]:checked');
 
             if (parseFloat(amount) <= 0) {
-                alert("Please enter a positive amount.");
+                showAlert('Please enter a positive amount.', 'error');
+                event.preventDefault();
                 return false;
             }
 
-            if (!time.match(/^\d{2}:\d{2}$/)) {
-                alert("Please enter a valid time in HH:MM format.");
+            if (!time) {
+                showAlert('Please select a time.', 'error');
+                event.preventDefault();
                 return false;
             }
 
             if (days.length === 0) {
-                alert("Please select at least one day.");
+                showAlert('Please select at least one day.', 'error');
+                event.preventDefault();
                 return false;
             }
 
-            const oldAmount = "{{ config[0] }}";
-            const oldDay = "{{ config[1] }}";
-            const oldTime = "{{ config[2] }}";
-
-            const newDayArr = Array.from(days).map(el => el.value);
-            const newDay = newDayArr.join(",");
-
-            let message = "You are about to update the settings:\n\n";
-            let hasChange = false;
-
-            if (oldAmount !== amount) {
-                message += `- Amount: ${oldAmount} → ${amount} USDT\n`;
-                hasChange = true;
-            }
-
-            if (oldDay !== newDay) {
-                message += `- Day: ${oldDay} → ${newDay}\n`;
-                hasChange = true;
-            }
-
-            if (oldTime !== time) {
-                message += `- Time: ${oldTime} → ${time}\n`;
-                hasChange = true;
-            }
-
-            if (!hasChange) {
-                message = "No changes detected. Do you want to proceed?";
-            } else {
-                message += "\nDo you want to proceed?";
-            }
-
-            return confirm(message);
+            return true;
         }
 
-        // Fetch Scheduler Status
-        function fetchSchedulerStatus() {
-            fetch('/scheduler_status')
-                .then(response => response.json())
-                .then(data => {
-                    const statusText = document.getElementById('status-text');
-                    statusText.textContent = data.status;
-                    const statusDiv = document.getElementById('scheduler-status');
-                    statusDiv.className = 'scheduler-status ' + 
-                        (data.status === 'Scheduler is running' ? 'running' : 'error');
-                })
-                .catch(error => {
-                    const statusText = document.getElementById('status-text');
-                    statusText.textContent = 'Scheduler is not responding';
-                    const statusDiv = document.getElementById('scheduler-status');
-                    statusDiv.className = 'scheduler-status error';
-                    console.error('Error fetching scheduler status:', error);
-                });
+        function validateEditForm(event) {
+            const amount = document.getElementById('edit-amount').value;
+            const time = document.getElementById('edit-time').value;
+            const days = document.querySelectorAll('#edit-days input[name="day"]:checked');
+
+            if (parseFloat(amount) <= 0) {
+                showAlert('Please enter a positive amount.', 'error');
+                event.preventDefault();
+                return false;
+            }
+
+            if (!time) {
+                showAlert('Please select a time.', 'error');
+                event.preventDefault();
+                return false;
+            }
+
+            if (days.length === 0) {
+                showAlert('Please select at least one day.', 'error');
+                event.preventDefault();
+                return false;
+            }
+
+            return true;
         }
 
-        // Initial fetch and periodic update
-        fetchSchedulerStatus();
-        setInterval(fetchSchedulerStatus, 30000);
+        // Modal Functions
+        function openEditModal(id, time, days, amount, isActive) {
+            const modal = document.getElementById('edit-modal');
+            const form = document.getElementById('edit-form');
+            
+            form.action = `/edit_schedule/${id}`;
+            document.getElementById('edit-amount').value = amount;
+            document.getElementById('edit-time').value = time;
+            document.getElementById('edit-is-active').checked = isActive;
 
-        // SocketIO
+            // Clear all checkboxes first
+            document.querySelectorAll('#edit-days input[name="day"]').forEach(cb => cb.checked = false);
+            
+            // Check the appropriate days
+            const dayList = days.split(',');
+            dayList.forEach(day => {
+                const checkbox = document.querySelector(`#edit-days input[value="${day.trim()}"]`);
+                if (checkbox) checkbox.checked = true;
+            });
+
+            modal.style.display = 'flex';
+        }
+
+        function closeEditModal() {
+            document.getElementById('edit-modal').style.display = 'none';
+        }
+
+        // Utility Functions
+        function selectAllDays() {
+            document.querySelectorAll('input[name="day"]').forEach(cb => cb.checked = true);
+        }
+
+        function showAlert(message, type = 'info') {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${type}`;
+            alertDiv.innerHTML = `<i class="fas fa-info-circle"></i> ${message}`;
+            
+            const container = document.querySelector('.container');
+            container.insertBefore(alertDiv, container.firstChild);
+            
+            setTimeout(() => alertDiv.remove(), 5000);
+        }
+
+        // Analytics Functions
+        function loadAnalytics() {
+            const historyRows = document.querySelectorAll('#history-table tr');
+            let totalInvested = 0;
+            let totalBTC = 0;
+            let totalTransactions = 0;
+            let prices = [];
+
+            historyRows.forEach(row => {
+                const cells = row.querySelectorAll('td');
+                if (cells.length >= 4) {
+                    const usdt = parseFloat(cells[1].textContent.replace(/[^\d.-]/g, ''));
+                    const btc = parseFloat(cells[2].textContent);
+                    const price = parseFloat(cells[3].textContent.replace(/[^\d.-]/g, ''));
+
+                    if (!isNaN(usdt) && !isNaN(btc) && !isNaN(price)) {
+                        totalInvested += usdt;
+                        totalBTC += btc;
+                        totalTransactions++;
+                        prices.push(price);
+                    }
+                }
+            });
+
+            const avgPrice = prices.length > 0 ? prices.reduce((a, b) => a + b, 0) / prices.length : 0;
+
+            // Update analytics display
+            document.getElementById('total-invested').textContent = totalInvested.toFixed(2);
+            document.getElementById('total-btc').textContent = totalBTC.toFixed(8);
+            document.getElementById('avg-price').textContent = `₿${avgPrice.toFixed(2)}`;
+            document.getElementById('success-rate').textContent = totalTransactions > 0 ? '100%' : '0%';
+        }
+
+        // Socket.IO Connection
         const socket = io();
 
         socket.on('connect', () => {
-            console.log("✅ Connected to SocketIO");
+            console.log('✅ Connected to server');
             socket.emit('request_latest');
         });
 
         socket.on('latest_data', (data) => {
-            const table = document.getElementById("table-body");
-            table.innerHTML = ''; // clear table
-
-            if (!data || data.length === 0) {
-                const tr = document.createElement("tr");
-                tr.innerHTML = `<td colspan="5">No data available</td>`;
-                table.appendChild(tr);
-                return;
+            updateHistoryTable(data);
+            if (document.querySelector('.tab-content.active').id === 'analytics') {
+                loadAnalytics();
             }
+        });
 
-            data.forEach(row => {
-                const tr = document.createElement("tr");
-                tr.innerHTML = `
-                    <td>${row.purchase_time}</td>
-                    <td>${row.usdt_amount.toFixed(2)}</td>
-                    <td>${row.btc_quantity.toFixed(8)}</td>
-                    <td>${row.btc_price.toFixed(2)}</td>
-                    <td>${row.order_id}</td>
+        socket.on('schedule_update', (data) => {
+            showAlert('Schedule updated successfully!', 'success');
+            setTimeout(() => location.reload(), 1000);
+        });
+
+        socket.on('schedule_delete', (data) => {
+            showAlert('Schedule deleted successfully!', 'success');
+            setTimeout(() => location.reload(), 1000);
+        });
+
+        socket.on('total_amount_update', (data) => {
+            document.querySelector('.total-amount .value').textContent = `${parseFloat(data.total_amount).toFixed(2)} USDT`;
+        });
+
+        function updateHistoryTable(data) {
+            const tbody = document.getElementById('history-table');
+            if (!data || data.length === 0) return;
+
+            tbody.innerHTML = '';
+            data.forEach(record => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>
+                        <i class="fas fa-calendar"></i>
+                        ${record.purchase_time}
+                    </td>
+                    <td>
+                        <span class="bitcoin-color font-bold">${record.usdt_amount.toFixed(2)}</span>
+                    </td>
+                    <td>
+                        <span class="font-bold">${record.btc_quantity.toFixed(8)}</span>
+                    </td>
+                    <td>
+                        <span class="font-bold">฿${record.btc_price.toFixed(2)}</span>
+                    </td>
+                    <td>
+                        <code style="font-size: 0.75rem;">${record.order_id || 'N/A'}</code>
+                    </td>
+                    <td>
+                        ${record.schedule_id ? `<span class="btn btn-secondary btn-sm">#${record.schedule_id}</span>` : '<span class="opacity-75">Manual</span>'}
+                    </td>
                 `;
-                table.appendChild(tr);
+                tbody.appendChild(row);
+            });
+        }
+
+        // Status Check
+        function checkSchedulerStatus() {
+            fetch('/scheduler_status')
+                .then(response => response.json())
+                .then(data => {
+                    const indicator = document.querySelector('.status-indicator');
+                    const statusText = document.querySelector('.scheduler-status span');
+                    
+                    if (data.status === 'Scheduler is running') {
+                        indicator.className = 'status-indicator status-running';
+                        statusText.textContent = 'Scheduler: Online';
+                    } else {
+                        indicator.className = 'status-indicator status-error';
+                        statusText.textContent = 'Scheduler: Offline';
+                    }
+                })
+                .catch(error => {
+                    console.error('Status check failed:', error);
+                    const indicator = document.querySelector('.status-indicator');
+                    indicator.className = 'status-indicator status-error';
+                });
+        }
+
+        // Close modal when clicking outside
+        document.getElementById('edit-modal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeEditModal();
+            }
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            checkSchedulerStatus();
+            setInterval(checkSchedulerStatus, 30000); // Check every 30 seconds
+            
+            // Load analytics if it's the active tab
+            if (document.querySelector('.tab-content.active').id === 'analytics') {
+                loadAnalytics();
+            }
+        });
+
+        // Add smooth scrolling and animations
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                document.querySelector(this.getAttribute('href')).scrollIntoView({
+                    behavior: 'smooth'
+                });
+            });
+        });
+
+        // Add loading states to buttons
+        document.querySelectorAll('form').forEach(form => {
+            form.addEventListener('submit', function() {
+                const submitBtn = this.querySelector('button[type="submit"]');
+                if (submitBtn) {
+                    const originalText = submitBtn.innerHTML;
+                    submitBtn.innerHTML = '<span class="spinner"></span> Processing...';
+                    submitBtn.disabled = true;
+                    
+                    setTimeout(() => {
+                        submitBtn.innerHTML = originalText;
+                        submitBtn.disabled = false;
+                    }, 3000);
+                }
             });
         });
     </script>

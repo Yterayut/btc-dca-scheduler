@@ -1,10 +1,38 @@
-venv/
+# Environment and secrets
+.env
+.env.*
+SECRET_KEY
+*.key
+*.pem
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Logs and data files
 *.log
-*.pyc
-*.sqlite3
-*.save
 *.txt
 *.sql
-.env
+*.sqlite
+*.sqlite3
 
+# Backup files
+*.backup
+*.save
+*.success
+*_backup*
+*copy*
+*_21052025
+*_262025
+*.txty
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

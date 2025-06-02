@@ -3,6 +3,7 @@ import logging
 import MySQLdb
 import asyncio
 import threading
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -21,8 +22,6 @@ required_env_vars = {
     'DB_USER': os.getenv('DB_USER'),
     'DB_PASSWORD': os.getenv('DB_PASSWORD'),
     'DB_NAME': os.getenv('DB_NAME'),
-    'LINE_CHANNEL_ACCESS_TOKEN': os.getenv('LINE_CHANNEL_ACCESS_TOKEN'),
-    'LINE_USER_ID': os.getenv('LINE_USER_ID'),
     'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY'),
     'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET')
 }
@@ -43,20 +42,59 @@ logging.basicConfig(
     ]
 )
 
-# Health check server
+# Health check server with port conflict handling
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"Scheduler is running")
+    
+    def log_message(self, format, *args):
+        # Suppress HTTP server logs
+        return
+
+def is_port_in_use(port):
+    """Check if a port is already in use"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
+def find_available_port(start_port, max_attempts=10):
+    """Find an available port starting from start_port"""
+    for i in range(max_attempts):
+        port = start_port + i
+        if not is_port_in_use(port):
+            return port
+    return None
 
 def start_health_check():
-    """Start a simple HTTP server for health check."""
-    port = int(os.getenv('HEALTH_CHECK_PORT', 8001))
-    server = HTTPServer(('localhost', port), HealthCheckHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    logging.info(f"Health check server started on port {port}")
+    """Start a simple HTTP server for health check with port conflict handling."""
+    base_port = int(os.getenv('HEALTH_CHECK_PORT', 8001))
+    
+    # Check if base port is in use
+    if is_port_in_use(base_port):
+        logging.warning(f"Port {base_port} is already in use, finding alternative...")
+        available_port = find_available_port(base_port + 1)
+        
+        if available_port:
+            port = available_port
+            logging.info(f"Using alternative port {port} for health check")
+            # Update environment variable for other processes
+            os.environ['HEALTH_CHECK_PORT'] = str(port)
+        else:
+            logging.error("No available ports found for health check server")
+            return None
+    else:
+        port = base_port
+    
+    try:
+        server = HTTPServer(('localhost', port), HealthCheckHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        logging.info(f"Health check server started on port {port}")
+        return server
+    except Exception as e:
+        logging.error(f"Failed to start health check server on port {port}: {e}")
+        return None
 
 # MySQL connection with retry
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -103,23 +141,20 @@ def validate_schedule(schedule_time_str: str, schedule_days: list) -> None:
         raise ValueError(f"Invalid schedule_day: {invalid_days}")
 
 # Purchase BTC
-async def purchase_btc(now: datetime) -> None:
+async def purchase_btc(now: datetime, purchase_amount: float, schedule_id: int) -> None:
     """Purchase BTC on Binance and save to database.
 
     Args:
         now (datetime): Current timestamp.
+        purchase_amount (float): Amount of USDT to purchase.
+        schedule_id (int): ID of the schedule for tracking.
     """
     db = None
     cursor = None
     try:
         db = get_db_connection()
         cursor = db.cursor()
-        cursor.execute("SELECT purchase_amount FROM config WHERE id = 1")
-        result = cursor.fetchone()
-        if not result:
-            raise ValueError("No purchase amount found in config")
-        purchase_amount = float(result[0])
-        logging.info(f"Purchase amount: {purchase_amount} USDT")
+        logging.info(f"Purchase amount for schedule {schedule_id}: {purchase_amount} USDT")
 
         balance = client.get_asset_balance(asset='USDT')
         available_usdt = float(balance['free'])
@@ -154,7 +189,7 @@ async def purchase_btc(now: datetime) -> None:
         formatted_quantity = f"{filled_quantity:.8f}"
 
         message = (
-            f"✅ DCA BTC Success\n"
+            f"✅ DCA BTC Success (Schedule ID: {schedule_id})\n"
             f"{current_time} - Purchased {purchase_amount} USDT\n"
             f"BUY: {formatted_quantity} BTC, Price: ฿{filled_price:.2f}\n"
             f"Order ID: {order['orderId']}"
@@ -165,13 +200,13 @@ async def purchase_btc(now: datetime) -> None:
         send_line_message(message)
 
         cursor.execute("""
-            INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id)
-            VALUES (NOW(), %s, %s, %s, %s)
-        """, (purchase_amount, filled_quantity, filled_price, order['orderId']))
+            INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id)
+            VALUES (NOW(), %s, %s, %s, %s, %s)
+        """, (purchase_amount, filled_quantity, filled_price, order['orderId'], schedule_id))
         db.commit()
 
     except Exception as e:
-        error_message = f"Error in purchase_btc: {e}"
+        error_message = f"Error in purchase_btc (Schedule ID: {schedule_id}): {e}"
         logging.error(error_message)
         print(error_message)
         send_line_message(error_message)
@@ -184,64 +219,60 @@ async def purchase_btc(now: datetime) -> None:
 
 # Main scheduler loop
 async def run_loop_scheduler():
-    """Run the DCA scheduler to purchase BTC based on configuration."""
+    """Run the DCA scheduler to purchase BTC based on multiple schedules."""
     print("⏳ Real-time BTC DCA scheduler started...")
-    last_run_date = None
-    config_cache = None
+    config_cache = []
     cache_expiry = datetime.now(timezone('Asia/Bangkok'))
+    last_run_times = {}  # Track last run time for each schedule_id
 
     while True:
         try:
             now = datetime.now(timezone('Asia/Bangkok'))
             current_day = now.strftime("%A").lower()
             current_time_str = now.strftime("%H:%M")
-            current_date = now.strftime("%Y-%m-%d")
+            current_datetime = now.strftime("%Y-%m-%d %H:%M")
 
-            if now >= cache_expiry or config_cache is None:
+            # Refresh config cache every 5 minutes
+            if now >= cache_expiry or not config_cache:
                 db = get_db_connection()
                 cursor = db.cursor()
-                cursor.execute("SELECT schedule_time, schedule_day FROM config WHERE id = 1")
-                config_cache = cursor.fetchone()
+                cursor.execute("SELECT id, schedule_time, schedule_day, purchase_amount FROM schedules WHERE is_active = 1")
+                config_cache = cursor.fetchall()
                 cursor.close()
                 db.close()
                 cache_expiry = now + timedelta(minutes=5)
-                logging.info("Config cache refreshed")
+                logging.info(f"Config cache refreshed - Found {len(config_cache)} active schedules")
 
             if not config_cache:
-                logging.warning("No schedule config found.")
+                logging.warning("No active schedules found.")
                 await asyncio.sleep(10)
                 continue
 
-            schedule_time_raw, schedule_day = config_cache
+            for schedule in config_cache:
+                schedule_id, schedule_time_str, schedule_day, purchase_amount = schedule
 
-            if isinstance(schedule_time_raw, timedelta):
-                total_seconds = int(schedule_time_raw.total_seconds())
-                hours, remainder = divmod(total_seconds, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                schedule_time_str = f"{hours:02d}:{minutes:02d}"
-            elif isinstance(schedule_time_raw, str):
-                schedule_time_str = schedule_time_raw[:5]
-            else:
-                schedule_time_str = schedule_time_raw.strftime("%H:%M")
+                # Validate schedule
+                schedule_days = [d.strip().lower() for d in schedule_day.split(",")]
+                validate_schedule(schedule_time_str, schedule_days)
 
-            schedule_days = [d.strip().lower() for d in schedule_day.split(",")]
-            validate_schedule(schedule_time_str, schedule_days)
+                logging.debug(f"[CHECK] Schedule ID: {schedule_id} | Now: {current_day} {current_time_str} | Config: {schedule_days} {schedule_time_str}")
+                time_diff = abs((datetime.strptime(current_time_str, "%H:%M") - 
+                                 datetime.strptime(schedule_time_str, "%H:%M")).total_seconds())
+                logging.debug(f"Time diff for Schedule ID {schedule_id}: {time_diff} seconds")
 
-            logging.info(f"[CHECK] Now: {current_day} {current_time_str} | Config: {schedule_days} {schedule_time_str}")
-            time_diff = abs((datetime.strptime(current_time_str, "%H:%M") - 
-                            datetime.strptime(schedule_time_str, "%H:%M")).total_seconds())
-            logging.info(f"Time diff: {time_diff} seconds")
-
-            if current_day in schedule_days and time_diff <= 15:
-                if last_run_date != current_date:
-                    logging.info(f"⏰ Matched schedule at {current_time_str}, executing purchase...")
-                    await purchase_btc(now)
-                    last_run_date = current_date
-                    await asyncio.sleep(60 - (now.second % 60))
+                # Check if this schedule should run
+                if current_day in schedule_days and time_diff <= 15:
+                    last_run = last_run_times.get(schedule_id)
+                    current_schedule_time = f"{now.strftime('%Y-%m-%d')} {schedule_time_str}"
+                    if last_run != current_schedule_time:
+                        logging.info(f"⏰ Matched schedule ID {schedule_id} at {current_time_str}, executing purchase...")
+                        await purchase_btc(now, purchase_amount, schedule_id)
+                        last_run_times[schedule_id] = current_schedule_time
+                        await asyncio.sleep(60 - (now.second % 60))  # Wait until next minute
+                    else:
+                        logging.debug(f"⏳ Schedule ID {schedule_id} already executed at {schedule_time_str} today.")
                 else:
-                    logging.info("⏳ Already executed for this day.")
-            else:
-                logging.debug(f"Schedule not matched: day={current_day} in {schedule_days}, time_diff={time_diff}")
+                    logging.debug(f"Schedule ID {schedule_id} not matched: day={current_day} in {schedule_days}, time_diff={time_diff}")
 
             await asyncio.sleep(10)
 
@@ -251,12 +282,27 @@ async def run_loop_scheduler():
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
+    health_server = None
     try:
-        start_health_check()
-        asyncio.run(run_loop_scheduler())
+        # Start health check server
+        health_server = start_health_check()
+        
+        if health_server:
+            logging.info("🚀 Starting BTC DCA scheduler...")
+            send_line_message("🚀 BTC DCA Scheduler Started")
+            asyncio.run(run_loop_scheduler())
+        else:
+            logging.error("Failed to start health check server, exiting...")
+            exit(1)
+            
     except KeyboardInterrupt:
         logging.info("Scheduler stopped by user")
+        send_line_message("🛑 BTC DCA Scheduler Stopped")
     except Exception as e:
         logging.error(f"Fatal error: {e}")
-        send_line_message(f"Scheduler fatal error: {e}")
+        send_line_message(f"💥 Scheduler fatal error: {e}")
         raise
+    finally:
+        if health_server:
+            health_server.shutdown()
+            logging.info("Health check server shutdown")
