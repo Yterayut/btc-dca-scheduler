@@ -19,6 +19,18 @@ env/
 *.sqlite
 *.sqlite3
 
+# Runtime artifacts
+log/
+web.lock
+web.pid
+web.out
+scheduler.out
+scheduler.pid
+*.pid
+*.out
+codex.gpt
+backup_files/
+
 # Backup files
 *.backup
 *.save

@@ -6,8 +6,9 @@ load_dotenv()
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+USE_TESTNET = str(os.getenv('USE_BINANCE_TESTNET', os.getenv('BINANCE_TESTNET', '0'))).lower() in ('1','true','yes','on')
 
-client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, testnet=USE_TESTNET)
 
 def get_btc_price():
     try:
@@ -19,4 +20,3 @@ def get_btc_price():
 
 def get_client():
     return client
-

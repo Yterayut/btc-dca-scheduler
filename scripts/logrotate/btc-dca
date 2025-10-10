@@ -1,0 +1,16 @@
+%h/yterayut-project/DCA/app.log
+%h/yterayut-project/DCA/web.out
+%h/yterayut-project/DCA/web.err
+%h/yterayut-project/DCA/scheduler.out
+%h/yterayut-project/DCA/scheduler.err
+%h/yterayut-project/DCA/btc_purchase_log.log
+{
+    size 10M
+    rotate 7
+    copytruncate
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+

@@ -6,6 +6,22 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Exchange name mapping for user-facing notifications
+_EXCHANGE_LABELS = {
+    'binance': 'Binance',
+    'okx': 'OKX',
+}
+
+
+def format_exchange_label(name: str | None) -> str:
+    """Return a human-friendly exchange name for notification text."""
+    if not name:
+        return 'Unknown'
+    key = str(name).strip()
+    if not key:
+        return 'Unknown'
+    return _EXCHANGE_LABELS.get(key.lower(), key.upper())
+
 def send_line_message(message: str) -> bool:
     """
     ส่งข้อความผ่าน Line Bot API
@@ -262,6 +278,25 @@ def send_system_notification(message_type: str, details: str) -> bool:
     
     return send_line_message_with_retry(message)
 
+def notify_exchange_changed(exchange: str, flags: dict | None = None) -> bool:
+    """
+    แจ้งเตือนเมื่อเปลี่ยน Exchange สำหรับ DCA (global)
+    flags: { 'testnet': bool, 'dry_run': bool }
+    """
+    suffix = []
+    try:
+        if flags:
+            if flags.get('testnet'):
+                suffix.append('TESTNET')
+            if flags.get('dry_run'):
+                suffix.append('DRY_RUN')
+    except Exception:
+        pass
+    suffix_text = f" ({'/'.join(suffix)})" if suffix else ''
+    ex = (exchange or '').upper()
+    msg = f"🔄 เปลี่ยน Exchange สำหรับ DCA เป็น: {ex}{suffix_text}"
+    return send_line_message_with_retry(msg)
+
 def send_scheduler_status(status: str, details: str = "") -> bool:
     """
     ส่งสถานะของ scheduler
@@ -382,6 +417,124 @@ def send_email_notification(message: str, email: str = None) -> bool:
     # TODO: Implement email notification using SMTP
     print(f"📧 Email notification: {message}")
     return True
+
+# ====== Strategy notifications (stubs ready to use) ======
+def notify_cdc_transition(prev_status: str, curr_status: str) -> bool:
+    icon = '🟢' if (curr_status or '').lower() == 'up' else '🔻'
+    msg = f"{icon} CDC Action Zone Transition (1D)\n{prev_status or 'unknown'} → {curr_status}"
+    return send_line_message_with_retry(msg)
+
+def notify_half_sell_executed(data: dict) -> bool:
+    pct = data.get('pct')
+    header = f"✅ Sell {pct}% Executed" if pct is not None else "✅ Half-Sell Executed"
+    exchange = format_exchange_label(data.get('exchange'))
+    msg = (
+        f"{header}\n"
+        f"Exchange: {exchange}\n"
+        f"Qty: {data.get('btc_qty', 0):.8f} BTC\n"
+        f"Price: ฿{data.get('price', 0):,.2f}\n"
+        f"Proceeds: {data.get('usdt', 0):,.2f} USDT\n"
+        f"Order ID: {data.get('order_id', 'N/A')}"
+    )
+    return send_line_message_with_retry(msg)
+
+def notify_half_sell_skipped(data: dict) -> bool:
+    pct = data.get('pct')
+    header = f"⚠️ Sell {pct}% Skipped" if pct is not None else "⚠️ Half-Sell Skipped (Too Small)"
+    msg = (
+        f"{header}\n"
+        f"Reason: {data.get('reason', 'notional below minimum')}\n"
+        f"BTC Free: {data.get('btc_free', 0):.8f} | stepSize: {data.get('step', 0)}\n"
+        f"MinNotional: {data.get('min_notional', 0)}"
+    )
+    exch = data.get('exchange')
+    if exch:
+        msg += f"\nExchange: {format_exchange_label(exch)}"
+    return send_line_message_with_retry(msg)
+
+def notify_weekly_dca_buy(data: dict) -> bool:
+    exchange = format_exchange_label(data.get('exchange'))
+    schedule = data.get('schedule_id')
+    schedule_label = schedule if schedule not in (None, '') else '-'
+    msg = (
+        f"✅ Weekly DCA Buy (CDC: GREEN)\n"
+        f"Exchange: {exchange}\n"
+        f"Buy: {data.get('usdt', 0):.2f} USDT\n"
+        f"Got: {data.get('btc_qty', 0):.8f} BTC\n"
+        f"Price: ฿{data.get('price', 0):,.2f}\n"
+        f"Schedule: #{schedule_label}\n"
+        f"Order ID: {data.get('order_id', 'N/A')}"
+    )
+    return send_line_message_with_retry(msg)
+
+def notify_weekly_dca_skipped(amount: float, reserve: float) -> bool:
+    amt = float(amount or 0.0)
+    res_val = float(reserve or 0.0)
+    msg = (
+        f"⏸ Weekly DCA Skipped (CDC: RED)\n"
+        f"+{amt:,.2f} USDT to reserve\n"
+        f"Reserve: {res_val:,.2f} USDT"
+    )
+    return send_line_message_with_retry(msg)
+
+
+def notify_weekly_dca_skipped_exchange(exchange: str, amount: float, reserve: float) -> bool:
+    exchange_label = format_exchange_label(exchange)
+    amt = float(amount or 0.0)
+    res_val = float(reserve or 0.0)
+    msg = (
+        f"⏸ Weekly DCA Skipped (CDC: RED)\n"
+        f"Exchange: {exchange_label}\n"
+        f"+{amt:,.2f} USDT to reserve\n"
+        f"Reserve: {res_val:,.2f} USDT"
+    )
+    return send_line_message_with_retry(msg)
+
+def notify_reserve_buy_executed(data: dict) -> bool:
+    exchange = format_exchange_label(data.get('exchange'))
+    msg = (
+        f"✅ Reserve Buy Executed\n"
+        f"Exchange: {exchange}\n"
+        f"Spend: {data.get('spend', 0):.2f} USDT\n"
+        f"Got: {data.get('btc_qty', 0):.8f} BTC\n"
+        f"Price: ฿{data.get('price', 0):,.2f}\n"
+        f"Reserve Left: {data.get('reserve_left', 0):,.2f} USDT\n"
+        f"Order ID: {data.get('order_id', 'N/A')}"
+    )
+    return send_line_message_with_retry(msg)
+
+def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:
+    msg = (
+        f"⚠️ Reserve Buy Skipped (Below minNotional)\n"
+        f"Spend: {data.get('spend', 0):.2f} < {data.get('min_notional', 0):,.2f}\n"
+        f"Reserve: {data.get('reserve', 0):,.2f} USDT"
+    )
+    return send_line_message_with_retry(msg)
+
+def notify_strategy_error(context: str, error: str) -> bool:
+    msg = f"❌ Strategy Error\n{context}\n🚨 {error}"
+    return send_line_message_with_retry(msg)
+
+def notify_cdc_toggle(enabled: bool, flags: dict | None = None) -> bool:
+    """แจ้งเตือนเมื่อสลับสถานะ CDC Trading แบบ Global
+    flags: { 'testnet': bool, 'dry_run': bool }
+    """
+    suffix = []
+    try:
+        if flags:
+            if flags.get('testnet'):
+                suffix.append('TESTNET')
+            if flags.get('dry_run'):
+                suffix.append('DRY_RUN')
+    except Exception:
+        pass
+    suffix_text = f" ({'/'.join(suffix)})" if suffix else ''
+
+    if enabled:
+        msg = f"🟢 CDC Trading Enabled (1D){suffix_text}\nระบบจะทำ DCA ตาม CDC Action Zone"
+    else:
+        msg = f"⏸ CDC Trading Disabled{suffix_text}\nระบบจะทำ DCA ตามตารางปกติ ไม่พิจารณา CDC"
+    return send_line_message_with_retry(msg)
 
 if __name__ == "__main__":
     # รันการทดสอบ

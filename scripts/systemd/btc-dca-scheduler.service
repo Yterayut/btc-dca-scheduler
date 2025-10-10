@@ -1,0 +1,21 @@
+[Unit]
+Description=BTC DCA Scheduler (trading engine)
+After=network.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/yterayut-project/DCA
+EnvironmentFile=%h/yterayut-project/DCA/.env.production
+# Ensure production flags; remove STRATEGY_DRY_RUN for live
+Environment=STRATEGY_DRY_RUN=0
+ExecStart=%h/yterayut-project/DCA/venv/bin/python main.py
+Restart=always
+RestartSec=5
+User=%i
+LimitNOFILE=65535
+StandardOutput=append:%h/yterayut-project/DCA/scheduler.out
+StandardError=append:%h/yterayut-project/DCA/scheduler.err
+
+[Install]
+WantedBy=multi-user.target
+

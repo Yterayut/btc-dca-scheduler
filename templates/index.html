@@ -171,6 +171,10 @@
         .total-amount {
             text-align: right;
         }
+        .env-badges { display:flex; gap:6px; justify-content:flex-end; margin-top:6px; }
+        .env-badges .badge { font-size: 0.65rem; padding: 0.2rem 0.4rem; }
+        .reserve-badges-top { display:flex; gap:6px; justify-content:flex-end; margin-top:6px; }
+        .reserve-badges-top .badge { font-size: 0.65rem; padding: 0.2rem 0.4rem; }
 
         .total-amount .label {
             font-size: 0.875rem;
@@ -202,6 +206,9 @@
             transition: all 0.3s ease;
             position: relative;
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
 
         .stat-card::before {
@@ -240,6 +247,48 @@
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
+
+        /* CDC color overrides */
+        .stat-value.cdc-green {
+            background: var(--gradient-success) !important;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .stat-value.cdc-red {
+            background: linear-gradient(135deg, var(--danger-color) 0%, #dc2626 100%) !important;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+        }
+        .badge-success { color: #84f3c9; border-color: #064e3b; }
+        .badge-danger { color: #fca5a5; border-color: #7f1d1d; }
+        .badge-ex-binance { color: #fbbf24; border-color: #92400e; }
+        .badge-ex-okx { color: #60a5fa; border-color: #1e3a8a; }
+        .badge-res-bz { color: #fbbf24; border-color: #92400e; }
+        .badge-res-okx { color: #60a5fa; border-color: #1e3a8a; }
+        .badge-ex-binance { color: #fbbf24; border-color: #92400e; }
+        .badge-ex-okx { color: #60a5fa; border-color: #1e3a8a; }
+        .badge-res-bz { color: #fbbf24; border-color: #92400e; }
+        .badge-res-okx { color: #60a5fa; border-color: #1e3a8a; }
+        .toggle {
+            display: flex; align-items: center; gap: 0.5rem;
+        }
+        .toggle input { width: 40px; height: 20px; }
+        .meta-badges { display:flex; gap:6px; justify-content:center; margin-top:6px; }
+        .meta-badges .badge { font-size: 0.65rem; padding: 0.2rem 0.4rem; }
+        .cdc-controls { display:flex; align-items:center; justify-content:space-between; gap: 8px; margin-top: 10px; }
+        .cdc-controls .left { display:flex; align-items:center; gap:8px; }
+        .cdc-controls .right { display:flex; gap:8px; }
 
         .stat-label {
             font-size: 0.875rem;
@@ -616,6 +665,46 @@
             }
         }
 
+        /* Small phones (Honor 90 5G friendly) */
+        @media (max-width: 480px) {
+            .header { padding: 1.25rem 0; }
+            .header h1 { font-size: 1.6rem; }
+            .header p { font-size: 0.95rem; }
+
+            .container { padding: 0 0.75rem; }
+
+            .tabs { gap: 0.4rem; padding: 0.4rem; }
+            .tab-button { padding: 0.6rem 0.75rem; font-size: 0.95rem; }
+
+            .card { padding: 1rem; margin-bottom: 1rem; }
+            .card h2 { font-size: 1.1rem; }
+
+            .stat-value { font-size: 1.25rem; }
+            .stat-label { font-size: 0.75rem; }
+            .stat-icon { font-size: 1.1rem; }
+            .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
+
+            /* Charts height smaller on mobile */
+            #investmentChart, #performanceChart { height: 200px !important; }
+
+            /* Table compact */
+            th, td { padding: 0.6rem; font-size: 0.9rem; }
+            .table-container { border-radius: 0.5rem; }
+
+            /* Hide less-important columns in Binance Trades table on mobile */
+            #analytics table th:nth-child(6),
+            #analytics table td:nth-child(6), /* Fee */
+            #analytics table th:nth-child(7),
+            #analytics table td:nth-child(7), /* Order ID */
+            #analytics table th:nth-child(8),
+            #analytics table td:nth-child(8)  /* Trade ID */
+            { display: none; }
+
+            /* Make inline controls stack */
+            input[type="datetime-local"] { width: 100%; max-width: none !important; }
+            .btn { width: 100%; }
+        }
+
         /* Utility Classes */
         .text-center { text-align: center; }
         .text-right { text-align: right; }
@@ -681,9 +770,82 @@
                 <div class="status-indicator {% if 'running' in (stats.scheduler_status if stats else 'unknown') %}status-running{% else %}status-error{% endif %}"></div>
                 <span>Scheduler: {{ stats.scheduler_status if stats else 'Unknown' }}</span>
             </div>
+            <div class="reserve-badges-top" id="reserveBadgesTop"></div>
             <div class="total-amount">
                 <div class="label">Total Active Amount</div>
                 <div class="value">{{ total_amount|floatformat(2) }} USDT</div>
+            </div>
+        </div>
+
+        <!-- Wallet Status -->
+        <div class="stats-grid" id="wallet-status">
+            <!-- OKX row -->
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                <div class="stat-value" id="wallet-okx-usdt">0.00</div>
+                <div class="stat-label">OKX-USDT Balance (free)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fab fa-bitcoin"></i></div>
+                <div class="stat-value" id="wallet-okx-btc">0.00000000</div>
+                <div class="stat-label">OKX-BTC Balance (free)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-dollar-sign"></i></div>
+                <div class="stat-value" id="wallet-okx-value">0.00</div>
+                <div class="stat-label">OKX-Portfolio Value (USDT)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-piggy-bank"></i></div>
+                <div class="stat-value" id="wallet-okx-reserve">0.00</div>
+                <div class="stat-label">OKX-Reserve USDT</div>
+            </div>
+            <!-- Binance row -->
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                <div class="stat-value" id="wallet-binance-usdt">0.00</div>
+                <div class="stat-label">BINANCE-USDT Balance (free)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fab fa-bitcoin"></i></div>
+                <div class="stat-value" id="wallet-binance-btc">0.00000000</div>
+                <div class="stat-label">BINANCE-BTC Balance (free)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-dollar-sign"></i></div>
+                <div class="stat-value" id="wallet-binance-value">0.00</div>
+                <div class="stat-label">BINANCE-Portfolio Value (USDT)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-piggy-bank"></i></div>
+                <div class="stat-value" id="wallet-binance-reserve">0.00</div>
+                <div class="stat-label">BINANCE-Reserve USDT</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fas fa-piggy-bank"></i></div>
+                <div class="stat-value" id="wallet-total-reserve">0.00</div>
+                <div class="stat-label">Reserve USDT (Total)</div>
+            </div>
+            <div class="stat-card" id="cdc-card">
+                <div>
+                    <div class="stat-icon"><i class="fas fa-wave-square"></i></div>
+                    <div class="stat-value cdc-red" id="cdc-status">DOWN</div>
+                    <div class="stat-label">CDC ACTION ZONE (1D)</div>
+                    <div class="meta-badges" id="cdc-flags-badges"></div>
+                </div>
+                <div>
+                    <div style="margin-top:8px; display:flex; align-items:center; justify-content:center; gap:8px;">
+                        <span id="cdc-enabled-badge" class="badge">CDC Trading: ?</span>
+                    </div>
+                    <div class="cdc-controls">
+                        <div class="left">
+                            <label class="toggle"><input type="checkbox" id="cdc-toggle"> <span>Enable CDC</span></label>
+                        </div>
+                        <div class="right">
+                            <button class="btn btn-secondary btn-sm" id="use-reserve-btn" title="Use Reserve Now (admin)">Use Reserve Now</button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -751,6 +913,10 @@
                 <i class="fas fa-chart-line"></i>
                 Analytics
             </button>
+            <button class="tab-button" onclick="switchTab('strategy')">
+                <i class="fas fa-cogs"></i>
+                Strategy
+            </button>
         </div>
 
         <!-- Schedules Tab -->
@@ -760,37 +926,69 @@
                     <i class="fas fa-calendar-alt"></i>
                     Active Schedules
                 </h2>
+                <div style="margin-bottom: .75rem; display:flex; gap:.5rem; align-items:center; flex-wrap: wrap;">
+                    <label style="color:var(--text-secondary); font-size:.9rem;">Mode Filter:</label>
+                    <select id="sch-mode-filter" class="form-control" style="max-width:220px;">
+                        <option value="all" selected>ALL</option>
+                        <option value="global">GLOBAL</option>
+                        <option value="binance">BINANCE</option>
+                        <option value="okx">OKX</option>
+                        <option value="both">BOTH</option>
+                    </select>
+                </div>
                 <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Time</th>
-                                <th>Days</th>
-                                <th>Amount (USDT)</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for schedule in schedules %}
-                            <tr>
-                                <td><span class="font-bold">#{{ schedule[0] }}</span></td>
-                                <td>
-                                    <i class="fas fa-clock"></i>
-                                    {{ schedule[1] }}
-                                </td>
-                                <td>
-                                    <span class="btn btn-secondary btn-sm">{{ schedule[2] }}</span>
-                                </td>
-                                <td>
-                                    <span class="bitcoin-color font-bold">{{ schedule[3]|floatformat(2) }}</span>
-                                </td>
-                                <td>
-                                    {% if schedule[4] %}
-                                        <span class="btn btn-success btn-sm">
-                                            <i class="fas fa-check"></i> Active
-                                        </span>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Time</th>
+                                        <th>Days</th>
+                                        <th>Amount (USDT)</th>
+                                        <th>Mode</th>
+                                        <th>Split Amounts</th>
+                                        <th>Next Run</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="schedules-tbody">
+                                    {% for schedule in schedules %}
+                                    <tr data-mode="{{ (schedule[5]|lower) if schedule|length>5 else 'global' }}">
+                                        <td><span class="font-bold">#{{ schedule[0] }}</span></td>
+                                        <td>
+                                            <i class="fas fa-clock"></i>
+                                            {{ schedule[1] }}
+                                        </td>
+                                        <td>
+                                            <span class="btn btn-secondary btn-sm">{{ schedule[2] }}</span>
+                                        </td>
+                                        <td>
+                                            <span class="bitcoin-color font-bold">{{ schedule[3]|floatformat(2) }}</span>
+                                        </td>
+                                        <td>
+                                            {% if schedule|length > 5 %}
+                                                <span class="badge">{{ schedule[5]|upper }}</span>
+                                            {% else %}
+                                                <span class="badge">GLOBAL</span>
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if schedule|length > 7 %}
+                                                <span class="badge">BZ: {{ schedule[6] if schedule[6] else 0.0 }}</span>
+                                                <span class="badge">OKX: {{ schedule[7] if schedule[7] else 0.0 }}</span>
+                                            {% else %}
+                                                <span class="opacity-75">-</span>
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            <i class="fas fa-hourglass-half"></i>
+                                            {{ next_run_map.get(schedule[0], '-') if next_run_map else '-' }}
+                                        </td>
+                                        <td>
+                                            {% if schedule[4] %}
+                                                <span class="btn btn-success btn-sm">
+                                                    <i class="fas fa-check"></i> Active
+                                                </span>
                                     {% else %}
                                         <span class="btn btn-secondary btn-sm">
                                             <i class="fas fa-pause"></i> Inactive
@@ -798,7 +996,7 @@
                                     {% endif %}
                                 </td>
                                 <td>
-                                    <button class="btn btn-primary btn-sm" onclick="openEditModal({{ schedule[0] }}, '{{ schedule[1] }}', '{{ schedule[2] }}', {{ schedule[3] }}, {{ schedule[4] }})">
+                                    <button class="btn btn-primary btn-sm" onclick="openEditModal({{ schedule[0] }}, '{{ schedule[1] }}', '{{ schedule[2] }}', {{ schedule[3] }}, {{ schedule[4] }}, '{{ schedule[5] if schedule|length>5 else 'global' }}', '{{ schedule[6] if schedule|length>6 else '' }}', '{{ schedule[7] if schedule|length>7 else '' }}')">
                                         <i class="fas fa-edit"></i> Edit
                                     </button>
                                     <form action="/delete_schedule/{{ schedule[0] }}" method="POST" style="display:inline;" onsubmit="return confirm('Are you sure?')">
@@ -856,21 +1054,46 @@
                         </button>
                     </div>
                     
-                    <div class="form-group">
-                        <label class="checkbox-item">
-                            <input type="checkbox" name="is_active" value="1" checked>
-                            <span>
-                                <i class="fas fa-power-off"></i>
-                                Active Schedule
-                            </span>
+                <div class="form-group">
+                    <label class="checkbox-item">
+                        <input type="checkbox" name="is_active" value="1" checked>
+                        <span>
+                            <i class="fas fa-power-off"></i>
+                            Active Schedule
+                        </span>
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label>Exchange Mode</label>
+                    <select id="ex-mode" name="exchange_mode" class="form-control" style="max-width:220px;">
+                        <option value="global" selected>Global (use Strategy exchange)</option>
+                        <option value="binance">Binance</option>
+                        <option value="okx">OKX</option>
+                        <option value="both">Both (split)</option>
+                    </select>
+                    <small style="color:var(--text-secondary);">Both = ซื้อทั้งสองฝั่งตามจำนวนที่กำหนด</small>
+                </div>
+
+                <div class="form-group" id="ex-amounts" style="display:none;">
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <label style="display:flex; flex-direction:column; gap:6px;">
+                            <span>Binance amount (USDT)</span>
+                            <input type="number" step="0.01" min="0" id="binance-amount" name="binance_amount" class="form-control" style="width:180px;" placeholder="e.g., 10">
+                        </label>
+                        <label style="display:flex; flex-direction:column; gap:6px;">
+                            <span>OKX amount (USDT)</span>
+                            <input type="number" step="0.01" min="0" id="okx-amount" name="okx_amount" class="form-control" style="width:180px;" placeholder="e.g., 10">
                         </label>
                     </div>
+                    <small style="color:var(--text-secondary);">ใส่เฉพาะฝั่งที่ต้องการ ถ้า Both ต้องรวมมากกว่า 0</small>
+                </div>
                     
-                    <button type="submit" class="btn btn-primary">
-                        <i class="fas fa-plus"></i>
-                        Add Schedule
-                    </button>
-                </form>
+                <button type="submit" class="btn btn-primary">
+                    <i class="fas fa-plus"></i>
+                    Add Schedule
+                </button>
+            </form>
             </div>
         </div>
 
@@ -881,6 +1104,18 @@
                     <i class="fas fa-history"></i>
                     Purchase History
                 </h2>
+                <div style="margin-bottom: .75rem; display:flex; gap:.5rem; align-items:center; flex-wrap: wrap;">
+                    <label style="color:var(--text-secondary); font-size:.9rem;">Export:</label>
+                    <select id="ph-exchange" class="form-control" style="max-width:180px;">
+                        <option value="all">All</option>
+                        <option value="binance">Binance</option>
+                        <option value="okx">OKX</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" onclick="exportPurchaseHistory()">
+                        <i class="fas fa-file-export"></i>
+                        Export CSV
+                    </button>
+                </div>
                 <div class="table-container">
                     <table>
                         <thead>
@@ -934,6 +1169,148 @@
             </div>
         </div>
 
+        <!-- Strategy Tab -->
+        <div id="strategy" class="tab-content">
+            <div class="card">
+                <h2><i class="fas fa-sliders-h"></i> CDC Strategy Settings</h2>
+                <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin:12px 0;">
+                    <span id="exchange-current-note" class="badge">Current Exchange: -</span>
+                    <button class="btn btn-secondary btn-sm" id="clear-admin-token"><i class="fas fa-eraser"></i> Clear Token</button>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:20px;">
+                    <div style="flex:1 1 280px; border:1px solid rgba(255,255,255,0.1); border-radius:12px; padding:16px; background:rgba(255,255,255,0.02);">
+                        <h3 style="margin-top:0; display:flex; align-items:center; gap:8px;"><i class="fab fa-btc"></i> Binance</h3>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <span>Sell on RED (%)</span>
+                                <input type="number" id="sell-percent-binance" class="form-control" style="width:120px;" min="0" max="100" step="1" placeholder="0-100">
+                            </label>
+                            <button class="btn btn-primary btn-sm" id="save-sell-binance"><i class="fas fa-save"></i> Save</button>
+                            <span id="sell-percent-binance-note" class="badge">Current: -</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+                            <button class="btn btn-secondary btn-sm" id="apply-exchange-binance"><i class="fas fa-exchange-alt"></i> Apply Binance</button>
+                            <span id="binance-exchange-note" class="badge">Status: -</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <span>Move to Reserve (USDT)</span>
+                                <input type="number" id="reserve-binance-input" class="form-control" style="width:140px;" min="0" step="0.01" placeholder="e.g., 100">
+                            </label>
+                            <button class="btn btn-primary btn-sm" id="reserve-binance-btn"><i class="fas fa-piggy-bank"></i> Transfer</button>
+                            <span id="reserve-binance-note" class="badge">Reserve: -</span>
+                        </div>
+                    </div>
+                    <div style="flex:1 1 280px; border:1px solid rgba(255,255,255,0.1); border-radius:12px; padding:16px; background:rgba(255,255,255,0.02);">
+                        <h3 style="margin-top:0; display:flex; align-items:center; gap:8px;"><i class="fab fa-ethereum"></i> OKX</h3>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <span>Sell on RED (%)</span>
+                                <input type="number" id="sell-percent-okx" class="form-control" style="width:120px;" min="0" max="100" step="1" placeholder="0-100">
+                            </label>
+                            <button class="btn btn-primary btn-sm" id="save-sell-okx"><i class="fas fa-save"></i> Save</button>
+                            <span id="sell-percent-okx-note" class="badge">Current: -</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <span>OKX Max per order (USDT)</span>
+                                <input type="number" id="okx-max-input" class="form-control" style="width:160px;" min="1" step="1" placeholder="e.g., 10">
+                            </label>
+                            <button class="btn btn-primary btn-sm" id="save-okx-max"><i class="fas fa-save"></i> Save</button>
+                            <span id="okx-max-note" class="badge">Current: -</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+                            <button class="btn btn-secondary btn-sm" id="apply-exchange-okx"><i class="fas fa-exchange-alt"></i> Apply OKX</button>
+                            <span id="okx-exchange-note" class="badge">Status: -</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <span>Move to Reserve (USDT)</span>
+                                <input type="number" id="reserve-okx-input" class="form-control" style="width:140px;" min="0" step="0.01" placeholder="e.g., 100">
+                            </label>
+                            <button class="btn btn-primary btn-sm" id="reserve-okx-btn"><i class="fas fa-piggy-bank"></i> Transfer</button>
+                            <span id="reserve-okx-note" class="badge">Reserve: -</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom: 12px;">
+                    <label style="display:flex; align-items:center; gap:8px;">
+                        <span>Half-Sell Mode</span>
+                        <select id="half-sell-mode" class="form-control" style="width:220px;">
+                            <option value="auto_proportional">Both exchanges (split)</option>
+                            <option value="binance_only">Binance only</option>
+                            <option value="okx_only">OKX only</option>
+                        </select>
+                    </label>
+                    <button class="btn btn-primary btn-sm" id="save-half-sell-mode"><i class="fas fa-save"></i> Save</button>
+                    <span id="half-sell-note" class="badge">Current: -</span>
+                </div>
+            </div>
+            <div class="card">
+                <h2><i class="fas fa-piggy-bank"></i> Exchange Reserves</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                        <div class="stat-value" id="bz-reserve">0.00</div>
+                        <div class="stat-label">Binance Reserve (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                        <div class="stat-value" id="okx-reserve">0.00</div>
+                        <div class="stat-label">OKX Reserve (USDT)</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <h2><i class="fas fa-stream"></i> Sell History</h2>
+                <div style="margin-bottom: .75rem; display:flex; gap:.5rem; align-items:center; flex-wrap: wrap;">
+                    <label style="color:var(--text-secondary); font-size:.9rem;">Export:</label>
+                    <select id="sh-exchange" class="form-control" style="max-width:180px;">
+                        <option value="all">All</option>
+                        <option value="binance">Binance</option>
+                        <option value="okx">OKX</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" onclick="exportSellHistory()">
+                        <i class="fas fa-file-export"></i>
+                        Export CSV
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Symbol</th>
+                                <th>BTC Qty</th>
+                                <th>Proceeds (USDT)</th>
+                                <th>Avg Price</th>
+                                <th>Order ID</th>
+                                <th>%</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sell-history-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card">
+                <h2><i class="fas fa-piggy-bank"></i> Reserve Log</h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Change (USDT)</th>
+                                <th>Reserve After</th>
+                                <th>Reason</th>
+                                <th>Note</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reserve-log-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <!-- Analytics Tab -->
         <div id="analytics" class="tab-content">
             <div class="stats-grid">
@@ -965,6 +1342,21 @@
                     <div class="stat-value" id="success-rate">100%</div>
                     <div class="stat-label">Success Rate</div>
                 </div>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-dollar-sign"></i></div>
+                    <div class="stat-value" id="current-price">0.00</div>
+                    <div class="stat-label">Current BTC Price (USDT)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                    <div class="stat-value" id="portfolio-value">0.00</div>
+                    <div class="stat-label">Unrealized Value (USDT)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-balance-scale"></i></div>
+                    <div class="stat-value" id="unrealized-pnl">0.00 (0%)</div>
+                    <div class="stat-label">Unrealized PnL</div>
+                </div>
             </div>
 
             <div class="card">
@@ -972,11 +1364,8 @@
                     <i class="fas fa-chart-area"></i>
                     Investment Summary
                 </h2>
-                <div id="investment-chart" class="text-center" style="height: 300px; display: flex; align-items: center; justify-content: center; color: var(--text-secondary);">
-                    <div>
-                        <i class="fas fa-chart-line" style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.3;"></i>
-                        <p>Analytics will be available after first purchase</p>
-                    </div>
+                <div class="text-center" style="height: 320px;">
+                    <canvas id="investmentChart" height="300"></canvas>
                 </div>
             </div>
 
@@ -985,12 +1374,161 @@
                     <i class="fas fa-trophy"></i>
                     DCA Performance
                 </h2>
-                <div class="stats-grid">
-                    <div style="text-align: center; padding: 2rem;">
-                        <i class="fas fa-rocket" style="font-size: 2rem; color: var(--primary-color); margin-bottom: 1rem;"></i>
-                        <h3>Your DCA Journey</h3>
-                        <p class="opacity-75">Track your Bitcoin accumulation progress over time</p>
+                <div class="text-center" style="height: 320px;">
+                    <canvas id="performanceChart" height="300"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>
+                    <i class="fas fa-exchange-alt"></i>
+                    Binance Trades (BTCUSDT)
+                </h2>
+                <div style="margin-bottom: 1rem; display:flex; gap:.5rem; align-items:center; flex-wrap: wrap;">
+                    <button class="btn btn-primary btn-sm" onclick="syncTrades()">
+                        <i class="fas fa-sync"></i>
+                        Sync Trades
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="reconcileTrades()" title="Match schedule_id from purchase history">
+                        <i class="fas fa-link"></i>
+                        Reconcile
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="exportBinanceTrades()" title="Export recent trades to CSV">
+                        <i class="fas fa-file-export"></i>
+                        Export CSV
+                    </button>
+                    <span id="sync-status" style="color: var(--text-secondary);"></span>
+                    <div style="width:100%; height:1px; background:var(--border-color);"></div>
+                    <label style="color:var(--text-secondary); font-size:.9rem;">Backfill:</label>
+                    <input type="datetime-local" id="bf-start" class="form-control" style="max-width:220px;">
+                    <span style="color:var(--text-secondary);">to</span>
+                    <input type="datetime-local" id="bf-end" class="form-control" style="max-width:220px;">
+                    <button class="btn btn-primary btn-sm" onclick="startBackfill()">
+                        <i class="fas fa-history"></i>
+                        Backfill
+                    </button>
+                    <div style="flex:1; min-width:220px;">
+                        <div id="bf-bar" style="height:8px; background:#222; border-radius:4px; overflow:hidden; display:none;">
+                            <div id="bf-bar-inner" style="height:100%; width:0%; background:var(--secondary-color);"></div>
+                        </div>
+                        <div id="bf-status" style="color:var(--text-secondary); font-size:.85rem;"></div>
                     </div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-hand-holding-usd"></i></div>
+                        <div class="stat-value" id="bz-total-buys">0.00</div>
+                        <div class="stat-label">Total Buys (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-cash-register"></i></div>
+                        <div class="stat-value" id="bz-total-sells">0.00</div>
+                        <div class="stat-label">Total Sells (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fab fa-bitcoin"></i></div>
+                        <div class="stat-value" id="bz-position">0.00000000</div>
+                        <div class="stat-label">Position (BTC)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-balance-scale"></i></div>
+                        <div class="stat-value" id="bz-avg-price">0.00</div>
+                        <div class="stat-label">Avg Price (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-chart-line"></i></div>
+                        <div class="stat-value" id="bz-unrealized">0.00</div>
+                        <div class="stat-label">Unrealized PnL (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-coins"></i></div>
+                        <div class="stat-value" id="bz-realized">0.00</div>
+                        <div class="stat-label">Realized PnL (USDT)</div>
+                    </div>
+                </div>
+                <div class="table-container" style="margin-top: 1rem;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Qty (BTC)</th>
+                                <th>Quote (USDT)</th>
+                                <th>Fee</th>
+                                <th>Order ID</th>
+                                <th>Trade ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bz-trades-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>
+                    <i class="fas fa-exchange-alt"></i>
+                    OKX Trades (BTC‑USDT)
+                </h2>
+                <div style="margin-bottom: 1rem; display:flex; gap:.5rem; align-items:center; flex-wrap: wrap;">
+                    <button class="btn btn-primary btn-sm" onclick="syncOkxTrades()">
+                        <i class="fas fa-sync"></i>
+                        Sync OKX Trades
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="exportOkxTrades()" title="Export recent OKX trades to CSV">
+                        <i class="fas fa-file-export"></i>
+                        Export CSV
+                    </button>
+                    <span id="okx-sync-status" style="color: var(--text-secondary);"></span>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-hand-holding-usd"></i></div>
+                        <div class="stat-value" id="okx-total-buys">0.00</div>
+                        <div class="stat-label">Total Buys (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-cash-register"></i></div>
+                        <div class="stat-value" id="okx-total-sells">0.00</div>
+                        <div class="stat-label">Total Sells (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fab fa-bitcoin"></i></div>
+                        <div class="stat-value" id="okx-position">0.00000000</div>
+                        <div class="stat-label">Position (BTC)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-balance-scale"></i></div>
+                        <div class="stat-value" id="okx-avg-price">0.00</div>
+                        <div class="stat-label">Avg Price (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-chart-line"></i></div>
+                        <div class="stat-value" id="okx-unrealized">0.00</div>
+                        <div class="stat-label">Unrealized PnL (USDT)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-coins"></i></div>
+                        <div class="stat-value" id="okx-realized">0.00</div>
+                        <div class="stat-label">Realized PnL (USDT)</div>
+                    </div>
+                </div>
+                <div class="table-container" style="margin-top: 1rem;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Qty (BTC)</th>
+                                <th>Quote (USDT)</th>
+                                <th>Fee</th>
+                                <th>Order ID</th>
+                                <th>Fill ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="okx-trades-body"></tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -1049,6 +1587,27 @@
                         </span>
                     </label>
                 </div>
+                <div class="form-group">
+                    <label>Exchange Mode</label>
+                    <select id="edit-ex-mode" name="exchange_mode" class="form-control" style="max-width:220px;">
+                        <option value="global">Global</option>
+                        <option value="binance">Binance</option>
+                        <option value="okx">OKX</option>
+                        <option value="both">Both</option>
+                    </select>
+                </div>
+                <div class="form-group" id="edit-ex-amounts" style="display:none;">
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <label style="display:flex; flex-direction:column; gap:6px;">
+                            <span>Binance amount (USDT)</span>
+                            <input type="number" step="0.01" min="0" id="edit-binance-amount" name="binance_amount" class="form-control" style="width:180px;" placeholder="e.g., 10">
+                        </label>
+                        <label style="display:flex; flex-direction:column; gap:6px;">
+                            <span>OKX amount (USDT)</span>
+                            <input type="number" step="0.01" min="0" id="edit-okx-amount" name="okx_amount" class="form-control" style="width:180px;" placeholder="e.g., 10">
+                        </label>
+                    </div>
+                </div>
                 
                 <div style="display: flex; gap: 1rem; justify-content: flex-end;">
                     <button type="button" class="btn btn-secondary" onclick="closeEditModal()">
@@ -1073,6 +1632,7 @@
 
     <!-- Socket.IO -->
     <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     
     <script>
         // Tab Switching
@@ -1096,6 +1656,9 @@
             const amount = document.getElementById('amount').value;
             const time = document.getElementById('time').value;
             const days = document.querySelectorAll('input[name="day"]:checked');
+            const mode = document.getElementById('ex-mode')?.value || 'global';
+            const bz = parseFloat(document.getElementById('binance-amount')?.value || '0');
+            const ok = parseFloat(document.getElementById('okx-amount')?.value || '0');
 
             if (parseFloat(amount) <= 0) {
                 showAlert('Please enter a positive amount.', 'error');
@@ -1114,6 +1677,11 @@
                 event.preventDefault();
                 return false;
             }
+
+            // Validate per exchange mode
+            if (mode === 'binance' && !(bz > 0)) { showAlert('Binance amount must be > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'okx' && !(ok > 0)) { showAlert('OKX amount must be > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'both' && !((bz + ok) > 0)) { showAlert('Both mode requires total amount > 0', 'error'); event.preventDefault(); return false; }
 
             return true;
         }
@@ -1122,6 +1690,9 @@
             const amount = document.getElementById('edit-amount').value;
             const time = document.getElementById('edit-time').value;
             const days = document.querySelectorAll('#edit-days input[name="day"]:checked');
+            const mode = document.getElementById('edit-ex-mode')?.value || 'global';
+            const bz = parseFloat(document.getElementById('edit-binance-amount')?.value || '0');
+            const ok = parseFloat(document.getElementById('edit-okx-amount')?.value || '0');
 
             if (parseFloat(amount) <= 0) {
                 showAlert('Please enter a positive amount.', 'error');
@@ -1141,11 +1712,27 @@
                 return false;
             }
 
+            if (mode === 'binance' && !(bz > 0)) { showAlert('Binance amount must be > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'okx' && !(ok > 0)) { showAlert('OKX amount must be > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'both' && !((bz + ok) > 0)) { showAlert('Both mode requires total amount > 0', 'error'); event.preventDefault(); return false; }
+
+            // Admin token for edit (optional)
+            let token = sessionStorage.getItem('ADMIN_TOKEN');
+            if (!token) {
+                token = window.prompt('Enter ADMIN_TOKEN to update schedule (leave empty if not required):') || '';
+                if (token) sessionStorage.setItem('ADMIN_TOKEN', token);
+            }
+            let hid = document.getElementById('edit-admin-token');
+            if (!hid) {
+                hid = document.createElement('input'); hid.type='hidden'; hid.name='admin_token'; hid.id='edit-admin-token';
+                document.getElementById('edit-form').appendChild(hid);
+            }
+            hid.value = token;
             return true;
         }
 
         // Modal Functions
-        function openEditModal(id, time, days, amount, isActive) {
+function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) {
             const modal = document.getElementById('edit-modal');
             const form = document.getElementById('edit-form');
             
@@ -1164,8 +1751,27 @@
                 if (checkbox) checkbox.checked = true;
             });
 
-            modal.style.display = 'flex';
-        }
+    // Exchange mode fields in modal
+    const exSel = document.getElementById('edit-ex-mode');
+    const box = document.getElementById('edit-ex-amounts');
+    const bz = document.getElementById('edit-binance-amount');
+    const ok = document.getElementById('edit-okx-amount');
+    if (exSel && box) {
+        exSel.value = exMode || 'global';
+        bz.value = (bzAmt || '');
+        ok.value = (okxAmt || '');
+        const apply = () => {
+            const m = exSel.value;
+            if (m === 'both') { box.style.display=''; bz.disabled=false; ok.disabled=false; }
+            else if (m === 'binance') { box.style.display=''; bz.disabled=false; ok.disabled=true; ok.value=''; }
+            else if (m === 'okx') { box.style.display=''; bz.disabled=true; bz.value=''; ok.disabled=false; }
+            else { box.style.display='none'; bz.disabled=false; ok.disabled=false; }
+        };
+        exSel.onchange = apply; apply();
+    }
+
+    modal.style.display = 'flex';
+}
 
         function closeEditModal() {
             document.getElementById('edit-modal').style.display = 'none';
@@ -1188,51 +1794,537 @@
         }
 
         // Analytics Functions
-        function loadAnalytics() {
-            const historyRows = document.querySelectorAll('#history-table tr');
-            let totalInvested = 0;
-            let totalBTC = 0;
-            let totalTransactions = 0;
-            let prices = [];
+        let investmentChartInstance = null;
+        let performanceChartInstance = null;
 
-            historyRows.forEach(row => {
-                const cells = row.querySelectorAll('td');
-                if (cells.length >= 4) {
-                    const usdt = parseFloat(cells[1].textContent.replace(/[^\d.-]/g, ''));
-                    const btc = parseFloat(cells[2].textContent);
-                    const price = parseFloat(cells[3].textContent.replace(/[^\d.-]/g, ''));
-
-                    if (!isNaN(usdt) && !isNaN(btc) && !isNaN(price)) {
-                        totalInvested += usdt;
-                        totalBTC += btc;
-                        totalTransactions++;
-                        prices.push(price);
+        function renderInvestmentChart(series) {
+            const ctx = document.getElementById('investmentChart').getContext('2d');
+            if (investmentChartInstance) {
+                investmentChartInstance.destroy();
+            }
+            investmentChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: series.timestamps,
+                    datasets: [
+                        {
+                            label: 'Cumulative USDT',
+                            data: series.cumulative_usdt,
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16,185,129,0.15)',
+                            tension: 0.3,
+                            yAxisID: 'y',
+                            fill: true,
+                        },
+                        {
+                            label: 'Cumulative BTC',
+                            data: series.cumulative_btc,
+                            borderColor: '#6366f1',
+                            backgroundColor: 'rgba(99,102,241,0.15)',
+                            tension: 0.3,
+                            yAxisID: 'y1',
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e5e7eb' } },
+                        tooltip: { mode: 'index', intersect: false }
+                    },
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: { ticks: { color: '#a1a1aa' }, grid: { color: 'rgba(255,255,255,0.07)' } },
+                        y: {
+                            type: 'linear',
+                            position: 'left',
+                            ticks: { color: '#a1a1aa' },
+                            grid: { color: 'rgba(255,255,255,0.07)' },
+                            title: { display: true, text: 'USDT', color: '#a1a1aa' }
+                        },
+                        y1: {
+                            type: 'linear',
+                            position: 'right',
+                            ticks: { color: '#a1a1aa' },
+                            grid: { drawOnChartArea: false },
+                            title: { display: true, text: 'BTC', color: '#a1a1aa' }
+                        }
                     }
                 }
             });
+        }
 
-            const avgPrice = prices.length > 0 ? prices.reduce((a, b) => a + b, 0) / prices.length : 0;
+        function renderPerformanceChart(series, avgPrice) {
+            const ctx = document.getElementById('performanceChart').getContext('2d');
+            if (performanceChartInstance) {
+                performanceChartInstance.destroy();
+            }
+            performanceChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: series.timestamps,
+                    datasets: [
+                        {
+                            label: 'Purchase Price',
+                            data: series.price,
+                            borderColor: '#f59e0b',
+                            backgroundColor: 'rgba(245,158,11,0.15)',
+                            tension: 0.3,
+                        },
+                        {
+                            label: 'Average Cost',
+                            data: series.timestamps.map((_, i) => {
+                                // running average cost = cumulative_usdt / cumulative_btc
+                                const usdt = series.cumulative_usdt[i];
+                                const btc = series.cumulative_btc[i];
+                                return btc > 0 ? usdt / btc : 0;
+                            }),
+                            borderColor: '#22c55e',
+                            backgroundColor: 'rgba(34,197,94,0.15)',
+                            borderDash: [6, 6],
+                            tension: 0.3,
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e5e7eb' } }
+                    },
+                    scales: {
+                        x: { ticks: { color: '#a1a1aa' }, grid: { color: 'rgba(255,255,255,0.07)' } },
+                        y: { ticks: { color: '#a1a1aa' }, grid: { color: 'rgba(255,255,255,0.07)' }, title: { display: true, text: 'Price (฿)', color: '#a1a1aa' } }
+                    }
+                }
+            });
+        }
 
-            // Update analytics display
-            document.getElementById('total-invested').textContent = totalInvested.toFixed(2);
-            document.getElementById('total-btc').textContent = totalBTC.toFixed(8);
-            document.getElementById('avg-price').textContent = `₿${avgPrice.toFixed(2)}`;
-            document.getElementById('success-rate').textContent = totalTransactions > 0 ? '100%' : '0%';
+        function loadAnalytics() {
+            fetch('/api/analytics')
+                .then(r => r.json())
+                .then(data => {
+                    if (!data || data.error) return;
+
+                    document.getElementById('total-invested').textContent = (data.total_invested || 0).toFixed(2);
+                    document.getElementById('total-btc').textContent = (data.total_btc || 0).toFixed(8);
+                    document.getElementById('avg-price').textContent = `₿${(data.avg_price || 0).toFixed(2)}`;
+                    document.getElementById('success-rate').textContent = `${Math.round(data.success_rate || 0)}%`;
+                    document.getElementById('current-price').textContent = (data.current_price || 0).toFixed(2);
+                    document.getElementById('portfolio-value').textContent = (data.portfolio_value || 0).toFixed(2);
+                    const pnlAbs = data.pnl_abs || 0;
+                    const pnlPct = data.pnl_pct || 0;
+                    const pnlEl = document.getElementById('unrealized-pnl');
+                    pnlEl.textContent = `${pnlAbs.toFixed(2)} (${pnlPct.toFixed(2)}%)`;
+                    pnlEl.style.color = pnlAbs >= 0 ? '#10b981' : '#ef4444';
+
+                    if ((data.count || 0) > 0) {
+                        renderInvestmentChart(data.series);
+                        renderPerformanceChart(data.series, data.avg_price);
+                    }
+                })
+                .catch(err => console.error('Analytics error:', err));
+        }
+
+        // Binance Trades
+        function syncTrades() {
+            const statusEl = document.getElementById('sync-status');
+            statusEl.textContent = 'Syncing...';
+
+            const parseJsonSafe = async (res) => {
+                try { return await res.json(); } catch (_) { return null; }
+            };
+
+            const handleResult = (data) => {
+                const count = (data && typeof data.synced !== 'undefined') ? data.synced : 0;
+                statusEl.textContent = `Synced: ${count}`;
+                loadBinanceTrades();
+                loadBinanceAnalytics();
+            };
+
+            // Try POST first, then fallback to GET if not OK or parsing fails
+            fetch('/api/sync_trades', { method: 'POST' })
+                .then(async (res) => {
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const data = await parseJsonSafe(res);
+                    if (!data) throw new Error('Invalid JSON');
+                    handleResult(data);
+                })
+                .catch(() => {
+                    fetch('/api/sync_trades')
+                        .then(async (res) => {
+                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                            const data = await parseJsonSafe(res);
+                            if (!data) throw new Error('Invalid JSON');
+                            handleResult(data);
+                        })
+                        .catch(err => {
+                            statusEl.textContent = 'Sync failed';
+                            console.error('Sync error:', err);
+                        });
+                });
+        }
+
+        function reconcileTrades() {
+            const el = document.getElementById('sync-status');
+            el.textContent = 'Reconciling...';
+            fetch('/api/reconcile_trades', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    el.textContent = `Reconciled: ${data.updated || 0}`;
+                    loadBinanceTrades();
+                    loadBinanceAnalytics();
+                })
+                .catch(err => {
+                    el.textContent = 'Reconcile failed';
+                    console.error(err);
+                });
+        }
+
+        function startBackfill() {
+            const start = document.getElementById('bf-start').value;
+            const end = document.getElementById('bf-end').value;
+            if (!start || !end) {
+                alert('Please select start and end time');
+                return;
+            }
+            const bar = document.getElementById('bf-bar');
+            const inner = document.getElementById('bf-bar-inner');
+            const status = document.getElementById('bf-status');
+            bar.style.display = 'block';
+            inner.style.width = '0%';
+            status.textContent = 'Starting backfill...';
+            fetch('/api/sync_trades_range', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start, end }) })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.task_id) { status.textContent = 'Failed to start backfill'; return; }
+                    pollBackfill(data.task_id);
+                })
+                .catch(err => { status.textContent = 'Failed to start backfill'; console.error(err); });
+        }
+
+        function pollBackfill(taskId) {
+            const inner = document.getElementById('bf-bar-inner');
+            const status = document.getElementById('bf-status');
+            const timer = setInterval(() => {
+                fetch(`/api/sync_trades_progress?task_id=${taskId}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.error) { status.textContent = data.error; clearInterval(timer); return; }
+                        inner.style.width = `${data.progress || 0}%`;
+                        status.textContent = `${data.status || ''} | Synced: ${data.synced || 0} | ${data.progress || 0}%`;
+                        if (data.status === 'done' || data.status === 'error') {
+                            clearInterval(timer);
+                            loadBinanceTrades();
+                            loadBinanceAnalytics();
+                        }
+                    })
+                    .catch(err => { status.textContent = 'Progress error'; clearInterval(timer); console.error(err); });
+            }, 1000);
+        }
+
+        function loadBinanceTrades() {
+            fetch('/api/binance_trades')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('bz-trades-body');
+                    if (!tbody) return;
+                    tbody.innerHTML = '';
+                    (data.trades || []).forEach(tr => {
+                        const trEl = document.createElement('tr');
+                        trEl.innerHTML = `
+                            <td>${tr.trade_time}</td>
+                            <td>${tr.side}</td>
+                            <td>${tr.price.toFixed(2)}</td>
+                            <td>${tr.qty.toFixed(8)}</td>
+                            <td>${tr.quote_qty.toFixed(2)}</td>
+                            <td>${tr.commission.toFixed(8)} ${tr.commission_asset}</td>
+                            <td>${tr.order_id}</td>
+                            <td>${tr.trade_id}</td>
+                        `;
+                        tbody.appendChild(trEl);
+                    });
+                })
+                .catch(err => console.error(err));
+        }
+
+        function loadBinanceAnalytics() {
+            fetch('/api/binance_trades_analytics')
+                .then(r => r.json())
+                .then(data => {
+                    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                    set('bz-total-buys', (data.total_buys_usdt || 0).toFixed(2));
+                    set('bz-total-sells', (data.total_sells_usdt || 0).toFixed(2));
+                    set('bz-position', (data.position_btc || 0).toFixed(8));
+                    set('bz-avg-price', (data.avg_price || 0).toFixed(2));
+                    const unreal = data.unrealized_pnl || 0;
+                    const real = data.realized_pnl || 0;
+                    set('bz-unrealized', unreal.toFixed(2));
+                    set('bz-realized', real.toFixed(2));
+                })
+                .catch(err => console.error(err));
+        }
+
+        function loadWallet() {
+            fetch('/api/wallet')
+                .then(r => r.json())
+                .then(data => {
+                    if (!data) return;
+                    const setVal = (id, value, digits) => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+                        let num = Number(value || 0);
+                        if (!Number.isFinite(num)) {
+                            num = 0;
+                        }
+                        el.textContent = num.toFixed(digits);
+                    };
+                    const okx = data.okx || {};
+                    const binance = data.binance || {};
+                    setVal('wallet-okx-usdt', okx.usdt_free || 0, 2);
+                    setVal('wallet-binance-usdt', binance.usdt_free || 0, 2);
+                    setVal('wallet-okx-btc', okx.btc_free || 0, 8);
+                    setVal('wallet-binance-btc', binance.btc_free || 0, 8);
+                    setVal('wallet-okx-value', okx.portfolio_value || 0, 2);
+                    setVal('wallet-binance-value', binance.portfolio_value || 0, 2);
+                    setVal('wallet-okx-reserve', okx.reserve || 0, 2);
+                    setVal('wallet-binance-reserve', binance.reserve || 0, 2);
+                    if (data.totals && typeof data.totals.reserve !== 'undefined') {
+                        setVal('wallet-total-reserve', data.totals.reserve || 0, 2);
+                    }
+                })
+                .catch(err => console.error('Wallet error:', err));
+        }
+
+        // CDC Action Zone (1D) loader
+        function loadCdcStatus() {
+            fetch('/api/cdc_action_zone')
+                .then(r => r.json())
+                .then(data => {
+                    const el = document.getElementById('cdc-status');
+                    if (!el || !data) return;
+                    const isUp = String(data.status || '').toLowerCase() === 'up';
+                    el.textContent = isUp ? 'UP' : 'DOWN';
+                    el.classList.remove('cdc-green', 'cdc-red');
+                    el.classList.add(isUp ? 'cdc-green' : 'cdc-red');
+                })
+                .catch(err => console.error('CDC status error:', err));
+        }
+
+        // Strategy state (cdc_enabled, reserve, etc.)
+        function loadStrategyState() {
+            fetch('/api/strategy_state')
+                .then(r => r.json())
+                .then(data => {
+                    const badge = document.getElementById('cdc-enabled-badge');
+                    const toggle = document.getElementById('cdc-toggle');
+                    const reserveEl = document.getElementById('wallet-total-reserve');
+                    const flagsEl = document.getElementById('cdc-flags-badges');
+                    const exchangeBadge = document.getElementById('exchange-current-note');
+                    const binStatus = document.getElementById('binance-exchange-note');
+                    const okxStatus = document.getElementById('okx-exchange-note');
+                    if (badge) {
+                        const en = !!data.cdc_enabled;
+                        badge.textContent = `CDC Trading: ${en ? 'ON' : 'OFF'}`;
+                        badge.className = `badge ${en ? 'badge-success' : 'badge-danger'}`;
+                    }
+                    if (toggle) {
+                        toggle.checked = !!data.cdc_enabled;
+                    }
+                    const currentExchange = String(data.exchange || 'binance').toLowerCase();
+                    if (exchangeBadge) {
+                        exchangeBadge.textContent = `Current Exchange: ${currentExchange.toUpperCase()}`;
+                    }
+                    if (binStatus) {
+                        binStatus.textContent = `Status: ${currentExchange === 'binance' ? 'Active' : 'Standby'}`;
+                    }
+                    if (okxStatus) {
+                        okxStatus.textContent = `Status: ${currentExchange === 'okx' ? 'Active' : 'Standby'}`;
+                    }
+                    try {
+                        const parsePercent = (val) => {
+                            if (typeof val === 'number' && Number.isFinite(val)) return val;
+                            const parsed = parseInt(val, 10);
+                            return Number.isFinite(parsed) ? parsed : null;
+                        };
+                        const globalDefault = parsePercent(data.sell_percent);
+                        const spBin = parsePercent(data.sell_percent_binance);
+                        const spOk = parsePercent(data.sell_percent_okx);
+                        const binValue = spBin !== null ? spBin : globalDefault;
+                        const okxValue = spOk !== null ? spOk : globalDefault;
+                        const spBinNote = document.getElementById('sell-percent-binance-note');
+                        const spOkNote = document.getElementById('sell-percent-okx-note');
+                        const spBinInput = document.getElementById('sell-percent-binance');
+                        const spOkInput = document.getElementById('sell-percent-okx');
+                        if (spBinNote) spBinNote.textContent = binValue === null ? 'Current: -' : `Current: ${binValue}%`;
+                        if (spOkNote) spOkNote.textContent = okxValue === null ? 'Current: -' : `Current: ${okxValue}%`;
+                        if (spBinInput && binValue !== null) spBinInput.value = binValue;
+                        if (spOkInput && okxValue !== null) spOkInput.value = okxValue;
+                    } catch (e) { /* noop */ }
+                    const halfSel = document.getElementById('half-sell-mode');
+                    const halfNote = document.getElementById('half-sell-note');
+                    const halfLabels = {
+                        'auto_proportional': 'Both exchanges',
+                        'binance_only': 'Binance only',
+                        'okx_only': 'OKX only'
+                    };
+                    const halfMode = String(data.half_sell_policy || 'auto_proportional');
+                    if (halfSel) halfSel.value = halfMode;
+                    if (halfNote) halfNote.textContent = `Current: ${halfLabels[halfMode] || halfMode}`;
+                    const reserve = (data.reserve_usdt || 0).toFixed(2);
+                    badge && (badge.title = `Reserve USDT: ${reserve}`);
+                    if (reserveEl) reserveEl.textContent = reserve;
+                    // per-exchange reserves
+                    const bzR = document.getElementById('bz-reserve');
+                    const okxR = document.getElementById('okx-reserve');
+                    if (bzR) bzR.textContent = (data.reserve_binance_usdt || 0).toFixed(2);
+                    if (okxR) okxR.textContent = (data.reserve_okx_usdt || 0).toFixed(2);
+                    const bzNote = document.getElementById('reserve-binance-note');
+                    const okxNote = document.getElementById('reserve-okx-note');
+                    if (bzNote) bzNote.textContent = `Reserve: ${(data.reserve_binance_usdt || 0).toFixed(2)} USDT`;
+                    if (okxNote) okxNote.textContent = `Reserve: ${(data.reserve_okx_usdt || 0).toFixed(2)} USDT`;
+                    if (flagsEl) {
+                        flagsEl.innerHTML = '';
+                        if (data.testnet) {
+                            const b = document.createElement('span');
+                            b.className = 'badge'; b.textContent = 'TESTNET';
+                            flagsEl.appendChild(b);
+                        }
+                        if (data.dry_run) {
+                            const b = document.createElement('span');
+                            b.className = 'badge'; b.textContent = 'DRY_RUN';
+                            flagsEl.appendChild(b);
+                        }
+                        // Show Current Exchange badge near status
+                        try {
+                            const bar = document.querySelector('.status-bar');
+                            let eb = document.getElementById('env-badges');
+                            if (!eb) {
+                                eb = document.createElement('div'); eb.id='env-badges'; eb.className='env-badges';
+                                const ta = document.querySelector('.total-amount');
+                                if (ta && ta.parentElement === bar) ta.appendChild(eb);
+                            }
+                            eb.innerHTML = '';
+                            const exb = document.createElement('span');
+                            const ex = String(data.exchange||'-').toUpperCase();
+                            exb.className = `badge ${ex==='BINANCE'?'badge-ex-binance':'badge-ex-okx'}`;
+                            exb.textContent = `EXCHANGE: ${ex}`;
+                            eb.appendChild(exb);
+                            if (data.testnet) { const t=document.createElement('span'); t.className='badge'; t.textContent='TESTNET'; eb.appendChild(t); }
+                            if (data.dry_run) { const d=document.createElement('span'); d.className='badge'; d.textContent='DRY_RUN'; eb.appendChild(d); }
+                            // compute reserve values (show only in top summary to avoid duplication)
+                            const bzR = (data.reserve_binance_usdt||0).toFixed ? data.reserve_binance_usdt.toFixed(2) : (data.reserve_binance_usdt||0);
+                            const okxR = (data.reserve_okx_usdt||0).toFixed ? data.reserve_okx_usdt.toFixed(2) : (data.reserve_okx_usdt||0);
+                            // top summary reserve badges
+                            try {
+                                const top = document.getElementById('reserveBadgesTop');
+                                if (top) {
+                                    top.innerHTML = '';
+                                    const bz2 = document.createElement('span'); bz2.className='badge badge-res-bz'; bz2.textContent=`Binance Reserve: ${bzR} USDT`;
+                                    const ok2 = document.createElement('span'); ok2.className='badge badge-res-okx'; ok2.textContent=`OKX Reserve: ${okxR} USDT`;
+                                    top.appendChild(bz2); top.appendChild(ok2);
+                                }
+                            } catch (e) {}
+                        } catch (e) {}
+                        // OKX Max per order current
+                        const okxNote = document.getElementById('okx-max-note');
+                        const okxInput = document.getElementById('okx-max-input');
+                        if (okxNote) okxNote.textContent = `Current: ${(data.okx_max_usdt||10).toFixed ? data.okx_max_usdt.toFixed(2) : data.okx_max_usdt} USDT`;
+                        if (okxInput && !okxInput.value && data.okx_max_usdt) okxInput.value = data.okx_max_usdt;
+                    }
+                })
+                .catch(err => console.error('strategy_state error:', err));
+        }
+
+        // Toggle CDC
+        function bindCdcToggle() {
+            const el = document.getElementById('cdc-toggle');
+            if (!el) return;
+            el.addEventListener('change', () => {
+                fetch('/api/strategy_toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: el.checked }) })
+                    .then(r => r.json())
+                    .then(() => loadStrategyState())
+                    .catch(err => console.error(err));
+            });
+        }
+
+        // Use reserve now (admin)
+        function bindUseReserveNow() {
+            const btn = document.getElementById('use-reserve-btn');
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                const ok1 = confirm('Use reserve USDT to buy BTC now?');
+                if (!ok1) return;
+                const ok2 = confirm('Are you sure? This will place a market order.');
+                if (!ok2) return;
+                const token = prompt('Admin token:');
+                if (!token) return;
+                fetch('/api/use_reserve_now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+                    .then(r => r.json())
+                    .then(res => {
+                        if (res && res.ok) {
+                            showAlert(`Reserve buy executed: ${res.spend?.toFixed ? res.spend.toFixed(2) : res.spend} USDT`, 'success');
+                            loadStrategyState();
+                        } else {
+                            showAlert(`Reserve buy failed: ${res.error || 'unknown'}`, 'error');
+                        }
+                    })
+                    .catch(err => showAlert(`Reserve buy error: ${err}`, 'error'));
+            });
         }
 
         // Socket.IO Connection
-        const socket = io();
+        // Force WebSocket transport to avoid Engine.IO polling 400s
+        const socket = io({ transports: ['websocket'] });
 
         socket.on('connect', () => {
             console.log('✅ Connected to server');
             socket.emit('request_latest');
         });
 
+        function applyExchange(exchange) {
+            let token = sessionStorage.getItem('ADMIN_TOKEN');
+            if (!token) {
+                token = window.prompt('Enter ADMIN_TOKEN to change exchange:');
+                if (!token) return;
+                sessionStorage.setItem('ADMIN_TOKEN', token);
+            }
+            if (!token) return;
+            fetch('/api/strategy_exchange', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ exchange, token })
+            }).then(r => r.json())
+              .then(res => {
+                if (res && res.ok) {
+                    showAlert(`Exchange switched to ${res.exchange.toUpperCase()}`, 'success');
+                    loadStrategyState();
+                } else {
+                    showAlert(`Failed: ${res.error || 'unknown'}`, 'error');
+                }
+              })
+              .catch(err => showAlert(`Error: ${err}`, 'error'));
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const bzBtn = document.getElementById('apply-exchange-binance');
+            if (bzBtn) bzBtn.addEventListener('click', () => applyExchange('binance'));
+            const okxBtn = document.getElementById('apply-exchange-okx');
+            if (okxBtn) okxBtn.addEventListener('click', () => applyExchange('okx'));
+            const clear = document.getElementById('clear-admin-token');
+            if (clear) {
+                clear.addEventListener('click', () => {
+                    sessionStorage.removeItem('ADMIN_TOKEN');
+                    showAlert('Cleared ADMIN_TOKEN from this session', 'success');
+                });
+            }
+        });
+
         socket.on('latest_data', (data) => {
             updateHistoryTable(data);
-            if (document.querySelector('.tab-content.active').id === 'analytics') {
-                loadAnalytics();
-            }
+            // Always refresh analytics when new data arrives
+            loadAnalytics();
         });
 
         socket.on('schedule_update', (data) => {
@@ -1281,6 +2373,13 @@
             });
         }
 
+        function exportPurchaseHistory() {
+            const sel = document.getElementById('ph-exchange');
+            const ex = sel ? sel.value : 'all';
+            const url = `/api/purchase_history_export?exchange=${encodeURIComponent(ex)}`;
+            window.open(url, '_blank');
+        }
+
         // Status Check
         function checkSchedulerStatus() {
             fetch('/scheduler_status')
@@ -1316,11 +2415,312 @@
             checkSchedulerStatus();
             setInterval(checkSchedulerStatus, 30000); // Check every 30 seconds
             
-            // Load analytics if it's the active tab
-            if (document.querySelector('.tab-content.active').id === 'analytics') {
-                loadAnalytics();
-            }
+            // Preload analytics + wallet on page ready
+            loadAnalytics();
+            loadWallet();
+            loadCdcStatus();
+            loadStrategyState();
+            bindCdcToggle();
+            bindUseReserveNow();
+            // Preload Binance trades + analytics from DB on page ready
+            loadBinanceTrades();
+            loadBinanceAnalytics();
+            loadSellHistory();
+            loadReserveLog();
+            // Refresh when analytics tab active
+            setInterval(() => {
+                const isAnalyticsActive = document.getElementById('analytics').classList.contains('active');
+                if (isAnalyticsActive) {
+                    loadAnalytics();
+                    loadBinanceAnalytics();
+                    // Trades table refresh is lightweight; keep it when tab is visible
+                    loadBinanceTrades();
+                }
+            }, 30000);
+            // Refresh wallet periodically
+            setInterval(loadWallet, 30000);
+            // Refresh CDC card every 60s
+            setInterval(loadCdcStatus, 60000);
+            setInterval(loadStrategyState, 60000);
+            setInterval(loadSellHistory, 60000);
+            setInterval(loadReserveLog, 60000);
         });
+
+        // Mode filter for schedules table
+        document.addEventListener('DOMContentLoaded', () => {
+            const sel = document.getElementById('sch-mode-filter');
+            const tbody = document.getElementById('schedules-tbody');
+            if (!sel || !tbody) return;
+            const apply = () => {
+                const v = (sel.value || 'all').toLowerCase();
+                tbody.querySelectorAll('tr').forEach(tr => {
+                    const m = (tr.getAttribute('data-mode') || 'global').toLowerCase();
+                    tr.style.display = (v === 'all' || v === m) ? '' : 'none';
+                });
+            };
+            sel.addEventListener('change', apply);
+            apply();
+        });
+
+        function loadSellHistory() {
+            fetch('/api/sell_history')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('sell-history-table');
+                    if (!tbody) return;
+                    tbody.innerHTML = '';
+                    (data.items || []).forEach(it => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${it.sell_time}</td>
+                            <td>${it.symbol}</td>
+                            <td>${(it.btc_quantity||0).toFixed(8)}</td>
+                            <td>${(it.usdt_received||0).toFixed(2)}</td>
+                            <td>${(it.price||0).toFixed(2)}</td>
+                            <td>${it.order_id || 'N/A'}</td>
+                            <td>${it.sell_percent ?? '-'}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                })
+                .catch(err => console.error('sell_history error:', err));
+        }
+
+        function loadReserveLog() {
+            fetch('/api/reserve_log')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('reserve-log-table');
+                    if (!tbody) return;
+                    tbody.innerHTML = '';
+                    (data.items || []).forEach(it => {
+                        const tr = document.createElement('tr');
+                        const change = parseFloat(it.change_usdt || 0);
+                        const color = change >= 0 ? 'style="color:#6ee7b7"' : 'style="color:#fca5a5"';
+                        tr.innerHTML = `
+                            <td>${it.event_time}</td>
+                            <td ${color}>${change.toFixed(2)}</td>
+                            <td>${(it.reserve_after||0).toFixed(2)}</td>
+                            <td>${it.reason || '-'}</td>
+                            <td>${it.note || '-'}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                })
+                .catch(err => console.error('reserve_log error:', err));
+        }
+
+        function bindSellPercent(buttonId, inputId, exchange, noteId) {
+            const btn = document.getElementById(buttonId);
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                const input = document.getElementById(inputId);
+                if (!input) return;
+                const v = parseInt(input.value, 10);
+                if (isNaN(v) || v < 0 || v > 100) {
+                    showAlert('Sell percent must be 0-100', 'error');
+                    return;
+                }
+                fetch('/api/strategy_update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sell_percent: v, exchange })
+                })
+                    .then(r => r.json())
+                    .then(res => {
+                        if (res && res.ok) {
+                            showAlert(`Sell percent updated for ${exchange.toUpperCase()}`, 'success');
+                            const note = document.getElementById(noteId);
+                            if (note) note.textContent = `Current: ${v}%`;
+                            loadStrategyState();
+                        } else {
+                            showAlert(`Update failed: ${res.error || 'unknown'}`, 'error');
+                        }
+                    })
+                    .catch(err => showAlert(`Update error: ${err}`, 'error'));
+            });
+        }
+
+        function bindReserveTransfer(buttonId, inputId, exchange) {
+            const btn = document.getElementById(buttonId);
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                const input = document.getElementById(inputId);
+                if (!input) return;
+                const amount = parseFloat(input.value);
+                if (isNaN(amount) || amount <= 0) {
+                    showAlert('Amount must be greater than 0', 'error');
+                    return;
+                }
+                let token = sessionStorage.getItem('ADMIN_TOKEN');
+                if (!token) {
+                    token = window.prompt('Enter ADMIN_TOKEN to adjust reserve:');
+                    if (!token) return;
+                    sessionStorage.setItem('ADMIN_TOKEN', token);
+                }
+                fetch('/api/reserve_transfer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ exchange, amount, token })
+                })
+                    .then(async (r) => {
+                        let payload = {};
+                        try {
+                            payload = await r.json();
+                        } catch (e) { /* ignore */ }
+                        if (!r.ok) {
+                            if (r.status === 403 || payload.error === 'invalid_admin_token') {
+                                sessionStorage.removeItem('ADMIN_TOKEN');
+                                showAlert('Invalid ADMIN_TOKEN. Please enter again.', 'error');
+                            } else if (payload.error === 'admin_token_not_configured') {
+                                showAlert('ADMIN_TOKEN not configured on server.', 'error');
+                            } else {
+                                showAlert(`Reserve update failed: ${payload.error || r.statusText}`, 'error');
+                            }
+                            throw new Error('reserve_transfer_failed');
+                        }
+                        return payload;
+                    })
+                    .then(res => {
+                        if (res && res.ok) {
+                            showAlert(`Reserve updated for ${exchange.toUpperCase()}`, 'success');
+                            input.value = '';
+                            loadStrategyState();
+                            loadWallet();
+                        } else {
+                            showAlert(`Reserve update failed: ${res?.error || 'unknown'}`, 'error');
+                        }
+                    })
+                    .catch(err => {
+                        if (err?.message === 'reserve_transfer_failed') return;
+                        showAlert(`Reserve update error: ${err}`, 'error');
+                    });
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            bindSellPercent('save-sell-binance', 'sell-percent-binance', 'binance', 'sell-percent-binance-note');
+            bindSellPercent('save-sell-okx', 'sell-percent-okx', 'okx', 'sell-percent-okx-note');
+            bindReserveTransfer('reserve-binance-btn', 'reserve-binance-input', 'binance');
+            bindReserveTransfer('reserve-okx-btn', 'reserve-okx-input', 'okx');
+        });
+
+        // Save half-sell mode
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = document.getElementById('save-half-sell-mode');
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                const sel = document.getElementById('half-sell-mode');
+                if (!sel) return;
+                const mode = sel.value || 'auto_proportional';
+                fetch('/api/strategy_update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ half_sell_policy: mode }) })
+                    .then(r => r.json())
+                    .then(res => {
+                        if (res && res.ok) {
+                            const labels = {
+                                'auto_proportional': 'Both exchanges',
+                                'binance_only': 'Binance only',
+                                'okx_only': 'OKX only'
+                            };
+                            showAlert('Half-sell mode updated', 'success');
+                            const note = document.getElementById('half-sell-note');
+                            if (note) note.textContent = `Current: ${labels[mode] || mode}`;
+                        } else {
+                            showAlert(`Update failed: ${res.error || 'unknown'}`, 'error');
+                        }
+                    })
+                    .catch(err => showAlert(`Update error: ${err}`, 'error'));
+            });
+        });
+
+        // Save OKX max per order
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = document.getElementById('save-okx-max');
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                const inp = document.getElementById('okx-max-input');
+                const val = parseFloat(inp.value);
+                if (isNaN(val) || val <= 0) { showAlert('Invalid OKX max USDT', 'error'); return; }
+                let token = sessionStorage.getItem('ADMIN_TOKEN');
+                if (!token) {
+                    token = window.prompt('Enter ADMIN_TOKEN to update OKX max per order:');
+                    if (!token) return;
+                    sessionStorage.setItem('ADMIN_TOKEN', token);
+                }
+                if (!token) return;
+                fetch('/api/okx_config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ okx_max_usdt: val, token }) })
+                    .then(r => r.json())
+                    .then(res => {
+                        if (res && res.ok) {
+                            showAlert('OKX max per order updated', 'success');
+                            const note = document.getElementById('okx-max-note');
+                            if (note) note.textContent = `Current: ${val.toFixed(2)} USDT`;
+                        } else {
+                            showAlert(`Update failed: ${res.error || 'unknown'}`, 'error');
+                        }
+                    })
+                    .catch(err => showAlert(`Update error: ${err}`, 'error'));
+            });
+        });
+
+        // OKX Trades UI
+        function syncOkxTrades() {
+            const st = document.getElementById('okx-sync-status');
+            st.textContent = 'Syncing...';
+            fetch('/api/okx_trades_sync', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    st.textContent = `Synced: ${d.synced || 0}`;
+                    loadOkxTrades();
+                    loadOkxAnalytics();
+                })
+                .catch(err => { st.textContent = 'Sync failed'; console.error(err); });
+        }
+
+        function loadOkxTrades() {
+            fetch('/api/okx_trades')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('okx-trades-body');
+                    if (!tbody) return;
+                    tbody.innerHTML = '';
+                    (data.trades || []).forEach(tr => {
+                        const trEl = document.createElement('tr');
+                        trEl.innerHTML = `
+                            <td>${tr.trade_time}</td>
+                            <td>${tr.side}</td>
+                            <td>${(tr.price||0).toFixed(2)}</td>
+                            <td>${(tr.qty||0).toFixed(8)}</td>
+                            <td>${(tr.quote_qty||0).toFixed(2)}</td>
+                            <td>${(tr.fee||0).toFixed(8)} ${tr.fee_ccy||''}</td>
+                            <td>${tr.ord_id||'N/A'}</td>
+                            <td>${tr.fill_id||'N/A'}</td>
+                        `;
+                        tbody.appendChild(trEl);
+                    });
+                })
+                .catch(err => console.error(err));
+        }
+
+        function loadOkxAnalytics() {
+            fetch('/api/okx_trades_analytics')
+                .then(r => r.json())
+                .then(data => {
+                    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                    set('okx-total-buys', (data.total_buys_usdt || 0).toFixed(2));
+                    set('okx-total-sells', (data.total_sells_usdt || 0).toFixed(2));
+                    set('okx-position', (data.position_btc || 0).toFixed(8));
+                    set('okx-avg-price', (data.avg_price || 0).toFixed(2));
+                    set('okx-unrealized', (data.unrealized_pnl || 0).toFixed(2));
+                    set('okx-realized', (data.realized_pnl || 0).toFixed(2));
+                })
+                .catch(err => console.error(err));
+        }
+
+        function exportOkxTrades() {
+            const url = '/api/okx_trades_export?limit=1000';
+            window.open(url, '_blank');
+        }
 
         // Add smooth scrolling and animations
         document.querySelectorAll('a[href^="#"]').forEach(anchor => {
@@ -1347,6 +2747,24 @@
                     }, 3000);
                 }
             });
+        });
+
+        // Exchange mode toggles on Add Schedule
+        document.addEventListener('DOMContentLoaded', () => {
+            const modeSel = document.getElementById('ex-mode');
+            const exBox = document.getElementById('ex-amounts');
+            const bz = document.getElementById('binance-amount');
+            const okx = document.getElementById('okx-amount');
+            if (!modeSel || !exBox) return;
+            const applyMode = () => {
+                const m = modeSel.value;
+                if (m === 'both') { exBox.style.display = ''; bz.disabled = false; okx.disabled = false; }
+                else if (m === 'binance') { exBox.style.display = ''; bz.disabled = false; okx.disabled = true; okx.value=''; }
+                else if (m === 'okx') { exBox.style.display = ''; bz.disabled = true; bz.value=''; okx.disabled = false; }
+                else { exBox.style.display = 'none'; if (bz) bz.disabled=false; if (okx) okx.disabled=false; }
+            };
+            modeSel.addEventListener('change', applyMode);
+            applyMode();
         });
     </script>
 </body>

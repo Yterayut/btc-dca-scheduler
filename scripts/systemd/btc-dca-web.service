@@ -1,0 +1,19 @@
+[Unit]
+Description=BTC DCA Web (Flask + SocketIO)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/yterayut-project/DCA
+EnvironmentFile=%h/yterayut-project/DCA/.env.production
+ExecStart=%h/yterayut-project/DCA/venv/bin/python app.py
+Restart=always
+RestartSec=5
+User=%i
+LimitNOFILE=65535
+StandardOutput=append:%h/yterayut-project/DCA/web.out
+StandardError=append:%h/yterayut-project/DCA/web.err
+
+[Install]
+WantedBy=multi-user.target
+
