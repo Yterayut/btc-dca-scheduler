@@ -219,11 +219,18 @@ Notes
 - Dry-run tests (execute_s4_dca with `DRY_RUN=1`) confirmed the message renders with schedule label and CDC status; unset the env afterward for live mode.
 - If new schedules should surface labels, remember to fill `line_channel` or embed `slot_label` inside `metadata`.
 
-2025-10-26 — LINE Flex Message Migration Plan
+2025-10-26 — LINE Flex Message Rollout
 
-- วางโรดแมปสำหรับเปลี่ยนแจ้งเตือน LINE เป็น Flex Message และบันทึกไว้ที่ `plan-flex-message.md`
-- แผนครอบคลุม: การเพิ่ม feature flag (`LINE_USE_FLEX`, allowlist), โมดูล builder ใหม่ (`notifications/line_flex.py`), สคริปต์ preview, test suite (`tests/test_line_flex.py`), rollout strategy ทีละประเภท, UX guideline และ fallback/rollback flow
-- ยังไม่เริ่ม implement; ใช้เป็น reference เมื่อพร้อมทำในอนาคต
+Highlights
+- เปิดใช้ feature flag + allowlist (`LINE_USE_FLEX`, `LINE_FLEX_ALLOWLIST`) และสร้าง scaffolding: โมดูล `notifications/line_flex.py`, สคริปต์ preview, test suite (`tests/test_line_flex.py`).
+- Weekly DCA buy/skip (ทั้ง global และ exchange) ส่ง Flex card ธีม success/warning; fallback เป็นข้อความเดิมเมื่อ flag ปิดหรือส่ง Flex ล้มเหลว.
+- Reserve buy executed และ half-sell executed แสดง Flex card แยกธีม (`success`, `danger`) พร้อม holdings/meta ใน footer.
+- S4 DCA buy และ S4 rotation แปลงเป็น Flex card ผ่าน theme `info`, footer แสดงคำสั่ง sell/buy และ realized notional.
+- เพิ่ม unit tests ครอบ routing/fallback สำหรับทุก channel Flex ใหม่, Update release notes v2.2.0–v2.2.3 พร้อมแท็ก GitHub.
+
+Operational notes
+- ทดสอบ DRY_RUN ผ่าน notify ฟังก์ชัน → Flex card ขึ้นใน LINE แล้ว; staging/production ใช้ allowlist `weekly_dca,reserve_buy,half_sell,s4_dca,s4_rotation`.
+- `memory.md` เก็บตัวอย่าง card เพื่อ reference สี/ข้อมูลก่อน iterate ต่อ.
 
 2025-10-18 — OKX S4 DCA Fix & Notifications
 
