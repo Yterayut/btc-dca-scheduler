@@ -362,6 +362,85 @@ def notify_s4_rotation(payload: dict) -> bool:
     notes = payload.get('notes') or {}
 
     exchange = str(payload.get('exchange') or 'BINANCE').upper()
+    executed = payload.get('executed')
+    meta_entries = _meta_entries(payload if isinstance(payload, dict) else {})
+
+    if flex_allowed('s4_rotation'):
+        sections: list[tuple[str, str]] = [
+            ("Exchange", exchange),
+            ("Amount", f"{amount:,.2f} USDT"),
+            ("Legs", f"{from_leg} → {to_leg}"),
+            ("CDC", cdc_status),
+        ]
+        try:
+            if btc_price:
+                sections.append(("BTC Price", f"{float(btc_price):,.2f} USD"))
+            if gold_price:
+                sections.append(("Gold Price", f"{float(gold_price):,.2f} USD"))
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(notes, dict) and notes:
+            delta = notes.get('delta_pct')
+            target = notes.get('target_btc_pct')
+            exposure = notes.get('exposure_btc_pct')
+            if delta is not None:
+                try:
+                    sections.append(("Δ BTC Weight", f"{float(delta):.2f}%"))
+                except (TypeError, ValueError):
+                    pass
+            if target is not None:
+                try:
+                    sections.append(("Target BTC", f"{float(target):.2f}%"))
+                except (TypeError, ValueError):
+                    pass
+            if exposure is not None:
+                try:
+                    sections.append(("Current BTC", f"{float(exposure):.2f}%"))
+                except (TypeError, ValueError):
+                    pass
+
+        footer_bits: list[str] = []
+        if isinstance(executed, dict):
+            sell = executed.get('sell_order') or {}
+            buy = executed.get('buy_order') or {}
+            try:
+                sell_qty = float(sell.get('executed_qty') or 0)
+                sell_quote = float(sell.get('quote_usd') or 0)
+                footer_bits.append(f"Sell: {sell.get('symbol','-')} {sell_qty:.6f} → {sell_quote:,.2f} USDT")
+            except (TypeError, ValueError):
+                pass
+            try:
+                buy_qty = float(buy.get('executed_qty') or 0)
+                buy_avg = float(buy.get('avg_price') or 0)
+                footer_bits.append(f"Buy: {buy.get('symbol','-')} {buy_qty:.6f} @ {buy_avg:,.2f}")
+            except (TypeError, ValueError):
+                pass
+            realized = executed.get('realized_usd')
+            if realized:
+                try:
+                    footer_bits.append(f"Realized: {float(realized):,.2f} USDT")
+                except (TypeError, ValueError):
+                    pass
+
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "S4 Rotation Triggered",
+            sections,
+            subtitle=f"Time: {_utc_stamp(payload.get('timestamp'))}",
+            theme="info",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"S4 Rotation {from_leg}->{to_leg} {amount:,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for S4 rotation; falling back to text message")
+
     lines = [
         "🔄 S4 Rotation Triggered",
         f"{from_leg} → {to_leg} | {amount:,.2f} USDT",
@@ -393,7 +472,6 @@ def notify_s4_rotation(payload: dict) -> bool:
             except (TypeError, ValueError):
                 pass
 
-    executed = payload.get('executed')
     if isinstance(executed, dict):
         sell = executed.get('sell_order') or {}
         buy = executed.get('buy_order') or {}
@@ -449,6 +527,66 @@ def notify_s4_dca_buy(payload: dict) -> bool:
         fee_asset_amount = float(payload.get('fee_asset_amount') or 0.0)
     except (TypeError, ValueError):
         fee_asset_amount = 0.0
+    holdings_line = _format_holdings_line(
+        payload.get('holdings'),
+        payload.get('holdings_meta'),
+    )
+    meta_entries = _meta_entries(payload)
+
+    if flex_allowed('s4_dca'):
+        sections = [
+            ("Asset", asset),
+            ("Exchange", exchange),
+            ("Amount", f"{usdt:,.2f} USDT"),
+        ]
+        if qty and price:
+            sections.append(("Qty @ Avg", f"{qty:.6f} @ {price:,.2f}"))
+        elif qty:
+            sections.append(("Quantity", f"{qty:.6f}"))
+        elif price:
+            sections.append(("Avg Price", f"{price:,.2f}"))
+
+        schedule_text = None
+        if schedule_id:
+            schedule_text = f"#{schedule_id}"
+        elif schedule_label:
+            schedule_text = str(schedule_label)
+        if schedule_text:
+            sections.append(("Schedule", schedule_text))
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        sections.append(("Mode", "DRY RUN" if dry_run else "LIVE"))
+        if order_id:
+            sections.append(("Order", str(order_id)))
+        if fee_usdt or (fee_asset and fee_asset_amount):
+            fee_bits: list[str] = []
+            if fee_usdt:
+                fee_bits.append(f"{fee_usdt:,.6f} USDT")
+            if fee_asset and fee_asset_amount:
+                fee_bits.append(f"{fee_asset_amount:,.6f} {str(fee_asset).upper()}")
+            sections.append(("Fee", " + ".join(fee_bits)))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "S4 DCA Buy",
+            sections,
+            subtitle=f"Time: {_utc_stamp(payload.get('timestamp'))}",
+            theme="info",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"S4 DCA Buy {usdt:,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for S4 DCA buy; falling back to text message")
 
     lines = [
         "S4 DCA Buy",
@@ -488,12 +626,9 @@ def notify_s4_dca_buy(payload: dict) -> bool:
     if fee_lines:
         lines.append("Fee: " + " + ".join(fee_lines))
 
-    holdings_line = _format_holdings_line(
-        payload.get('holdings'),
-        payload.get('holdings_meta'),
-    )
     if holdings_line:
         lines.append(holdings_line)
+    lines.extend(meta_entries)
 
     return send_line_message_with_retry("\n".join(lines))
 

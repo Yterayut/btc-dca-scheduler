@@ -4,6 +4,7 @@ from unittest.mock import patch
 from notify import (
     _format_holdings_line,
     notify_s4_dca_buy,
+    notify_s4_rotation,
     notify_weekly_dca_buy,
     notify_weekly_dca_skipped,
     notify_weekly_dca_skipped_exchange,
@@ -185,6 +186,41 @@ class NotifyFlexRoutingTest(unittest.TestCase):
                 patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
                 patch('notify.send_line_message_with_retry') as mock_text:
             notify_half_sell_executed(payload)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
+    def test_s4_dca_uses_flex(self):
+        payload = {
+            'timestamp': '2025-01-01T00:20:00Z',
+            'asset': 'XAUT',
+            'exchange': 'okx',
+            'usdt': 15.0,
+            'qty': 0.0035,
+            'price': 4240.0,
+            'schedule_id': 20,
+            'order_id': 999,
+            'cdc_status': 'up',
+        }
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_s4_dca_buy(payload)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
+    def test_s4_rotation_uses_flex(self):
+        payload = {
+            'timestamp': '2025-01-01T00:25:00Z',
+            'exchange': 'okx',
+            'amount_usd': 5000.0,
+            'from': 'BTC',
+            'to': 'GOLD',
+            'cdc_status': 'down',
+        }
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_s4_rotation(payload)
         mock_flex.assert_called_once()
         mock_text.assert_not_called()
 
