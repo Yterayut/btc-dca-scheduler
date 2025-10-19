@@ -7,6 +7,8 @@ from typing import Iterable
 import requests
 from dotenv import load_dotenv
 
+from notifications.line_flex import build_basic_bubble, make_flex_message
+
 # Load environment variables
 load_dotenv()
 
@@ -80,12 +82,20 @@ def _utc_stamp(value=None) -> str:
 
 
 def _append_meta(lines: list[str], data: dict) -> None:
+    for entry in _meta_entries(data):
+        lines.append(entry)
+
+
+def _meta_entries(data: dict) -> list[str]:
     rid = data.get('request_id')
+    dedupe = data.get('dedupe_key')
+    entries: list[str] = []
     if rid:
-        lines.append(f"Req: {rid}")
+        entries.append(f"Req: {rid}")
     dedupe = data.get('dedupe_key')
     if dedupe:
-        lines.append(f"Dedupe: {dedupe}")
+        entries.append(f"Dedupe: {dedupe}")
+    return entries
 
 
 def format_exchange_label(name: str | None) -> str:
@@ -155,6 +165,59 @@ def _format_holdings_line(holdings: dict | None, meta: dict | None = None) -> st
         line += f" ({', '.join(suffix_bits)})"
     return line
 
+def _channel_credentials() -> tuple[str | None, str | None]:
+    token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+    user_id = os.getenv("LINE_USER_ID")
+    return token, user_id
+
+
+def _push_line_messages(messages: list[dict]) -> bool:
+    url = "https://api.line.me/v2/bot/message/push"
+    token, user_id = _channel_credentials()
+
+    if not token:
+        logging.warning("LINE_CHANNEL_ACCESS_TOKEN not found - Line notifications disabled")
+        print(f"📱 Line Message (No Token): {messages}")
+        return False
+
+    if not user_id:
+        logging.warning("LINE_USER_ID not found - Line notifications disabled")
+        print(f"📱 Line Message (No User ID): {messages}")
+        return False
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+
+    payload = {
+        "to": user_id,
+        "messages": messages,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=15)
+
+    if response.status_code == 200:
+        logging.info("Line message sent successfully")
+        return True
+    elif response.status_code == 401:
+        logging.error("Line Bot API: Invalid access token")
+        print(f"📱 Line Message (Auth Error): {messages}")
+        return False
+    elif response.status_code == 403:
+        logging.error("Line Bot API: Forbidden - check bot permissions")
+        print(f"📱 Line Message (Permission Error): {messages}")
+        return False
+    elif response.status_code == 400:
+        logging.error(f"Line Bot API: Bad Request - {response.text}")
+        print(f"📱 Line Message (Bad Request): {messages}")
+        return False
+    else:
+        logging.error(f"Failed to send Line message: {response.status_code} - {response.text}")
+        print(f"📱 Line Message (Error {response.status_code}): {messages}")
+        return False
+
+
 def send_line_message(message: str) -> bool:
     """
     ส่งข้อความผ่าน Line Bot API
@@ -166,52 +229,7 @@ def send_line_message(message: str) -> bool:
         bool: True ถ้าส่งสำเร็จ, False ถ้าส่งไม่สำเร็จ
     """
     try:
-        url = "https://api.line.me/v2/bot/message/push"
-        token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-        user_id = os.getenv("LINE_USER_ID")
-        
-        if not token:
-            logging.warning("LINE_CHANNEL_ACCESS_TOKEN not found - Line notifications disabled")
-            print(f"📱 Line Message (No Token): {message}")
-            return False
-
-        if not user_id:
-            logging.warning("LINE_USER_ID not found - Line notifications disabled")
-            print(f"📱 Line Message (No User ID): {message}")
-            return False
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {token}'
-        }
-        
-        payload = {
-            "to": user_id,
-            "messages": [{"type": "text", "text": message}]
-        }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            logging.info("Line message sent successfully")
-            return True
-        elif response.status_code == 401:
-            logging.error("Line Bot API: Invalid access token")
-            print(f"📱 Line Message (Auth Error): {message}")
-            return False
-        elif response.status_code == 403:
-            logging.error("Line Bot API: Forbidden - check bot permissions")
-            print(f"📱 Line Message (Permission Error): {message}")
-            return False
-        elif response.status_code == 400:
-            logging.error(f"Line Bot API: Bad Request - {response.text}")
-            print(f"📱 Line Message (Bad Request): {message}")
-            return False
-        else:
-            logging.error(f"Failed to send Line message: {response.status_code} - {response.text}")
-            print(f"📱 Line Message (Error {response.status_code}): {message}")
-            return False
-            
+        return _push_line_messages([{"type": "text", "text": message}])
     except requests.RequestException as e:
         logging.error(f"Network error sending Line message: {e}")
         print(f"📱 Line Message (Network Error): {message}")
@@ -289,6 +307,29 @@ def send_line_message_with_retry(message: str, max_retries: int = 3) -> bool:
             delay = min(2 ** attempt, 30)
             time.sleep(delay)
 
+    return False
+
+
+def send_line_flex_message(flex_message: dict) -> bool:
+    """Send a Flex payload (already wrapped with type/altText/contents)."""
+    try:
+        return _push_line_messages([flex_message])
+    except requests.RequestException as e:
+        logging.error(f"Network error sending Flex message: {e}")
+        print(f"📱 Line Flex (Network Error): {flex_message.get('altText')}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error sending Flex message: {e}")
+        return False
+
+
+def send_line_flex_with_retry(flex_message: dict, max_retries: int = 3) -> bool:
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        if send_line_flex_message(flex_message):
+            return True
+        time.sleep(min(2 ** attempt, 10))
     return False
 
 def send_console_message(message: str) -> bool:
@@ -752,6 +793,45 @@ def notify_half_sell_skipped(data: dict) -> bool:
 def notify_weekly_dca_buy(data: dict) -> bool:
     schedule = data.get('schedule_id')
     schedule_label = schedule if schedule not in (None, '') else '-'
+    cdc_status = data.get('cdc_status')
+    holdings_line = _format_holdings_line(
+        data.get('holdings'),
+        data.get('holdings_meta'),
+    )
+    meta_entries = _meta_entries(data)
+
+    if flex_allowed('weekly_dca'):
+        sections = [
+            ("Exchange", format_exchange_label(data.get('exchange'))),
+            ("Amount", f"{data.get('usdt', 0):,.2f} USDT"),
+            ("Filled", f"{data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}"),
+            ("Schedule", f"#{schedule_label}"),
+            ("Order", str(data.get('order_id', 'N/A'))),
+        ]
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Weekly DCA Buy",
+            sections,
+            subtitle=f"Time: {_utc_stamp(data.get('timestamp'))}",
+            theme="success",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Weekly DCA Buy {data.get('usdt', 0):,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for weekly DCA buy; falling back to text message")
+
     lines = [
         "✅ Weekly DCA Buy",
         f"Time: {_utc_stamp(data.get('timestamp'))}",
@@ -761,59 +841,123 @@ def notify_weekly_dca_buy(data: dict) -> bool:
         f"Schedule: #{schedule_label}",
         f"Order: {data.get('order_id', 'N/A')}",
     ]
-    if data.get('cdc_status'):
-        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
-    holdings_line = _format_holdings_line(
-        data.get('holdings'),
-        data.get('holdings_meta'),
-    )
+    if cdc_status:
+        lines.append(f"CDC: {str(cdc_status).upper()}")
     if holdings_line:
         lines.append(holdings_line)
-    _append_meta(lines, data)
+    lines.extend(meta_entries)
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_weekly_dca_skipped(amount: float, reserve: float, context: dict | None = None) -> bool:
     amt = float(amount or 0.0)
     res_val = float(reserve or 0.0)
+    ctx = context or {}
+    cdc_status = ctx.get('cdc_status')
+    timestamp = _utc_stamp(ctx.get('timestamp'))
+    holdings_line = _format_holdings_line(
+        ctx.get('holdings'),
+        ctx.get('holdings_meta'),
+    )
+    meta_entries = _meta_entries(ctx)
+
+    if flex_allowed('weekly_dca'):
+        sections = [
+            ("Reserve Added", f"+{amt:,.2f} USDT"),
+            ("Total Reserve", f"{res_val:,.2f} USDT"),
+        ]
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Weekly DCA Skipped",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="warning",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Weekly DCA Skipped +{amt:,.2f} USDT to reserve",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for weekly DCA skipped; falling back to text message")
+
     lines = [
         "⏸ Weekly DCA Skipped",
-        f"Time: {_utc_stamp((context or {}).get('timestamp'))}",
+        f"Time: {timestamp}",
         f"Reserve +{amt:,.2f} USDT",
         f"Total Reserve: {res_val:,.2f} USDT",
     ]
-    if context and context.get('cdc_status'):
-        lines.append(f"CDC: {str(context['cdc_status']).upper()}")
-    holdings_line = _format_holdings_line(
-        (context or {}).get('holdings'),
-        (context or {}).get('holdings_meta'),
-    )
+    if cdc_status:
+        lines.append(f"CDC: {str(cdc_status).upper()}")
     if holdings_line:
         lines.append(holdings_line)
-    if context:
-        _append_meta(lines, context)
+    lines.extend(meta_entries)
     return send_line_message_with_retry("\n".join(lines))
 
 
 def notify_weekly_dca_skipped_exchange(exchange: str, amount: float, reserve: float, context: dict | None = None) -> bool:
     amt = float(amount or 0.0)
     res_val = float(reserve or 0.0)
+    ctx = context or {}
+    cdc_status = ctx.get('cdc_status')
+    timestamp = _utc_stamp(ctx.get('timestamp'))
+    holdings_line = _format_holdings_line(
+        ctx.get('holdings'),
+        ctx.get('holdings_meta'),
+    )
+    meta_entries = _meta_entries(ctx)
+    exchange_label = format_exchange_label(exchange)
+
+    if flex_allowed('weekly_dca'):
+        sections = [
+            ("Exchange", exchange_label),
+            ("Reserve Added", f"+{amt:,.2f} USDT"),
+            ("Total Reserve", f"{res_val:,.2f} USDT"),
+        ]
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Weekly DCA Skipped",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="warning",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Weekly DCA Skipped ({exchange_label})",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for weekly DCA skipped exchange; falling back to text message")
+
     lines = [
         "⏸ Weekly DCA Skipped",
-        f"Time: {_utc_stamp((context or {}).get('timestamp'))}",
-        f"Exchange: {format_exchange_label(exchange)}",
+        f"Time: {timestamp}",
+        f"Exchange: {exchange_label}",
         f"Reserve +{amt:,.2f} USDT",
         f"Total Reserve: {res_val:,.2f} USDT",
     ]
-    if context and context.get('cdc_status'):
-        lines.append(f"CDC: {str(context['cdc_status']).upper()}")
-    holdings_line = _format_holdings_line(
-        (context or {}).get('holdings'),
-        (context or {}).get('holdings_meta'),
-    )
+    if cdc_status:
+        lines.append(f"CDC: {str(cdc_status).upper()}")
     if holdings_line:
         lines.append(holdings_line)
-    if context:
-        _append_meta(lines, context)
+    lines.extend(meta_entries)
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_executed(data: dict) -> bool:

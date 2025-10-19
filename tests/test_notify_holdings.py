@@ -106,5 +106,43 @@ class NotifyS4FormatTest(unittest.TestCase):
         self.assertIn('CDC: DOWN', message)
         self.assertIn('Mode: DRY RUN', message)
 
+
+class NotifyFlexRoutingTest(unittest.TestCase):
+    def setUp(self):
+        self.payload = {
+            'timestamp': '2025-01-01T00:00:00Z',
+            'exchange': 'binance',
+            'usdt': 100.0,
+            'btc_qty': 0.0025,
+            'price': 40000.0,
+            'schedule_id': 1,
+            'order_id': 123,
+            'cdc_status': 'up',
+        }
+
+    def test_weekly_dca_buy_prefers_flex_when_allowed(self):
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_weekly_dca_buy(self.payload)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
+    def test_weekly_dca_buy_fallback_when_flex_fails(self):
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_weekly_dca_buy(self.payload)
+        mock_text.assert_called_once()
+
+    def test_weekly_dca_skipped_exchange_uses_flex(self):
+        context = {'timestamp': '2025-01-01T00:05:00Z', 'cdc_status': 'down'}
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_weekly_dca_skipped_exchange('binance', 25.0, 300.0, context=context)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
 if __name__ == '__main__':
     unittest.main()
