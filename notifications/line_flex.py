@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-FlexThemeName = Literal["default", "warning", "success", "info"]
+FlexThemeName = Literal["default", "warning", "success", "info", "danger"]
 
 
 @dataclass(frozen=True)
@@ -18,9 +18,10 @@ class FlexTheme:
 
 THEMES: dict[FlexThemeName, FlexTheme] = {
     "default": FlexTheme(header_color="#1B9CFC", accent_color="#F8C102", text_color="#FFFFFF"),
-    "warning": FlexTheme(header_color="#D7263D", accent_color="#FF6B6B", text_color="#FFFFFF"),
-    "success": FlexTheme(header_color="#2ECC71", accent_color="#1ABC9C", text_color="#FFFFFF"),
-    "info": FlexTheme(header_color="#3D7BF7", accent_color="#5DA3FA", text_color="#FFFFFF"),
+    "warning": FlexTheme(header_color="#F2994A", accent_color="#F2C94C", text_color="#FFFFFF"),
+    "success": FlexTheme(header_color="#27AE60", accent_color="#6FCF97", text_color="#FFFFFF"),
+    "info": FlexTheme(header_color="#3D7BF7", accent_color="#56CCF2", text_color="#FFFFFF"),
+    "danger": FlexTheme(header_color="#B71C1C", accent_color="#FF5252", text_color="#FFFFFF"),
 }
 
 
