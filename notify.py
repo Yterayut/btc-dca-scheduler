@@ -755,21 +755,60 @@ def notify_cdc_transition(prev_status: str, curr_status: str) -> bool:
 def notify_half_sell_executed(data: dict) -> bool:
     pct = data.get('pct')
     header = f"✅ Half-Sell {pct}% Executed" if pct is not None else "✅ Half-Sell Executed"
+    exchange_label = format_exchange_label(data.get('exchange'))
+    timestamp = _utc_stamp(data.get('timestamp'))
+    holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
+    meta_entries = _meta_entries(data)
+    cdc_status = data.get('cdc_status')
+
+    if flex_allowed('half_sell'):
+        sections = [
+            ("Exchange", exchange_label),
+            ("Quantity", f"{data.get('btc_qty', 0):.8f} BTC"),
+            ("Price", f"฿{data.get('price', 0):,.2f}"),
+            ("Proceeds", f"{data.get('usdt', 0):,.2f} USDT"),
+            ("Order", str(data.get('order_id', 'N/A'))),
+        ]
+        if pct is not None:
+            sections.insert(1, ("Percent", f"{pct}%"))
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            header.replace("✅ ", ""),
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="danger",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Half-Sell Executed {data.get('usdt', 0):,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for half-sell executed; falling back to text message")
+
     lines = [
         header,
-        f"Time: {_utc_stamp(data.get('timestamp'))}",
-        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Time: {timestamp}",
+        f"Exchange: {exchange_label}",
         f"Qty: {data.get('btc_qty', 0):.8f} BTC",
         f"Price: ฿{data.get('price', 0):,.2f}",
         f"Proceeds: {data.get('usdt', 0):,.2f} USDT",
         f"Order: {data.get('order_id', 'N/A')}",
     ]
-    if data.get('cdc_status'):
-        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
-    holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
+    if cdc_status:
+        lines.append(f"CDC: {str(cdc_status).upper()}")
     if holdings_line:
         lines.append(holdings_line)
-    _append_meta(lines, data)
+    lines.extend(meta_entries)
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_half_sell_skipped(data: dict) -> bool:
@@ -961,18 +1000,58 @@ def notify_weekly_dca_skipped_exchange(exchange: str, amount: float, reserve: fl
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_executed(data: dict) -> bool:
+    exchange_label = format_exchange_label(data.get('exchange'))
+    timestamp = _utc_stamp(data.get('timestamp'))
+    cdc_status = data.get('cdc_status')
+    holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
+    meta_entries = _meta_entries(data)
+
+    if flex_allowed('reserve_buy'):
+        sections = [
+            ("Exchange", exchange_label),
+            ("Spend", f"{data.get('spend', 0):,.2f} USDT"),
+            ("Filled", f"{data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}"),
+            ("Reserve Left", f"{data.get('reserve_left', 0):,.2f} USDT"),
+            ("Order", str(data.get('order_id', 'N/A'))),
+        ]
+        if cdc_status:
+            sections.append(("CDC", str(cdc_status).upper()))
+
+        footer_bits: list[str] = []
+        if holdings_line:
+            footer_bits.append(holdings_line)
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Reserve Buy Executed",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="success",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Reserve Buy {data.get('spend', 0):,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for reserve buy executed; falling back to text message")
+
     lines = [
         "✅ Reserve Buy Executed",
-        f"Time: {_utc_stamp(data.get('timestamp'))}",
-        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Time: {timestamp}",
+        f"Exchange: {exchange_label}",
         f"Spend: {data.get('spend', 0):,.2f} USDT",
         f"Filled: {data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}",
         f"Reserve Left: {data.get('reserve_left', 0):,.2f} USDT",
         f"Order: {data.get('order_id', 'N/A')}",
     ]
-    if data.get('cdc_status'):
-        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
-    _append_meta(lines, data)
+    if cdc_status:
+        lines.append(f"CDC: {str(cdc_status).upper()}")
+    if holdings_line:
+        lines.append(holdings_line)
+    lines.extend(meta_entries)
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:

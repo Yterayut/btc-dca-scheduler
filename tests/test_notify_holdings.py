@@ -7,6 +7,8 @@ from notify import (
     notify_weekly_dca_buy,
     notify_weekly_dca_skipped,
     notify_weekly_dca_skipped_exchange,
+    notify_half_sell_executed,
+    notify_reserve_buy_executed,
 )
 
 
@@ -52,7 +54,9 @@ class NotifyHoldingsFormatTest(unittest.TestCase):
             'order_id': 123,
             'holdings': {'BTC': {'free': 0.5, 'locked': 0.0, 'updated_at': base_time, 'stale': False}},
         }
-        with patch('notify.send_line_message_with_retry') as mock_send, patch('notify.time.time', return_value=base_time):
+        with patch('notify.flex_allowed', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_send, \
+                patch('notify.time.time', return_value=base_time):
             notify_weekly_dca_buy(payload)
         message = mock_send.call_args[0][0]
         self.assertIn('Holdings: BTC 0.500000', message)
@@ -63,7 +67,9 @@ class NotifyHoldingsFormatTest(unittest.TestCase):
             'timestamp': '2025-01-01T00:05:00Z',
             'holdings': {'BTC': {'free': 0.2, 'locked': 0.0, 'updated_at': base_time, 'stale': True}},
         }
-        with patch('notify.send_line_message_with_retry') as mock_send, patch('notify.time.time', return_value=base_time + 45):
+        with patch('notify.flex_allowed', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_send, \
+                patch('notify.time.time', return_value=base_time + 45):
             notify_weekly_dca_skipped(50.0, 250.0, context=context)
         message = mock_send.call_args[0][0]
         self.assertIn('Holdings:', message)
@@ -75,7 +81,9 @@ class NotifyHoldingsFormatTest(unittest.TestCase):
             'timestamp': '2025-01-01T00:10:00Z',
             'holdings': {'BTC': {'free': 0.3, 'locked': 0.01, 'updated_at': base_time, 'stale': False}},
         }
-        with patch('notify.send_line_message_with_retry') as mock_send, patch('notify.time.time', return_value=base_time):
+        with patch('notify.flex_allowed', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_send, \
+                patch('notify.time.time', return_value=base_time):
             notify_weekly_dca_skipped_exchange('binance', 25.0, 300.0, context=context)
         message = mock_send.call_args[0][0]
         self.assertIn('Holdings: BTC 0.300000 (+0.010000 locked)', message)
@@ -141,6 +149,42 @@ class NotifyFlexRoutingTest(unittest.TestCase):
                 patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
                 patch('notify.send_line_message_with_retry') as mock_text:
             notify_weekly_dca_skipped_exchange('binance', 25.0, 300.0, context=context)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
+    def test_reserve_buy_uses_flex(self):
+        payload = {
+            'timestamp': '2025-01-01T00:10:00Z',
+            'exchange': 'binance',
+            'spend': 200.0,
+            'btc_qty': 0.0045,
+            'price': 44500.0,
+            'reserve_left': 800.0,
+            'order_id': 555,
+            'cdc_status': 'down',
+        }
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_reserve_buy_executed(payload)
+        mock_flex.assert_called_once()
+        mock_text.assert_not_called()
+
+    def test_half_sell_uses_flex(self):
+        payload = {
+            'timestamp': '2025-01-01T00:15:00Z',
+            'exchange': 'okx',
+            'btc_qty': 0.01,
+            'price': 43000.0,
+            'usdt': 430.0,
+            'order_id': 777,
+            'pct': 50,
+            'cdc_status': 'up',
+        }
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.send_line_flex_with_retry', return_value=True) as mock_flex, \
+                patch('notify.send_line_message_with_retry') as mock_text:
+            notify_half_sell_executed(payload)
         mock_flex.assert_called_once()
         mock_text.assert_not_called()
 
