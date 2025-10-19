@@ -1,12 +1,49 @@
-import requests
 import os
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Iterable
+
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _parse_allowlist(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    tokens: Iterable[str] = (tok.strip().lower() for tok in value.split(','))
+    return {tok for tok in tokens if tok}
+
+
+
+def _refresh_flex_settings() -> None:
+    global LINE_USE_FLEX, LINE_FLEX_ALLOWLIST
+    LINE_USE_FLEX = _env_flag('LINE_USE_FLEX', False)
+    LINE_FLEX_ALLOWLIST = _parse_allowlist(os.getenv('LINE_FLEX_ALLOWLIST'))
+
+
+_refresh_flex_settings()
+
+
+def flex_allowed(channel: str | None) -> bool:
+    """Return True if Flex message delivery is permitted for a given channel."""
+    if not LINE_USE_FLEX:
+        return False
+    if not LINE_FLEX_ALLOWLIST:
+        return True
+    if not channel:
+        return False
+    return str(channel).strip().lower() in LINE_FLEX_ALLOWLIST
 
 # Exchange name mapping for user-facing notifications
 _EXCHANGE_LABELS = {
