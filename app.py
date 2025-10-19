@@ -2307,77 +2307,38 @@ def api_okx_trades_export():
 
 @app.route('/api/use_reserve_now', methods=['POST'])
 def api_use_reserve_now():
-    """Admin-only: Use reserve immediately to buy BTC with available USDT up to reserve amount."""
+    """Admin-only: Trigger reserve buy via orchestrator to maintain dedupe semantics."""
     try:
         admin_token = os.getenv('ADMIN_TOKEN')
         data = request.get_json(force=True, silent=True) or {}
         token = data.get('token')
+        target_exchange = str(data.get('exchange') or '').lower()
         if not admin_token or token != admin_token:
             return jsonify({'ok': False, 'error': 'forbidden'}), 403
 
-        client = _get_binance_client()
-        if client is None:
-            return jsonify({'ok': False, 'error': 'binance client unavailable'}), 500
+        now = datetime.utcnow()
+        from strategies.base import StrategyAction, StrategyActionType, make_request_id, dedupe_key_for
+        from strategies.runtime import StrategyOrchestrator
+        from strategies.cdc import CdcDcaStrategy, TransitionDecisionInput
+        from main import handle_reserve_buy_action, strategy_orchestrator
 
-        # Load reserve
-        with get_db_cursor() as (cursor, db):
-            cursor.execute("SELECT reserve_usdt FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
-            row = cursor.fetchone(); reserve = float(row[0] or 0) if row else 0.0
+        # Build a reserve-buy action, optionally scoped to exchange
+        payload = {'mode': 'global'}
+        if target_exchange in ('binance', 'okx'):
+            payload = {'mode': 'exchange', 'exchange': target_exchange}
 
-        usdt = client.get_asset_balance(asset='USDT')
-        available = float(usdt.get('free') or 0)
-        spend = min(available, reserve)
+        action = StrategyAction(
+            action_type=StrategyActionType.RESERVE_BUY,
+            request_id=make_request_id('reserve-now'),
+            dedupe_key=dedupe_key_for('reserve_now', payload.get('mode'), payload.get('exchange')),
+            payload=payload,
+        )
 
-        # Filters
-        info = client.get_symbol_info('BTCUSDT')
-        min_notional = None
-        for f in info['filters']:
-            if f['filterType'] == 'NOTIONAL':
-                min_notional = float(f.get('minNotional') or 0)
-                break
-        min_notional = min_notional or 10.0
-        if spend < min_notional:
-            return jsonify({'ok': False, 'error': 'below minNotional', 'spend': spend, 'reserve': reserve}), 200
-
-        # Place order (support DRY_RUN)
-        dry = _env_flag('STRATEGY_DRY_RUN', False) or _env_flag('DRY_RUN', False)
-        if dry:
-            price = float(client.get_symbol_ticker(symbol='BTCUSDT')['price'])
-            executed_qty = spend / price
-            cqq = spend
-            avg_price = price
-            order_id = -1
-        else:
-            order = client.order_market_buy(symbol='BTCUSDT', quoteOrderQty=spend)
-            order_id = order['orderId']
-            details = client.get_order(symbol='BTCUSDT', orderId=order_id)
-            executed_qty = float(details.get('executedQty') or 0)
-            cqq = float(details.get('cummulativeQuoteQty') or 0)
-            avg_price = cqq / executed_qty if executed_qty > 0 else 0
-
-        with get_db_cursor() as (cursor, db):
-            # purchase history
-            cursor.execute(
-                """
-                INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id)
-                VALUES (NOW(), %s, %s, %s, %s, %s)
-                """,
-                (cqq, executed_qty, avg_price, order_id, None)
-            )
-            # reduce reserve and log
-            cursor.execute("UPDATE strategy_state SET reserve_usdt = GREATEST(reserve_usdt - %s, 0) WHERE mode='cdc_dca_v1'", (cqq,))
-            cursor.execute("SELECT reserve_usdt FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
-            new_reserve = float(cursor.fetchone()[0] or 0)
-            cursor.execute(
-                """
-                INSERT INTO reserve_log (event_time, change_usdt, reserve_after, reason, note)
-                VALUES (NOW(), %s, %s, %s, %s)
-                """,
-                (-cqq, new_reserve, 'reserve_buy_now', 'Manual reserve buy via API')
-            )
-            db.commit()
-
-        return jsonify({'ok': True, 'spend': cqq, 'btc_qty': executed_qty, 'price': avg_price, 'order_id': order_id, 'reserve_after': new_reserve})
+        result = asyncio.run(handle_reserve_buy_action(now, action))
+        data = result.data or {}
+        if result.status is ActionStatus.SUCCESS:
+            return jsonify({'ok': True, 'result': data})
+        return jsonify({'ok': False, 'error': data.get('payload', {}).get('error', result.detail or 'failed'), 'result': data}), 500
     except Exception as e:
         logging.error(f"use_reserve_now error: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500

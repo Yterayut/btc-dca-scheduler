@@ -1,6 +1,8 @@
 import requests
 import os
 import logging
+import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -12,6 +14,42 @@ _EXCHANGE_LABELS = {
     'okx': 'OKX',
 }
 
+_REASON_LABELS = {
+    'sell_percent_zero': 'Configured percent is 0',
+    'no_balance': 'No free BTC balance',
+    'below_minQty': 'Quantity below minQty',
+    'below_minNotional': 'Notional below minimum',
+    'below_min_notional': 'Notional below minimum',
+    'depth_insufficient': 'Orderbook depth below guard threshold',
+    'depth_guard': 'Depth guard triggered',
+    'twap_deviation': 'Price deviates from TWAP beyond guard',
+    'twap_guard': 'TWAP guard triggered',
+    'notional_cap': 'Notional exceeds configured cap',
+}
+
+
+def _reason_text(reason: str | None) -> str:
+    if not reason:
+        return 'Unspecified'
+    return _REASON_LABELS.get(str(reason), str(reason))
+
+
+def _utc_stamp(value=None) -> str:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    if value:
+        return str(value)
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
+def _append_meta(lines: list[str], data: dict) -> None:
+    rid = data.get('request_id')
+    if rid:
+        lines.append(f"Req: {rid}")
+    dedupe = data.get('dedupe_key')
+    if dedupe:
+        lines.append(f"Dedupe: {dedupe}")
+
 
 def format_exchange_label(name: str | None) -> str:
     """Return a human-friendly exchange name for notification text."""
@@ -21,6 +59,64 @@ def format_exchange_label(name: str | None) -> str:
     if not key:
         return 'Unknown'
     return _EXCHANGE_LABELS.get(key.lower(), key.upper())
+
+
+def _format_holdings_line(holdings: dict | None, meta: dict | None = None) -> str:
+    """Render holdings dict into a single notification line."""
+    if not isinstance(holdings, dict) or not holdings:
+        return ""
+
+    now = time.time()
+    parts: list[str] = []
+    oldest_age = 0.0
+    has_stale = False
+    meta_errors: list[str] = []
+
+    for asset, entry in sorted(holdings.items()):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            free = float(entry.get('free') or 0.0)
+        except (TypeError, ValueError):
+            free = 0.0
+        try:
+            locked = float(entry.get('locked') or 0.0)
+        except (TypeError, ValueError):
+            locked = 0.0
+
+        part = f"{asset} {free:.6f}"
+        if locked:
+            part += f" (+{locked:.6f} locked)"
+        parts.append(part)
+
+        if entry.get('stale'):
+            has_stale = True
+        updated_at = entry.get('updated_at')
+        if isinstance(updated_at, (int, float)):
+            age = max(0.0, now - float(updated_at))
+            oldest_age = max(oldest_age, age)
+        error_text = entry.get('error')
+        if isinstance(error_text, str) and error_text:
+            meta_errors.append(error_text)
+
+    if isinstance(meta, dict):
+        meta_errors.extend(
+            str(msg) for msg in (meta.get('errors') or {}).values() if isinstance(msg, str) and msg
+        )
+
+    if not parts and not meta_errors:
+        return ""
+
+    suffix_bits: list[str] = []
+    if has_stale:
+        suffix_bits.append(f"cached {int(oldest_age)}s" if oldest_age else "cached")
+    if meta_errors and not suffix_bits:
+        suffix_bits.append("error")
+
+    line = "Holdings: " + (" | ".join(parts) if parts else "unavailable")
+    if suffix_bits:
+        line += f" ({', '.join(suffix_bits)})"
+    return line
 
 def send_line_message(message: str) -> bool:
     """
@@ -39,15 +135,13 @@ def send_line_message(message: str) -> bool:
         
         if not token:
             logging.warning("LINE_CHANNEL_ACCESS_TOKEN not found - Line notifications disabled")
-            # Fallback to console
             print(f"📱 Line Message (No Token): {message}")
-            return True  # Return True เพื่อไม่ให้ระบบหยุด
-        
+            return False
+
         if not user_id:
             logging.warning("LINE_USER_ID not found - Line notifications disabled")
-            # Fallback to console
             print(f"📱 Line Message (No User ID): {message}")
-            return True  # Return True เพื่อไม่ให้ระบบหยุด
+            return False
         
         headers = {
             'Content-Type': 'application/json',
@@ -67,29 +161,28 @@ def send_line_message(message: str) -> bool:
         elif response.status_code == 401:
             logging.error("Line Bot API: Invalid access token")
             print(f"📱 Line Message (Auth Error): {message}")
-            return True  # Return True เพื่อไม่ให้ระบบหยุด
+            return False
         elif response.status_code == 403:
             logging.error("Line Bot API: Forbidden - check bot permissions")
             print(f"📱 Line Message (Permission Error): {message}")
-            return True
+            return False
         elif response.status_code == 400:
             logging.error(f"Line Bot API: Bad Request - {response.text}")
             print(f"📱 Line Message (Bad Request): {message}")
-            return True
+            return False
         else:
             logging.error(f"Failed to send Line message: {response.status_code} - {response.text}")
             print(f"📱 Line Message (Error {response.status_code}): {message}")
-            return True  # Return True เพื่อไม่ให้ระบบหยุด
+            return False
             
     except requests.RequestException as e:
         logging.error(f"Network error sending Line message: {e}")
-        # Fallback to console output
         print(f"📱 Line Message (Network Error): {message}")
-        return True  # Return True เพื่อไม่ให้ระบบหยุด
+        return False
     except Exception as e:
         logging.error(f"Unexpected error sending Line message: {e}")
         print(f"📱 Line Message (Unexpected Error): {message}")
-        return True  # Return True เพื่อไม่ให้ระบบหยุด
+        return False
 
 def send_line_notify_fallback(message: str) -> bool:
     """
@@ -147,15 +240,18 @@ def send_line_message_with_retry(message: str, max_retries: int = 3) -> bool:
         try:
             if send_line_message(message):
                 return True
-            
-            # ถ้าไม่สำเร็จ ลอง Line Notify
-            if attempt == max_retries - 1:  # Last attempt
+
+            if attempt == max_retries - 1:
                 logging.info("Trying Line Notify as fallback...")
                 return send_line_notify_fallback(message)
-                
+
         except Exception as e:
             logging.error(f"Attempt {attempt + 1} failed: {e}")
-            
+
+        if attempt < max_retries - 1:
+            delay = min(2 ** attempt, 30)
+            time.sleep(delay)
+
     return False
 
 def send_console_message(message: str) -> bool:
@@ -173,6 +269,155 @@ def send_console_message(message: str) -> bool:
     print(f"{message}")
     print(f"{'='*60}\n")
     return True
+
+def notify_s4_rotation(payload: dict) -> bool:
+    """Send a LINE notification when S4 rotation action is emitted."""
+    try:
+        amount = float(payload.get('amount_usd') or 0.0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    from_leg = str(payload.get('from') or 'BTC').upper()
+    to_leg = str(payload.get('to') or 'GOLD').upper()
+    cdc_status = str(payload.get('cdc_status') or 'unknown').upper()
+    btc_price = payload.get('btc_price')
+    gold_price = payload.get('gold_price')
+    notes = payload.get('notes') or {}
+
+    exchange = str(payload.get('exchange') or 'BINANCE').upper()
+    lines = [
+        "🔄 S4 Rotation Triggered",
+        f"{from_leg} → {to_leg} | {amount:,.2f} USDT",
+        f"CDC: {cdc_status} | Exchange: {exchange}",
+    ]
+    try:
+        if btc_price:
+            lines.append(f"BTC: {float(btc_price):,.2f} USD")
+        if gold_price:
+            lines.append(f"GOLD: {float(gold_price):,.2f} USD")
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(notes, dict) and notes:
+        delta = notes.get('delta_pct')
+        target = notes.get('target_btc_pct')
+        if delta is not None:
+            try:
+                delta_val = float(delta)
+                lines.append(f"Δ BTC weight: {delta_val:.2f}%")
+            except (TypeError, ValueError):
+                pass
+        if target is not None:
+            try:
+                target_val = float(target)
+                current = float(notes.get('exposure_btc_pct', 0))
+                lines.append(f"Target BTC weight: {target_val:.2f}%")
+                lines.append(f"Explanation: current BTC weight {current:.2f}% vs target {target_val:.2f}% → rotate towards {to_leg}")
+            except (TypeError, ValueError):
+                pass
+
+    executed = payload.get('executed')
+    if isinstance(executed, dict):
+        sell = executed.get('sell_order') or {}
+        buy = executed.get('buy_order') or {}
+        try:
+            lines.append(f"Sell: {sell.get('symbol','-')} qty {float(sell.get('executed_qty') or 0):.6f} → {float(sell.get('quote_usd') or 0):,.2f} USDT")
+        except (TypeError, ValueError):
+            pass
+        try:
+            avg = float(buy.get('avg_price') or 0)
+            qty = float(buy.get('executed_qty') or 0)
+            lines.append(f"Buy: {buy.get('symbol','-')} qty {qty:.6f} @ {avg:,.2f}")
+        except (TypeError, ValueError):
+            pass
+        realized = executed.get('realized_usd')
+        if realized:
+            try:
+                lines.append(f"Realized notional: {float(realized):,.2f} USDT")
+            except (TypeError, ValueError):
+                pass
+
+    message = "\n".join(lines)
+    return send_line_message_with_retry(message)
+
+
+def notify_s4_dca_buy(payload: dict) -> bool:
+    """Notify when S4 performs a DCA buy on the active leg."""
+    try:
+        usdt = float(payload.get('usdt') or 0.0)
+    except (TypeError, ValueError):
+        usdt = 0.0
+    try:
+        qty = float(payload.get('qty') or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        price = float(payload.get('price') or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+
+    asset = str(payload.get('asset') or 'BTC').upper()
+    exchange = str(payload.get('exchange') or 'BINANCE').upper()
+    dry_run = bool(payload.get('dry_run'))
+    schedule_id = payload.get('schedule_id')
+    schedule_label = payload.get('schedule_label')
+    order_id = payload.get('order_id')
+    cdc_status = payload.get('cdc_status')
+    try:
+        fee_usdt = float(payload.get('fee_usdt') or 0.0)
+    except (TypeError, ValueError):
+        fee_usdt = 0.0
+    fee_asset = payload.get('fee_asset')
+    try:
+        fee_asset_amount = float(payload.get('fee_asset_amount') or 0.0)
+    except (TypeError, ValueError):
+        fee_asset_amount = 0.0
+
+    lines = [
+        "S4 DCA Buy",
+        f"Asset: {asset} | Exchange: {exchange}",
+        f"Amount: {usdt:,.2f} USDT",
+    ]
+    if qty and price:
+        lines.append(f"Qty: {qty:.6f} {asset} @ {price:,.2f}")
+    elif qty:
+        lines.append(f"Qty: {qty:.6f} {asset}")
+    elif price:
+        lines.append(f"Avg: {price:,.2f}")
+
+    status_bits: list[str] = []
+    if schedule_id:
+        status_bits.append(f"Schedule: #{schedule_id}")
+    elif schedule_label:
+        status_bits.append(f"Schedule: {schedule_label}")
+    if cdc_status:
+        status_bits.append(f"CDC: {str(cdc_status).upper()}")
+    if status_bits:
+        lines.append(" | ".join(status_bits))
+    mode_bits: list[str] = []
+    if dry_run:
+        mode_bits.append("Mode: DRY RUN")
+    else:
+        mode_bits.append("Mode: LIVE")
+    if order_id:
+        mode_bits.append(f"Order: {order_id}")
+    if mode_bits:
+        lines.append(" | ".join(mode_bits))
+    fee_lines: list[str] = []
+    if fee_usdt:
+        fee_lines.append(f"{fee_usdt:,.6f} USDT")
+    if fee_asset_amount and fee_asset:
+        fee_lines.append(f"{fee_asset_amount:,.6f} {str(fee_asset).upper()}")
+    if fee_lines:
+        lines.append("Fee: " + " + ".join(fee_lines))
+
+    holdings_line = _format_holdings_line(
+        payload.get('holdings'),
+        payload.get('holdings_meta'),
+    )
+    if holdings_line:
+        lines.append(holdings_line)
+
+    return send_line_message_with_retry("\n".join(lines))
 
 def format_purchase_message(purchase_data: dict) -> str:
     """
@@ -421,95 +666,192 @@ def send_email_notification(message: str, email: str = None) -> bool:
 # ====== Strategy notifications (stubs ready to use) ======
 def notify_cdc_transition(prev_status: str, curr_status: str) -> bool:
     icon = '🟢' if (curr_status or '').lower() == 'up' else '🔻'
-    msg = f"{icon} CDC Action Zone Transition (1D)\n{prev_status or 'unknown'} → {curr_status}"
-    return send_line_message_with_retry(msg)
+    lines = [
+        f"{icon} CDC Action Zone Transition (1D)",
+        f"Prev: {prev_status or 'unknown'}",
+        f"Curr: {curr_status or 'unknown'}",
+        f"Time: {_utc_stamp()}",
+    ]
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_half_sell_executed(data: dict) -> bool:
     pct = data.get('pct')
-    header = f"✅ Sell {pct}% Executed" if pct is not None else "✅ Half-Sell Executed"
-    exchange = format_exchange_label(data.get('exchange'))
-    msg = (
-        f"{header}\n"
-        f"Exchange: {exchange}\n"
-        f"Qty: {data.get('btc_qty', 0):.8f} BTC\n"
-        f"Price: ฿{data.get('price', 0):,.2f}\n"
-        f"Proceeds: {data.get('usdt', 0):,.2f} USDT\n"
-        f"Order ID: {data.get('order_id', 'N/A')}"
-    )
-    return send_line_message_with_retry(msg)
+    header = f"✅ Half-Sell {pct}% Executed" if pct is not None else "✅ Half-Sell Executed"
+    lines = [
+        header,
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Qty: {data.get('btc_qty', 0):.8f} BTC",
+        f"Price: ฿{data.get('price', 0):,.2f}",
+        f"Proceeds: {data.get('usdt', 0):,.2f} USDT",
+        f"Order: {data.get('order_id', 'N/A')}",
+    ]
+    if data.get('cdc_status'):
+        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
+    holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
+    if holdings_line:
+        lines.append(holdings_line)
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_half_sell_skipped(data: dict) -> bool:
     pct = data.get('pct')
-    header = f"⚠️ Sell {pct}% Skipped" if pct is not None else "⚠️ Half-Sell Skipped (Too Small)"
-    msg = (
-        f"{header}\n"
-        f"Reason: {data.get('reason', 'notional below minimum')}\n"
-        f"BTC Free: {data.get('btc_free', 0):.8f} | stepSize: {data.get('step', 0)}\n"
-        f"MinNotional: {data.get('min_notional', 0)}"
-    )
-    exch = data.get('exchange')
-    if exch:
-        msg += f"\nExchange: {format_exchange_label(exch)}"
-    return send_line_message_with_retry(msg)
+    header = f"⚠️ Sell {pct}% Skipped" if pct is not None else "⚠️ Half-Sell Skipped"
+    lines = [
+        header,
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Reason: {_reason_text(data.get('reason'))}",
+        f"BTC Free: {data.get('btc_free', 0):.8f}",
+        f"stepSize: {data.get('step', '-')}",
+        f"MinNotional: {data.get('min_notional', '-')}",
+    ]
+    if data.get('cdc_status'):
+        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
+    if data.get('exchange'):
+        lines.append(f"Exchange: {format_exchange_label(data.get('exchange'))}")
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_weekly_dca_buy(data: dict) -> bool:
-    exchange = format_exchange_label(data.get('exchange'))
     schedule = data.get('schedule_id')
     schedule_label = schedule if schedule not in (None, '') else '-'
-    msg = (
-        f"✅ Weekly DCA Buy (CDC: GREEN)\n"
-        f"Exchange: {exchange}\n"
-        f"Buy: {data.get('usdt', 0):.2f} USDT\n"
-        f"Got: {data.get('btc_qty', 0):.8f} BTC\n"
-        f"Price: ฿{data.get('price', 0):,.2f}\n"
-        f"Schedule: #{schedule_label}\n"
-        f"Order ID: {data.get('order_id', 'N/A')}"
+    lines = [
+        "✅ Weekly DCA Buy",
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Amount: {data.get('usdt', 0):,.2f} USDT",
+        f"Filled: {data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}",
+        f"Schedule: #{schedule_label}",
+        f"Order: {data.get('order_id', 'N/A')}",
+    ]
+    if data.get('cdc_status'):
+        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
+    holdings_line = _format_holdings_line(
+        data.get('holdings'),
+        data.get('holdings_meta'),
     )
-    return send_line_message_with_retry(msg)
+    if holdings_line:
+        lines.append(holdings_line)
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
 
-def notify_weekly_dca_skipped(amount: float, reserve: float) -> bool:
+def notify_weekly_dca_skipped(amount: float, reserve: float, context: dict | None = None) -> bool:
     amt = float(amount or 0.0)
     res_val = float(reserve or 0.0)
-    msg = (
-        f"⏸ Weekly DCA Skipped (CDC: RED)\n"
-        f"+{amt:,.2f} USDT to reserve\n"
-        f"Reserve: {res_val:,.2f} USDT"
+    lines = [
+        "⏸ Weekly DCA Skipped",
+        f"Time: {_utc_stamp((context or {}).get('timestamp'))}",
+        f"Reserve +{amt:,.2f} USDT",
+        f"Total Reserve: {res_val:,.2f} USDT",
+    ]
+    if context and context.get('cdc_status'):
+        lines.append(f"CDC: {str(context['cdc_status']).upper()}")
+    holdings_line = _format_holdings_line(
+        (context or {}).get('holdings'),
+        (context or {}).get('holdings_meta'),
     )
-    return send_line_message_with_retry(msg)
+    if holdings_line:
+        lines.append(holdings_line)
+    if context:
+        _append_meta(lines, context)
+    return send_line_message_with_retry("\n".join(lines))
 
 
-def notify_weekly_dca_skipped_exchange(exchange: str, amount: float, reserve: float) -> bool:
-    exchange_label = format_exchange_label(exchange)
+def notify_weekly_dca_skipped_exchange(exchange: str, amount: float, reserve: float, context: dict | None = None) -> bool:
     amt = float(amount or 0.0)
     res_val = float(reserve or 0.0)
-    msg = (
-        f"⏸ Weekly DCA Skipped (CDC: RED)\n"
-        f"Exchange: {exchange_label}\n"
-        f"+{amt:,.2f} USDT to reserve\n"
-        f"Reserve: {res_val:,.2f} USDT"
+    lines = [
+        "⏸ Weekly DCA Skipped",
+        f"Time: {_utc_stamp((context or {}).get('timestamp'))}",
+        f"Exchange: {format_exchange_label(exchange)}",
+        f"Reserve +{amt:,.2f} USDT",
+        f"Total Reserve: {res_val:,.2f} USDT",
+    ]
+    if context and context.get('cdc_status'):
+        lines.append(f"CDC: {str(context['cdc_status']).upper()}")
+    holdings_line = _format_holdings_line(
+        (context or {}).get('holdings'),
+        (context or {}).get('holdings_meta'),
     )
-    return send_line_message_with_retry(msg)
+    if holdings_line:
+        lines.append(holdings_line)
+    if context:
+        _append_meta(lines, context)
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_executed(data: dict) -> bool:
-    exchange = format_exchange_label(data.get('exchange'))
-    msg = (
-        f"✅ Reserve Buy Executed\n"
-        f"Exchange: {exchange}\n"
-        f"Spend: {data.get('spend', 0):.2f} USDT\n"
-        f"Got: {data.get('btc_qty', 0):.8f} BTC\n"
-        f"Price: ฿{data.get('price', 0):,.2f}\n"
-        f"Reserve Left: {data.get('reserve_left', 0):,.2f} USDT\n"
-        f"Order ID: {data.get('order_id', 'N/A')}"
-    )
-    return send_line_message_with_retry(msg)
+    lines = [
+        "✅ Reserve Buy Executed",
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Spend: {data.get('spend', 0):,.2f} USDT",
+        f"Filled: {data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}",
+        f"Reserve Left: {data.get('reserve_left', 0):,.2f} USDT",
+        f"Order: {data.get('order_id', 'N/A')}",
+    ]
+    if data.get('cdc_status'):
+        lines.append(f"CDC: {str(data['cdc_status']).upper()}")
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:
-    msg = (
-        f"⚠️ Reserve Buy Skipped (Below minNotional)\n"
-        f"Spend: {data.get('spend', 0):.2f} < {data.get('min_notional', 0):,.2f}\n"
-        f"Reserve: {data.get('reserve', 0):,.2f} USDT"
-    )
-    return send_line_message_with_retry(msg)
+    lines = [
+        "⚠️ Reserve Buy Skipped",
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Spend: {data.get('spend', 0):,.2f} < {data.get('min_notional', 0):,.2f}",
+        f"Reserve: {data.get('reserve', 0):,.2f} USDT",
+    ]
+    if data.get('exchange'):
+        lines.append(f"Exchange: {format_exchange_label(data.get('exchange'))}")
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
+
+
+def notify_liquidity_blocked(action: str, data: dict) -> bool:
+    action_label = action.replace('_', ' ').title()
+    lines = [
+        "🛑 Liquidity Block",
+        f"Action: {action_label}",
+        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+    ]
+    if data.get('spread_pct') is not None:
+        lines.append(f"Spread: {data.get('spread_pct', 0):.3f}% (max {data.get('threshold_pct', 0):.3f}%)")
+    if data.get('reason'):
+        lines.append(f"Reason: {_reason_text(data.get('reason'))}")
+    if data.get('expected_notional') is not None:
+        lines.append(f"Notional: {data.get('expected_notional', 0):,.2f} USDT")
+    depth_info = data.get('depth')
+    if isinstance(depth_info, dict):
+        bid_notional = depth_info.get('bid_notional')
+        ask_notional = depth_info.get('ask_notional')
+        if bid_notional is not None and ask_notional is not None:
+            lines.append(f"Depth Bid/Ask: {bid_notional:,.0f} / {ask_notional:,.0f} USDT within ±{depth_info.get('band_pct', 0):.2f}%")
+    twap_info = data.get('twap')
+    if isinstance(twap_info, dict):
+        twap_val = twap_info.get('twap')
+        deviation = twap_info.get('deviation_pct')
+        if twap_val is not None:
+            lines.append(f"TWAP: {twap_val:,.2f} USDT (Δ {deviation or 0:.2f}% / max {twap_info.get('threshold_pct', 0):.2f}%)")
+    if data.get('cap') is not None:
+        lines.append(f"Cap: {float(data.get('cap') or 0):,.2f} USDT")
+    if data.get('attempt') is not None:
+        lines.append(f"Attempt: {float(data.get('attempt') or 0):,.2f} USDT")
+    _append_meta(lines, data)
+    return send_line_message_with_retry("\n".join(lines))
+
+def notify_security_alert(title: str, details: dict | None = None) -> bool:
+    lines = [
+        "🚨 Security Alert",
+        title,
+        f"Time: {_utc_stamp()}",
+    ]
+    if details:
+        for key, value in details.items():
+            if value is None:
+                continue
+            lines.append(f"{key}: {value}")
+    return send_line_message_with_retry("\n".join(lines))
 
 def notify_strategy_error(context: str, error: str) -> bool:
     msg = f"❌ Strategy Error\n{context}\n🚨 {error}"
