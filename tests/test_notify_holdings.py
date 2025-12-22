@@ -104,7 +104,8 @@ class NotifyS4FormatTest(unittest.TestCase):
             'cdc_status': 'down',
             'holdings': {'BTC': {'free': 0.0, 'locked': 0.0, 'updated_at': 0, 'stale': False}},
         }
-        with patch('notify.send_line_message_with_retry') as mock_send:
+        with patch('notify.flex_allowed', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_send:
             notify_s4_dca_buy(payload)
         message = mock_send.call_args[0][0]
         self.assertTrue(message.startswith('S4 DCA Buy'))

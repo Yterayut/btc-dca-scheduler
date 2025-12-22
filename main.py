@@ -6,6 +6,7 @@ import MySQLdb
 import asyncio
 import threading
 import socket
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -17,6 +18,7 @@ import requests
 from collections.abc import Sequence
 from notify import (
     send_line_message,
+    send_line_message_with_retry,
     notify_cdc_transition,
     notify_half_sell_executed,
     notify_half_sell_skipped,
@@ -98,6 +100,273 @@ TWAP_GUARD_WINDOW_MINUTES = int(os.getenv('TWAP_GUARD_WINDOW_MINUTES', '15'))
 TWAP_GUARD_MAX_DEVIATION_PCT = float(os.getenv('TWAP_GUARD_MAX_DEVIATION_PCT', '1.5'))
 ANOMALY_PNL_THRESHOLD_USDT = float(os.getenv('ANOMALY_PNL_THRESHOLD_USDT', '50000'))
 ANOMALY_NOTIONAL_THRESHOLD_USDT = float(os.getenv('ANOMALY_NOTIONAL_THRESHOLD_USDT', '250000'))
+
+DB_DEDUPE_ENABLED = _env_flag('DB_DEDUPE_ENABLED', False)
+SCHEDULER_DB_LOCK_ENABLED = _env_flag('SCHEDULER_DB_LOCK_ENABLED', False)
+SCHEDULER_DB_LOCK_NAME = os.getenv('SCHEDULER_DB_LOCK_NAME', 'dca_scheduler')
+SCHEDULER_DB_LOCK_TIMEOUT = int(os.getenv('SCHEDULER_DB_LOCK_TIMEOUT', '1') or 1)
+
+DEDUPE_CLEANUP_ENABLED = _env_flag('DEDUPE_CLEANUP_ENABLED', False)
+DEDUPE_CLEANUP_DAYS = int(os.getenv('DEDUPE_CLEANUP_DAYS', '30') or 30)
+DEDUPE_CLEANUP_INTERVAL_HOURS = float(os.getenv('DEDUPE_CLEANUP_INTERVAL_HOURS', '6') or 6)
+
+# --- S4 Hardening (gates) ---
+S4_HARDENING_ENABLED = _env_flag('S4_HARDENING_ENABLED', False)
+S4_RATIO_TTL_MINUTES = int(os.getenv('S4_RATIO_TTL_MINUTES', '30') or 30)
+S4_CONFIRM_DAYS = int(os.getenv('S4_CONFIRM_DAYS', '2') or 2)
+S4_COOLDOWN_DAYS = int(os.getenv('S4_COOLDOWN_DAYS', '3') or 3)
+S4_MAX_FLIPS_30D = int(os.getenv('S4_MAX_FLIPS_30D', '2') or 2)
+
+# --- S4 Execution Hardening (OKX only) ---
+S4_EXEC_HARDENING_ENABLED = _env_flag('S4_EXEC_HARDENING_ENABLED', False)
+S4_LIMIT_FIRST_SECONDS = int(os.getenv('S4_LIMIT_FIRST_SECONDS', '45') or 45)
+S4_IOC_FALLBACK_ENABLED = _env_flag('S4_IOC_FALLBACK_ENABLED', False)
+S4_MAX_SPREAD_PCT_BTC = float(os.getenv('S4_MAX_SPREAD_PCT_BTC', '0.60') or 0.60)
+S4_MAX_SPREAD_PCT_XAUT = float(os.getenv('S4_MAX_SPREAD_PCT_XAUT', '0.50') or 0.50)
+
+
+def ensure_action_dedupe_table() -> None:
+    """Create action_dedupe table when DB dedupe is enabled."""
+    if not DB_DEDUPE_ENABLED:
+        return
+    try:
+        with db_transaction() as (cursor, _):
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_dedupe (
+                    dedupe_key VARCHAR(128) PRIMARY KEY,
+                    request_id VARCHAR(64) NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_action_dedupe_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+        logging.info("DB dedupe enabled: ensured action_dedupe table exists.")
+    except Exception as exc:
+        logging.warning(f"ensure_action_dedupe_table failed: {exc}")
+
+
+def claim_dedupe_key(dedupe_key: str, request_id: str) -> bool:
+    """Try to claim a dedupe key in DB. Returns True if new, False if duplicate."""
+    if not DB_DEDUPE_ENABLED or not dedupe_key:
+        return True
+    try:
+        with db_transaction() as (cursor, _):
+            cursor.execute(
+                "INSERT IGNORE INTO action_dedupe (dedupe_key, request_id) VALUES (%s, %s)",
+                (dedupe_key, request_id),
+            )
+            claimed = cursor.rowcount > 0
+        if not claimed:
+            logging.warning("DB dedupe hit: skipping action dedupe_key=%s request_id=%s", dedupe_key, request_id)
+        return claimed
+    except Exception as exc:
+        logging.warning("claim_dedupe_key failed (allowing action): %s", exc)
+        return True
+
+
+def cleanup_action_dedupe() -> int:
+    """Delete old action_dedupe rows older than configured retention days."""
+    if not (DB_DEDUPE_ENABLED and DEDUPE_CLEANUP_ENABLED):
+        return 0
+    days = max(DEDUPE_CLEANUP_DAYS, 1)
+    try:
+        with db_transaction() as (cursor, _):
+            cursor.execute(
+                "DELETE FROM action_dedupe WHERE created_at < (NOW() - INTERVAL %s DAY)",
+                (days,),
+            )
+            deleted = cursor.rowcount or 0
+        if deleted:
+            logging.info("DB dedupe cleanup: deleted %s rows older than %s days.", deleted, days)
+        return int(deleted)
+    except Exception as exc:
+        logging.warning("DB dedupe cleanup failed: %s", exc)
+        return 0
+
+
+def _format_dt_local(dt: datetime) -> str:
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(dt)
+
+
+def _format_dt_local_from_iso(value: str | None, tz_name: str = "Asia/Bangkok") -> str | None:
+    if not value:
+        return None
+    dt = parse_iso_dt(value)
+    if not dt:
+        return None
+    try:
+        tz = timezone(tz_name)
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return dt.isoformat()
+
+
+def _compute_s4_gates_summary(now: datetime, runtime: dict) -> tuple[str | None, str | None]:
+    cooldown_text = None
+    confirm_text = None
+
+    try:
+        last_flip_dt = parse_iso_dt(runtime.get('last_flip_at')) if isinstance(runtime.get('last_flip_at'), str) else None
+        cooldown_days = max(int(S4_COOLDOWN_DAYS or 0), 0)
+        if last_flip_dt and cooldown_days > 0:
+            cooldown_until = last_flip_dt + timedelta(days=cooldown_days)
+            if now.astimezone(utc) < cooldown_until:
+                remaining = cooldown_until - now.astimezone(utc)
+                hours_left = max(int(remaining.total_seconds() // 3600), 0)
+                cooldown_text = f"ON ({hours_left}h left)"
+            else:
+                cooldown_text = "OFF"
+        else:
+            cooldown_text = "OFF"
+    except Exception:
+        cooldown_text = None
+
+    try:
+        confirm_days = max(int(S4_CONFIRM_DAYS or 0), 1)
+        history = runtime.get('signal_history')
+        if confirm_days > 1 and isinstance(history, list):
+            confirm_text = "OFF" if _s4_confirmed(history, days=confirm_days) else f"ON (need {confirm_days}D)"
+        else:
+            confirm_text = "OFF"
+    except Exception:
+        confirm_text = None
+
+    return cooldown_text, confirm_text
+
+
+_LAST_HEARTBEAT_DAY_SENT: str | None = None
+
+
+def maybe_send_daily_heartbeat(now: datetime) -> None:
+    """Send a daily heartbeat LINE message once per day (08:00–08:15 Asia/Bangkok)."""
+    if now.tzinfo is None:
+        now = timezone('Asia/Bangkok').localize(now)
+    if now.hour != 8 or now.minute > 15:
+        return
+
+    day_key = now.strftime("%Y-%m-%d")
+    dedupe_key = f"heartbeat:{day_key}"
+    request_id = f"heartbeat-{day_key.replace('-', '')}-{os.getpid()}"
+    global _LAST_HEARTBEAT_DAY_SENT
+    if not DB_DEDUPE_ENABLED:
+        if _LAST_HEARTBEAT_DAY_SENT == day_key:
+            return
+        _LAST_HEARTBEAT_DAY_SENT = day_key
+    else:
+        if not claim_dedupe_key(dedupe_key, request_id):
+            return
+
+    cdc_status = None
+    try:
+        cdc_status = load_strategy_state().get('last_cdc_status')
+    except Exception:
+        cdc_status = None
+
+    s4_asset = None
+    s4_cdc = None
+    cooldown_text = None
+    confirm_text = None
+    last_flip_text = None
+    portfolio_text = None
+    try:
+        record, _, _, runtime = get_s4_state()
+        if record and isinstance(runtime, dict):
+            s4_cdc = str(runtime.get('last_cdc_status') or '').lower() or None
+            s4_asset = runtime.get('active_asset')
+            if not s4_asset:
+                s4_asset = 'BTC' if (s4_cdc or 'up') == 'up' else 'GOLD'
+            cooldown_text, confirm_text = _compute_s4_gates_summary(now, runtime)
+            last_flip_text = _format_dt_local_from_iso(runtime.get('last_flip_at'))
+            exposure = runtime.get('exposure') if isinstance(runtime, dict) else None
+            if isinstance(exposure, dict):
+                total_usd = exposure.get('total_usd')
+                if isinstance(total_usd, (int, float)) and total_usd > 0:
+                    portfolio_text = f"{total_usd:,.2f} USDT"
+    except Exception as exc:
+        logging.debug("Heartbeat S4 state read failed: %s", exc)
+
+    effective_cdc = (s4_cdc or cdc_status or 'unknown')
+    asset_text = s4_asset or 'unknown'
+
+    lines = [
+        "Daily Heartbeat",
+        "Status: RUNNING",
+        f"Time: {_format_dt_local(now)} (Asia/Bangkok) | PID: {os.getpid()}",
+        f"S4: Asset={asset_text} | CDC={effective_cdc}",
+    ]
+    gates_bits = []
+    if cooldown_text:
+        gates_bits.append(f"cooldown={cooldown_text}")
+    if confirm_text:
+        gates_bits.append(f"confirm_pending={confirm_text}")
+    if gates_bits:
+        lines.append("Gates: " + " | ".join(gates_bits))
+    if last_flip_text:
+        lines.append(f"Last Flip: {last_flip_text} (Asia/Bangkok)")
+    if portfolio_text:
+        lines.append(f"Portfolio: {portfolio_text}")
+
+    try:
+        send_line_message_with_retry("\n".join(lines))
+        logging.info("Daily heartbeat sent dedupe_key=%s", dedupe_key)
+    except Exception as exc:
+        logging.warning("Daily heartbeat notify failed: %s", exc)
+
+
+def acquire_scheduler_lock() -> object | None:
+    """Acquire a DB-level lock to ensure single scheduler instance."""
+    if not SCHEDULER_DB_LOCK_ENABLED:
+        return None
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT GET_LOCK(%s, %s)", (SCHEDULER_DB_LOCK_NAME, SCHEDULER_DB_LOCK_TIMEOUT))
+        row = cursor.fetchone()
+        got = bool(row and row[0] == 1)
+        if not got:
+            logging.error("Failed to acquire scheduler lock '%s'. Another instance may be running.", SCHEDULER_DB_LOCK_NAME)
+            cursor.close()
+            conn.close()
+            return None
+        logging.info("Acquired scheduler lock '%s'.", SCHEDULER_DB_LOCK_NAME)
+        cursor.close()
+        return conn
+    except Exception as exc:
+        logging.error("Scheduler lock acquisition error: %s", exc)
+        try:
+            if cursor:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return None
+
+
+def release_scheduler_lock(conn: object | None) -> None:
+    if not conn or not SCHEDULER_DB_LOCK_ENABLED:
+        return
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT RELEASE_LOCK(%s)", (SCHEDULER_DB_LOCK_NAME,))
+        conn.commit()
+        cursor.close()
+        logging.info("Released scheduler lock '%s'.", SCHEDULER_DB_LOCK_NAME)
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def assess_liquidity(adapter, exchange: str, *, context: dict | None = None) -> tuple[bool, dict]:
@@ -190,10 +459,33 @@ def evaluate_twap_guard(adapter, exchange: str, price: float) -> tuple[bool, dic
 def evaluate_notional_cap(exchange: str, notional: float, state: dict | None = None) -> tuple[bool, dict]:
     st = state or {}
     cap = 0.0
-    if exchange.lower() == 'okx':
-        cap = float(st.get('okx_max_usdt') or os.getenv('OKX_MAX_USDT') or 0.0)
-    elif exchange.lower() == 'binance':
-        cap = float(st.get('binance_max_usdt') or os.getenv('BINANCE_MAX_USDT') or 0.0)
+    ex = exchange.lower()
+    if ex == 'okx':
+        cap_val = st.get('okx_max_usdt')
+        if cap_val is None:
+            env_val = os.getenv('OKX_MAX_USDT')
+            try:
+                cap = float(env_val) if env_val not in (None, '') else 0.0
+            except (TypeError, ValueError):
+                cap = 0.0
+        else:
+            try:
+                cap = float(cap_val)
+            except (TypeError, ValueError):
+                cap = 0.0
+    elif ex == 'binance':
+        cap_val = st.get('binance_max_usdt')
+        if cap_val is None:
+            env_val = os.getenv('BINANCE_MAX_USDT')
+            try:
+                cap = float(env_val) if env_val not in (None, '') else 0.0
+            except (TypeError, ValueError):
+                cap = 0.0
+        else:
+            try:
+                cap = float(cap_val)
+            except (TypeError, ValueError):
+                cap = 0.0
     if is_dry_run():
         return True, {'reason': 'dry_run', 'cap': cap, 'attempt': notional}
     if cap and cap > 0 and notional > cap:
@@ -205,6 +497,13 @@ async def handle_half_sell_action(now: datetime, action: StrategyAction, *, stat
     exchange = str(action.payload.get('exchange') or '').lower()
     pct = int(action.payload.get('percent') or 0)
     ctx_state = state or load_strategy_state()
+    if not claim_dedupe_key(action.dedupe_key, action.request_id):
+        return ActionResult(
+            request_id=action.request_id,
+            dedupe_key=action.dedupe_key,
+            status=ActionStatus.SKIPPED,
+            detail="duplicate_action_db",
+        )
     meta = {
         'request_id': action.request_id,
         'dedupe_key': action.dedupe_key,
@@ -225,6 +524,13 @@ async def handle_reserve_buy_action(now: datetime, action: StrategyAction) -> Ac
     """Execute a RESERVE_BUY action (global or per exchange)."""
     mode = str(action.payload.get('mode') or 'global').lower()
     exchange = str(action.payload.get('exchange') or '').lower()
+    if not claim_dedupe_key(action.dedupe_key, action.request_id):
+        return ActionResult(
+            request_id=action.request_id,
+            dedupe_key=action.dedupe_key,
+            status=ActionStatus.SKIPPED,
+            detail="duplicate_action_db",
+        )
     context = {
         'request_id': action.request_id,
         'dedupe_key': action.dedupe_key,
@@ -612,6 +918,178 @@ def parse_iso_dt(value: str | None) -> datetime | None:
     except Exception:
         return None
 
+
+def _s4_should_alert(runtime: dict, key: str, now: datetime, *, min_interval_minutes: int = 360) -> bool:
+    ts_key = f"last_alert_{key}"
+    last_raw = runtime.get(ts_key)
+    last_dt = parse_iso_dt(last_raw) if isinstance(last_raw, str) else None
+    if not last_dt:
+        runtime[ts_key] = now.astimezone(utc).isoformat()
+        return True
+    if (now.astimezone(utc) - last_dt).total_seconds() >= min_interval_minutes * 60:
+        runtime[ts_key] = now.astimezone(utc).isoformat()
+        return True
+    return False
+
+
+def _s4_hold(
+    now: datetime,
+    metadata: dict,
+    runtime: dict,
+    *,
+    reason: str,
+    detail: str | None = None,
+    alert_key: str | None = None,
+    alert_message: str | None = None,
+    alert_interval_minutes: int = 360,
+) -> None:
+    runtime['last_action_result'] = [{'status': 'HOLD', 'reason': reason}]
+    runtime.pop('last_error', None)
+    runtime['last_hold_detail'] = {
+        'at': now.isoformat(),
+        'reason': reason,
+        'detail': detail,
+    }
+    # Forensic-friendly logs with minimal spam: log immediately on reason change,
+    # otherwise throttle at the same interval as alerts by default.
+    last_reason = runtime.get('last_hold_reason')
+    runtime['last_hold_reason'] = reason
+    if last_reason != reason or _s4_should_alert(runtime, f"log_{reason}", now, min_interval_minutes=alert_interval_minutes):
+        logging.info("S4 HOLD | reason=%s | detail=%s", reason, detail or "")
+    if alert_key and alert_message and _s4_should_alert(runtime, alert_key, now, min_interval_minutes=alert_interval_minutes):
+        try:
+            send_line_message_with_retry(alert_message)
+        except Exception:
+            logging.debug("S4 hold alert failed", exc_info=True)
+    save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
+
+
+def _s4_asof_date(value: str | None) -> str | None:
+    dt = parse_iso_dt(value)
+    if not dt:
+        return None
+    return dt.date().isoformat()
+
+
+def _s4_update_signal_history(runtime: dict, entry: dict, *, keep: int = 14) -> list[dict]:
+    history = runtime.get('signal_history')
+    if not isinstance(history, list):
+        history = []
+    date_key = entry.get('date')
+    if date_key:
+        replaced = False
+        for idx, item in enumerate(history):
+            if isinstance(item, dict) and item.get('date') == date_key:
+                history[idx] = entry
+                replaced = True
+                break
+        if not replaced:
+            history.append(entry)
+    # Keep only the latest N entries sorted by date (string ISO date).
+    history = [item for item in history if isinstance(item, dict) and item.get('date')]
+    history.sort(key=lambda x: x.get('date') or '')
+    if len(history) > keep:
+        history = history[-keep:]
+    runtime['signal_history'] = history
+    return history
+
+
+def _s4_confirmed(history: list[dict], *, days: int) -> bool:
+    if days <= 1:
+        return True
+    if not history or len(history) < days:
+        return False
+    tail = history[-days:]
+    statuses = [str(item.get('status') or '').lower() for item in tail]
+    dates = [item.get('date') for item in tail]
+    if any(not s for s in statuses) or any(not d for d in dates):
+        return False
+    if len(set(statuses)) != 1:
+        return False
+    try:
+        parsed_dates = [datetime.fromisoformat(d).date() for d in dates]  # type: ignore[arg-type]
+    except Exception:
+        return False
+    # Require consecutive daily closes (date increments by 1 day).
+    for prev, curr in zip(parsed_dates, parsed_dates[1:]):
+        if (curr - prev).days != 1:
+            return False
+    return True
+
+
+def _s4_count_successful_flips_30d() -> int:
+    """Count executed S4 flips in the last 30 days (both directions)."""
+    days = 30
+    try:
+        with db_transaction() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM strategy_rotation_log
+                WHERE strategy_mode=%s
+                  AND reason=%s
+                  AND executed_at >= (NOW() - INTERVAL %s DAY)
+                  AND (
+                        metadata_json LIKE %s
+                     OR metadata_json LIKE %s
+                     OR (
+                            (metadata_json LIKE %s OR metadata_json LIKE %s)
+                        AND metadata_json LIKE %s
+                        )
+                  )
+                """,
+                (
+                    's4_multi_leg',
+                    'cdc_flip',
+                    days,
+                    '%"executed_ok": true%',
+                    '%"executed_ok":true%',
+                    '%"dry_run": false%',
+                    '%"dry_run":false%',
+                    '%"executed": {%',
+                ),
+            )
+            row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as exc:
+        logging.warning("S4 flip count query failed (allowing flips): %s", exc)
+        return 0
+
+
+def _s4_spread_threshold_pct(symbol: str) -> float:
+    sym = str(symbol or "").upper()
+    if "XAUT" in sym:
+        return float(S4_MAX_SPREAD_PCT_XAUT)
+    return float(S4_MAX_SPREAD_PCT_BTC)
+
+
+def _s4_check_spread_okx(adapter, symbol: str) -> tuple[bool, dict]:
+    """Return (ok, metrics) for symbol spread check using OKX top-of-book."""
+    try:
+        tob = adapter.get_top_of_book(symbol)  # OKX adapter supports symbol
+        bid = float(tob.get("bid") or 0.0)
+        ask = float(tob.get("ask") or 0.0)
+        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+        spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
+        threshold = _s4_spread_threshold_pct(symbol)
+        metrics = {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            "threshold_pct": threshold,
+            "ts": tob.get("ts"),
+        }
+        if bid <= 0 or ask <= 0:
+            metrics["reason"] = "invalid_top_of_book"
+            return False, metrics
+        if spread_pct > threshold:
+            metrics["reason"] = "spread_high"
+            return False, metrics
+        return True, metrics
+    except Exception as exc:
+        return False, {"symbol": symbol, "reason": "top_of_book_error", "error": str(exc)}
+
 def compute_s4_exposure_from_units(
     btc_units: float,
     gold_units: float,
@@ -793,6 +1271,17 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
     except Exception as exc:
         logging.debug(f"S4 DCA schedule context unavailable ({schedule_id}): {exc}")
 
+    def _order_id_payload(value):
+        """Return an order identifier suitable for notifications/logs."""
+        if value in (None, '', 0):
+            return None
+        if isinstance(value, (int, float)):
+            return value if value > 0 else None
+        text = str(value).strip()
+        return text or None
+
+    order_id_payload = _order_id_payload(order_id)
+
     try:
         notify_s4_dca_buy({
             'asset': asset_label,
@@ -804,7 +1293,7 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
             'schedule_time': schedule_context.get('time') if schedule_context else None,
             'schedule_label': schedule_context.get('label') if schedule_context else None,
             'dry_run': dry_run or adapter is None,
-            'order_id': order_id if order_id and order_id > 0 else None,
+            'order_id': order_id_payload,
             'fee_usdt': fee_buy_usdt,
             'fee_asset': fee_buy_asset,
             'fee_asset_amount': fee_buy_asset_amount,
@@ -812,8 +1301,49 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
             'holdings': holdings_payload,
             'holdings_meta': holdings_meta,
         })
-    except Exception:
-        logging.debug("S4 DCA notification skipped", exc_info=True)
+    except Exception as exc:
+        logging.error("S4 DCA notification failed; falling back to text message: %s", exc, exc_info=True)
+        fallback_lines = [
+            "S4 DCA Buy (fallback)",
+            f"Asset: {asset_label} | Exchange: {exchange_label}",
+            f"Amount: {filled_usd:,.2f} USDT",
+        ]
+        if executed_qty and avg_price:
+            fallback_lines.append(f"Qty: {executed_qty:.6f} {asset_label} @ {avg_price:,.2f}")
+        elif executed_qty:
+            fallback_lines.append(f"Qty: {executed_qty:.6f} {asset_label}")
+        elif avg_price:
+            fallback_lines.append(f"Avg: {avg_price:,.2f}")
+
+        status_bits: list[str] = []
+        if schedule_id:
+            status_bits.append(f"Schedule: #{schedule_id}")
+        elif schedule_context.get('label'):
+            status_bits.append(f"Schedule: {schedule_context.get('label')}")
+        cdc_state = runtime.get('last_cdc_status') or last_status
+        if cdc_state:
+            status_bits.append(f"CDC: {str(cdc_state).upper()}")
+        if dry_run or adapter is None:
+            status_bits.append("Mode: DRY RUN")
+        else:
+            status_bits.append("Mode: LIVE")
+        if order_id_payload:
+            status_bits.append(f"Order: {order_id_payload}")
+        if status_bits:
+            fallback_lines.append(" | ".join(status_bits))
+
+        fee_bits: list[str] = []
+        if fee_buy_usdt:
+            fee_bits.append(f"{fee_buy_usdt:,.6f} USDT")
+        if fee_buy_asset and fee_buy_asset_amount:
+            fee_bits.append(f"{fee_buy_asset_amount:,.6f} {str(fee_buy_asset).upper()}")
+        if fee_bits:
+            fallback_lines.append("Fee: " + " + ".join(fee_bits))
+
+        try:
+            send_line_message_with_retry("\n".join(fallback_lines))
+        except Exception:
+            logging.error("S4 DCA fallback notification failed", exc_info=True)
 
     save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
     return {
@@ -1170,8 +1700,11 @@ def get_cdc_status_1d(client_override=None, use_cache: bool = True):
     _CDC_CACHE.update({'data': data, 'expires': now + 60})
     return data
 
-def load_strategy_state():
-    """Load CDC strategy state with graceful handling for legacy schemas."""
+def load_strategy_state(*, fail_on_error: bool = False):
+    """Load CDC strategy state with graceful handling for legacy schemas.
+
+    If fail_on_error is True, bubble up DB errors instead of returning defaults.
+    """
     defaults = {
         'last_cdc_status': None,
         'reserve_usdt': 0.0,
@@ -1201,6 +1734,8 @@ def load_strategy_state():
         columns = [desc[0] for desc in cursor.description]
         record = dict(zip(columns, row))
     except Exception as exc:
+        if fail_on_error:
+            raise
         logging.warning(f"load_strategy_state fallback: {exc}")
         return defaults
     finally:
@@ -2373,12 +2908,56 @@ async def run_s4_tick(now: datetime) -> None:
             ratio_snapshot = _fetch_okx_ratio_signal()
         except Exception as exc:
             logging.warning(f"S4 ratio signal fetch failed: {exc}")
-    if ratio_snapshot and ratio_snapshot.get('status'):
+
+    if S4_HARDENING_ENABLED and exchange_code == 'okx':
+        # Enforce okx_ratio as PRIMARY for flip decisions.
+        if not (ratio_snapshot and ratio_snapshot.get('status')):
+            _s4_hold(
+                now,
+                metadata,
+                runtime,
+                reason='ratio_missing',
+                detail='okx_ratio snapshot missing or invalid; holding allocation (no flip)',
+                alert_key='ratio_missing',
+                alert_message='⚠️ S4 HOLD: okx_ratio missing/invalid (no flip).',
+            )
+            return
+        updated_at = ratio_snapshot.get('updated_at')
+        upd_dt = parse_iso_dt(str(updated_at)) if updated_at else None
+        if not upd_dt:
+            _s4_hold(
+                now,
+                metadata,
+                runtime,
+                reason='ratio_timestamp_invalid',
+                detail=f'okx_ratio updated_at invalid: {updated_at}',
+                alert_key='ratio_stale',
+                alert_message='⚠️ S4 HOLD: okx_ratio timestamp invalid/stale (no flip).',
+            )
+            return
+        ttl_minutes = max(int(S4_RATIO_TTL_MINUTES or 0), 1)
+        age_seconds = (now.astimezone(utc) - upd_dt).total_seconds()
+        if age_seconds > ttl_minutes * 60:
+            _s4_hold(
+                now,
+                metadata,
+                runtime,
+                reason='ratio_stale',
+                detail=f'okx_ratio age {int(age_seconds)}s > ttl {ttl_minutes}m',
+                alert_key='ratio_stale',
+                alert_message=f'⚠️ S4 HOLD: okx_ratio stale (> {ttl_minutes}m) (no flip).',
+            )
+            return
         cdc_snapshot = ratio_snapshot
         signal_source = str(ratio_snapshot.get('source') or 'okx_ratio')
     else:
-        cdc_snapshot = get_cdc_status_1d()
-        signal_source = 'binance_cdc'
+        # Legacy behaviour: allow fallback to binance_cdc.
+        if ratio_snapshot and ratio_snapshot.get('status'):
+            cdc_snapshot = ratio_snapshot
+            signal_source = str(ratio_snapshot.get('source') or 'okx_ratio')
+        else:
+            cdc_snapshot = get_cdc_status_1d()
+            signal_source = 'binance_cdc'
 
     cdc_status = str(cdc_snapshot.get('status') or 'down').lower()
     target_asset = 'BTC' if cdc_status == 'up' else 'GOLD'
@@ -2393,6 +2972,77 @@ async def run_s4_tick(now: datetime) -> None:
         'gold_close': cdc_snapshot.get('gold_close'),
     }
 
+    # S4 hardening: confirmation/cooldown/max flip circuit breaker (NO-GO gates).
+    if S4_HARDENING_ENABLED:
+        # Record 1D signal history (de-dupe per as-of date).
+        asof_date = None
+        if cdc_snapshot.get('asof_date'):
+            asof_date = str(cdc_snapshot.get('asof_date'))
+        if not asof_date:
+            asof_date = _s4_asof_date(str(cdc_snapshot.get('updated_at')) if cdc_snapshot.get('updated_at') else None)
+        if asof_date:
+            _s4_update_signal_history(
+                runtime,
+                {
+                    'date': asof_date,
+                    'status': cdc_status,
+                    'source': signal_source,
+                    'updated_at': cdc_snapshot.get('updated_at'),
+                },
+            )
+
+        # Cooldown hard-lock
+        last_flip_dt = parse_iso_dt(runtime.get('last_flip_at')) if isinstance(runtime.get('last_flip_at'), str) else None
+        cooldown_days = max(int(S4_COOLDOWN_DAYS or 0), 0)
+        if last_flip_dt and cooldown_days > 0:
+            if (now.astimezone(utc) - last_flip_dt).total_seconds() < cooldown_days * 86400:
+                _s4_hold(
+                    now,
+                    metadata,
+                    runtime,
+                    reason='cooldown_active',
+                    detail=f'cooldown_days={cooldown_days}',
+                    alert_key='cooldown',
+                    alert_message=f'ℹ️ S4 HOLD: cooldown active ({cooldown_days}d).',
+                    alert_interval_minutes=720,
+                )
+                return
+
+        # Max flips / 30d circuit breaker (count successful executed flips, both directions)
+        max_flips = max(int(S4_MAX_FLIPS_30D or 0), 0)
+        if max_flips > 0:
+            flips = _s4_count_successful_flips_30d()
+            runtime['flip_count_30d'] = flips
+            if flips >= max_flips:
+                _s4_hold(
+                    now,
+                    metadata,
+                    runtime,
+                    reason='max_flips_reached',
+                    detail=f'flips_30d={flips} >= max={max_flips}',
+                    alert_key='max_flips',
+                    alert_message=f'⚠️ S4 SAFE MODE: max flips reached ({flips}/{max_flips} in 30d). HOLD.',
+                    alert_interval_minutes=1440,
+                )
+                return
+
+        # 2-day confirmation (requires consecutive daily closes)
+        confirm_days = max(int(S4_CONFIRM_DAYS or 0), 1)
+        history = runtime.get('signal_history')
+        if isinstance(history, list) and confirm_days > 1:
+            if not _s4_confirmed(history, days=confirm_days):
+                _s4_hold(
+                    now,
+                    metadata,
+                    runtime,
+                    reason='confirm_pending',
+                    detail=f'confirm_days={confirm_days}',
+                    alert_key='confirm_pending',
+                    alert_message=f'ℹ️ S4 HOLD: waiting {confirm_days}-day confirmation.',
+                    alert_interval_minutes=720,
+                )
+                return
+
     target_btc_pct, target_gold_pct = _resolve_s4_target_allocations(config, cdc_status)
     target_alloc = runtime.setdefault('target_allocations', {})
     target_alloc['btc_pct'] = target_btc_pct
@@ -2403,6 +3053,21 @@ async def run_s4_tick(now: datetime) -> None:
     executed_meta = None
     rotation_amount_usd = 0.0
     rotation_plan = None
+
+    if previous_status not in ('up', 'down'):
+        logging.warning("S4 transition with unknown previous CDC state (%s); skipping rotation and persisting current state", previous_status)
+        runtime['active_asset'] = target_asset
+        runtime['last_action'] = {
+            'result': 'noop_unknown_prev',
+            'dry_run': dry_run_mode or adapter is None,
+            'target_btc_pct': target_btc_pct,
+            'target_gold_pct': target_gold_pct,
+            'total_usd': exposure['total_usd'],
+        }
+        runtime['last_action_result'] = [{'status': 'NOOP_UNKNOWN_PREV'}]
+        runtime.pop('last_error', None)
+        save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
+        return
 
     if previous_status != cdc_status:
         rotation_plan = _plan_s4_rotation(
@@ -2423,62 +3088,330 @@ async def run_s4_tick(now: datetime) -> None:
         symbol_to = btc_symbol if to_asset == 'BTC' else gold_symbol
         available_units = gold_units if from_asset == 'GOLD' else btc_units
 
+        executed_ok = False
         if adapter is not None and not dry_run_mode and price_from > 0 and price_to > 0 and available_units > 0:
             sell_units_target = min(available_units, plan_usd / price_from if price_from > 0 else 0.0)
             if sell_units_target <= 0:
                 rotation_plan = None
             else:
                 try:
-                    sell_res = adapter.place_market_sell_qty_symbol(symbol_from, sell_units_target)
-                    rotation_amount_usd = float(sell_res.cummulative_quote_qty or 0.0)
-                    buy_res = adapter.place_market_buy_quote_symbol(symbol_to, rotation_amount_usd)
-                    executed_meta = {
-                        'sell_order': {
-                            'order_id': sell_res.order_id,
-                            'executed_qty': sell_res.executed_qty,
-                            'quote_usd': sell_res.cummulative_quote_qty,
-                            'avg_price': sell_res.avg_price,
-                            'symbol': symbol_from,
-                        },
-                        'buy_order': {
-                            'order_id': buy_res.order_id,
-                            'executed_qty': buy_res.executed_qty,
-                            'quote_usd': buy_res.cummulative_quote_qty,
-                            'avg_price': buy_res.avg_price,
-                            'symbol': symbol_to,
-                        },
-                        'realized_usd': rotation_amount_usd,
-                    }
+                    if exchange_code == 'okx' and adapter_name == 'okx' and S4_EXEC_HARDENING_ENABLED:
+                        ok_from, spread_from = _s4_check_spread_okx(adapter, symbol_from)
+                        ok_to, spread_to = _s4_check_spread_okx(adapter, symbol_to)
+                        try:
+                            logging.info(
+                                "S4 EXEC CHECK | from=%s spread=%.4f%% thr=%.4f%% bid=%.6f ask=%.6f | to=%s spread=%.4f%% thr=%.4f%% bid=%.6f ask=%.6f",
+                                symbol_from,
+                                float(spread_from.get("spread_pct") or 0.0),
+                                float(spread_from.get("threshold_pct") or 0.0),
+                                float(spread_from.get("bid") or 0.0),
+                                float(spread_from.get("ask") or 0.0),
+                                symbol_to,
+                                float(spread_to.get("spread_pct") or 0.0),
+                                float(spread_to.get("threshold_pct") or 0.0),
+                                float(spread_to.get("bid") or 0.0),
+                                float(spread_to.get("ask") or 0.0),
+                            )
+                        except Exception:
+                            pass
+                        if not ok_from or not ok_to:
+                            _s4_hold(
+                                now,
+                                metadata,
+                                runtime,
+                                reason='s4_spread_guard',
+                                detail=json.dumps({"from": spread_from, "to": spread_to}, ensure_ascii=False),
+                                alert_key='s4_spread_guard',
+                                alert_message='⚠️ S4 HOLD: spread guard blocked rotation (OKX).',
+                                alert_interval_minutes=180,
+                            )
+                            return
+
+                        # Quantize sell quantity to lot size
+                        filters_from = adapter.get_symbol_filters(symbol_from)
+                        sell_qty, sell_qty_text = adapter.quantize_step(sell_units_target, float(filters_from.get("lotSz") or 0.0))
+                        if sell_qty < float(filters_from.get("minSz") or 0.0):
+                            _s4_hold(
+                                now,
+                                metadata,
+                                runtime,
+                                reason='s4_sell_below_min',
+                                detail=f"symbol={symbol_from} qty={sell_qty} min={filters_from.get('minSz')}",
+                                alert_key='s4_sell_below_min',
+                                alert_message='⚠️ S4 HOLD: sell qty below min size (OKX).',
+                            )
+                            return
+
+                        # Stage A: limit-first (maker-ish): sell at ask, buy at bid.
+                        tob_from = adapter.get_top_of_book(symbol_from)
+                        tob_to = adapter.get_top_of_book(symbol_to)
+                        ask_from = float(tob_from.get("ask") or price_from)
+                        bid_to = float(tob_to.get("bid") or price_to)
+
+                        tick_from = float(filters_from.get("tickSz") or 0.01)
+                        px_sell = adapter.round_to_tick(ask_from, tick_from)
+
+                        sell_orders = []
+                        sell_res = adapter.place_limit_sell_qty_symbol(
+                            symbol_from,
+                            sell_qty,
+                            px_sell,
+                            timeout_seconds=max(int(S4_LIMIT_FIRST_SECONDS), 1),
+                            ord_type="limit",
+                        )
+                        sell_orders.append(sell_res)
+
+                        # Stage B: optional IOC fallback for remaining sell (only if spread still OK)
+                        remaining_sell_qty = max(sell_qty - float(sell_res.executed_qty or 0.0), 0.0)
+                        if remaining_sell_qty > 0 and S4_IOC_FALLBACK_ENABLED:
+                            logging.warning("S4 IOC fallback (sell) enabled | symbol=%s remaining_qty=%.8f", symbol_from, remaining_sell_qty)
+                            ok_leg, _ = _s4_check_spread_okx(adapter, symbol_from)
+                            if ok_leg:
+                                bid_from = float(adapter.get_top_of_book(symbol_from).get("bid") or 0.0)
+                                px_sell_ioc = adapter.round_to_tick(bid_from if bid_from > 0 else px_sell, tick_from)
+                                sell_res2 = adapter.place_limit_sell_qty_symbol(
+                                    symbol_from,
+                                    remaining_sell_qty,
+                                    px_sell_ioc,
+                                    timeout_seconds=max(int(S4_LIMIT_FIRST_SECONDS), 1),
+                                    ord_type="ioc",
+                                )
+                                sell_orders.append(sell_res2)
+
+                        sell_total_quote = sum(float(o.cummulative_quote_qty or 0.0) for o in sell_orders)
+                        sell_total_qty = sum(float(o.executed_qty or 0.0) for o in sell_orders)
+                        if sell_total_quote <= 0 or sell_total_qty <= 0:
+                            _s4_hold(
+                                now,
+                                metadata,
+                                runtime,
+                                reason='s4_sell_unfilled',
+                                detail=f"symbol={symbol_from} qty={sell_qty_text} timeout={S4_LIMIT_FIRST_SECONDS}s",
+                                alert_key='s4_sell_unfilled',
+                                alert_message='⚠️ S4 HOLD: limit-first sell unfilled (OKX).',
+                                alert_interval_minutes=180,
+                            )
+                            return
+
+                        rotation_amount_usd = sell_total_quote
+
+                        # Buy stage: compute qty from realized quote
+                        filters_to = adapter.get_symbol_filters(symbol_to)
+                        tick_to = float(filters_to.get("tickSz") or 0.01)
+                        tob_to = adapter.get_top_of_book(symbol_to)
+                        bid_to = float(tob_to.get("bid") or price_to)
+                        ask_to = float(tob_to.get("ask") or price_to)
+                        px_buy = adapter.round_to_tick(bid_to, tick_to)
+
+                        buy_qty_raw = rotation_amount_usd / max(px_buy, 1e-9)
+                        buy_qty, buy_qty_text = adapter.quantize_step(buy_qty_raw, float(filters_to.get("lotSz") or 0.0))
+                        if buy_qty < float(filters_to.get("minSz") or 0.0):
+                            _s4_hold(
+                                now,
+                                metadata,
+                                runtime,
+                                reason='s4_buy_below_min',
+                                detail=f"symbol={symbol_to} qty={buy_qty_text} min={filters_to.get('minSz')}",
+                                alert_key='s4_buy_below_min',
+                                alert_message='⚠️ S4 HOLD: buy qty below min size (OKX).',
+                            )
+                            return
+
+                        buy_orders = []
+                        buy_res = adapter.place_limit_buy_qty_symbol(
+                            symbol_to,
+                            buy_qty,
+                            px_buy,
+                            timeout_seconds=max(int(S4_LIMIT_FIRST_SECONDS), 1),
+                            ord_type="limit",
+                        )
+                        buy_orders.append(buy_res)
+
+                        remaining_buy_quote = max(rotation_amount_usd - float(buy_res.cummulative_quote_qty or 0.0), 0.0)
+                        if remaining_buy_quote > 0 and S4_IOC_FALLBACK_ENABLED:
+                            logging.warning("S4 IOC fallback (buy) enabled | symbol=%s remaining_quote=%.2f", symbol_to, remaining_buy_quote)
+                            ok_leg, _ = _s4_check_spread_okx(adapter, symbol_to)
+                            if ok_leg:
+                                px_buy_ioc = adapter.round_to_tick(ask_to if ask_to > 0 else px_buy, tick_to)
+                                rem_qty_raw = remaining_buy_quote / max(px_buy_ioc, 1e-9)
+                                rem_qty, _ = adapter.quantize_step(rem_qty_raw, float(filters_to.get("lotSz") or 0.0))
+                                if rem_qty >= float(filters_to.get("minSz") or 0.0):
+                                    buy_res2 = adapter.place_limit_buy_qty_symbol(
+                                        symbol_to,
+                                        rem_qty,
+                                        px_buy_ioc,
+                                        timeout_seconds=max(int(S4_LIMIT_FIRST_SECONDS), 1),
+                                        ord_type="ioc",
+                                    )
+                                    buy_orders.append(buy_res2)
+
+                        buy_total_quote = sum(float(o.cummulative_quote_qty or 0.0) for o in buy_orders)
+                        buy_total_qty = sum(float(o.executed_qty or 0.0) for o in buy_orders)
+                        if buy_total_qty <= 0:
+                            _s4_hold(
+                                now,
+                                metadata,
+                                runtime,
+                                reason='s4_buy_unfilled',
+                                detail=f"symbol={symbol_to} quote={rotation_amount_usd:.2f} timeout={S4_LIMIT_FIRST_SECONDS}s",
+                                alert_key='s4_buy_unfilled',
+                                alert_message='⚠️ S4 HOLD: limit-first buy unfilled (OKX).',
+                                alert_interval_minutes=180,
+                            )
+                            return
+
+                        executed_meta = {
+                            'mode': 'limit_first',
+                            'timeout_seconds': int(S4_LIMIT_FIRST_SECONDS),
+                            'ioc_fallback': bool(S4_IOC_FALLBACK_ENABLED),
+                            'sell_orders': [
+                                {
+                                    'order_id': o.order_id,
+                                    'executed_qty': float(o.executed_qty or 0.0),
+                                    'quote_usd': float(o.cummulative_quote_qty or 0.0),
+                                    'avg_price': float(o.avg_price or 0.0),
+                                    'fee_usd': float(getattr(o, 'fee_usd', 0.0) or 0.0),
+                                    'fee_asset': getattr(o, 'fee_asset', None),
+                                    'fee_asset_amount': float(getattr(o, 'fee_asset_amount', 0.0) or 0.0),
+                                    'symbol': symbol_from,
+                                }
+                                for o in sell_orders
+                            ],
+                            'buy_orders': [
+                                {
+                                    'order_id': o.order_id,
+                                    'executed_qty': float(o.executed_qty or 0.0),
+                                    'quote_usd': float(o.cummulative_quote_qty or 0.0),
+                                    'avg_price': float(o.avg_price or 0.0),
+                                    'fee_usd': float(getattr(o, 'fee_usd', 0.0) or 0.0),
+                                    'fee_asset': getattr(o, 'fee_asset', None),
+                                    'fee_asset_amount': float(getattr(o, 'fee_asset_amount', 0.0) or 0.0),
+                                    'symbol': symbol_to,
+                                }
+                                for o in buy_orders
+                            ],
+                            'realized_usd': float(sell_total_quote),
+                            'spent_usd': float(buy_total_quote),
+                            'executed_ok': executed_ok,
+                        }
+                    else:
+                        sell_res = adapter.place_market_sell_qty_symbol(symbol_from, sell_units_target)
+                        rotation_amount_usd = float(sell_res.cummulative_quote_qty or 0.0)
+                        buy_res = adapter.place_market_buy_quote_symbol(symbol_to, rotation_amount_usd)
+                        executed_ok = float(sell_res.cummulative_quote_qty or 0.0) > 0 and float(buy_res.executed_qty or 0.0) > 0
+                        executed_meta = {
+                            'sell_order': {
+                                'order_id': sell_res.order_id,
+                                'executed_qty': sell_res.executed_qty,
+                                'quote_usd': sell_res.cummulative_quote_qty,
+                                'avg_price': sell_res.avg_price,
+                                'symbol': symbol_from,
+                            },
+                            'buy_order': {
+                                'order_id': buy_res.order_id,
+                                'executed_qty': buy_res.executed_qty,
+                                'quote_usd': buy_res.cummulative_quote_qty,
+                                'avg_price': buy_res.avg_price,
+                                'symbol': symbol_to,
+                            },
+                            'realized_usd': rotation_amount_usd,
+                            'executed_ok': executed_ok,
+                        }
                     if adapter is not None and not dry_run_mode:
-                        sell_fee_usdt = float(getattr(sell_res, 'fee_usd', 0.0) or 0.0)
-                        sell_fee_asset = getattr(sell_res, 'fee_asset', None)
-                        sell_fee_asset_amount = float(getattr(sell_res, 'fee_asset_amount', 0.0) or 0.0)
-                        buy_fee_usdt = float(getattr(buy_res, 'fee_usd', 0.0) or 0.0)
-                        buy_fee_asset = getattr(buy_res, 'fee_asset', None)
-                        buy_fee_asset_amount = float(getattr(buy_res, 'fee_asset_amount', 0.0) or 0.0)
                         sell_symbol = symbol_from.replace('-', '')
                         buy_symbol = symbol_to.replace('-', '')
                         try:
                             with db_transaction() as (cursor, _):
-                                cursor.execute(
-                                    """
-                                    INSERT INTO sell_history (sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent, note, exchange, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                    """,
-                                    (now, sell_symbol, float(sell_res.executed_qty or 0.0), float(sell_res.cummulative_quote_qty or 0.0), float(sell_res.avg_price or 0.0), sell_res.order_id, None, 's4 rotation sell', exchange_label.lower(), sell_fee_usdt or None, sell_fee_asset, sell_fee_asset_amount or None)
-                                )
-                                cursor.execute(
-                                    """
-                                    INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id, exchange, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                    """,
-                                    (now, float(buy_res.cummulative_quote_qty or 0.0), float(buy_res.executed_qty or 0.0), float(buy_res.avg_price or 0.0), buy_res.order_id, None, exchange_label.lower(), buy_fee_usdt or None, buy_fee_asset, buy_fee_asset_amount or None)
-                                )
+                                if executed_meta and executed_meta.get('sell_orders'):
+                                    for order_entry in executed_meta['sell_orders']:
+                                        cursor.execute(
+                                            """
+                                            INSERT INTO sell_history (sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent, note, exchange, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            """,
+                                            (
+                                                now,
+                                                sell_symbol,
+                                                float(order_entry.get('executed_qty') or 0.0),
+                                                float(order_entry.get('quote_usd') or 0.0),
+                                                float(order_entry.get('avg_price') or 0.0),
+                                                order_entry.get('order_id'),
+                                                None,
+                                                's4 rotation sell (limit-first)',
+                                                exchange_label.lower(),
+                                                float(order_entry.get('fee_usd') or 0.0) or None,
+                                                order_entry.get('fee_asset'),
+                                                float(order_entry.get('fee_asset_amount') or 0.0) or None,
+                                            ),
+                                        )
+                                else:
+                                    sell_fee_usdt = float(getattr(sell_res, 'fee_usd', 0.0) or 0.0)
+                                    sell_fee_asset = getattr(sell_res, 'fee_asset', None)
+                                    sell_fee_asset_amount = float(getattr(sell_res, 'fee_asset_amount', 0.0) or 0.0)
+                                    cursor.execute(
+                                        """
+                                        INSERT INTO sell_history (sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent, note, exchange, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        """,
+                                        (now, sell_symbol, float(sell_res.executed_qty or 0.0), float(sell_res.cummulative_quote_qty or 0.0), float(sell_res.avg_price or 0.0), sell_res.order_id, None, 's4 rotation sell', exchange_label.lower(), sell_fee_usdt or None, sell_fee_asset, sell_fee_asset_amount or None)
+                                    )
+
+                                if executed_meta and executed_meta.get('buy_orders'):
+                                    for order_entry in executed_meta['buy_orders']:
+                                        cursor.execute(
+                                            """
+                                            INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id, exchange, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            """,
+                                            (
+                                                now,
+                                                float(order_entry.get('quote_usd') or 0.0),
+                                                float(order_entry.get('executed_qty') or 0.0),
+                                                float(order_entry.get('avg_price') or 0.0),
+                                                order_entry.get('order_id'),
+                                                None,
+                                                exchange_label.lower(),
+                                                float(order_entry.get('fee_usd') or 0.0) or None,
+                                                order_entry.get('fee_asset'),
+                                                float(order_entry.get('fee_asset_amount') or 0.0) or None,
+                                            ),
+                                        )
+                                else:
+                                    buy_fee_usdt = float(getattr(buy_res, 'fee_usd', 0.0) or 0.0)
+                                    buy_fee_asset = getattr(buy_res, 'fee_asset', None)
+                                    buy_fee_asset_amount = float(getattr(buy_res, 'fee_asset_amount', 0.0) or 0.0)
+                                    cursor.execute(
+                                        """
+                                        INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id, exchange, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        """,
+                                        (now, float(buy_res.cummulative_quote_qty or 0.0), float(buy_res.executed_qty or 0.0), float(buy_res.avg_price or 0.0), buy_res.order_id, None, exchange_label.lower(), buy_fee_usdt or None, buy_fee_asset, buy_fee_asset_amount or None)
+                                    )
                         except Exception as exc:
                             logging.warning(f"S4 rotation logging error: {exc}")
 
-                        record_fee_totals('s4_rotation_sell', adapter_name, 'sell', sell_fee_usdt, sell_fee_asset, sell_fee_asset_amount)
-                        record_fee_totals('s4_rotation_buy', adapter_name, 'buy', buy_fee_usdt, buy_fee_asset, buy_fee_asset_amount)
+                        if executed_meta and executed_meta.get('sell_orders'):
+                            for order_entry in executed_meta.get('sell_orders') or []:
+                                record_fee_totals(
+                                    's4_rotation_sell',
+                                    adapter_name,
+                                    'sell',
+                                    float(order_entry.get('fee_usd') or 0.0),
+                                    order_entry.get('fee_asset'),
+                                    float(order_entry.get('fee_asset_amount') or 0.0),
+                                )
+                            for order_entry in executed_meta.get('buy_orders') or []:
+                                record_fee_totals(
+                                    's4_rotation_buy',
+                                    adapter_name,
+                                    'buy',
+                                    float(order_entry.get('fee_usd') or 0.0),
+                                    order_entry.get('fee_asset'),
+                                    float(order_entry.get('fee_asset_amount') or 0.0),
+                                )
+                        else:
+                            record_fee_totals('s4_rotation_sell', adapter_name, 'sell', sell_fee_usdt, sell_fee_asset, sell_fee_asset_amount)
+                            record_fee_totals('s4_rotation_buy', adapter_name, 'buy', buy_fee_usdt, buy_fee_asset, buy_fee_asset_amount)
                     btc_balance = adapter.get_balance('BTC')
                     gold_balance = adapter.get_balance(gold_asset)
                     btc_units = _safe_float((btc_balance or {}).get('free'))
@@ -2515,8 +3448,10 @@ async def run_s4_tick(now: datetime) -> None:
                 now,
             )
             metadata.setdefault('runtime', {})['exposure'] = exposure
-            runtime['last_flip_at'] = now.isoformat()
-            runtime['active_asset'] = target_asset
+            # Only lock in a flip timestamp after successful execution (prevents cooldown on unfilled/aborted attempts).
+            if (adapter is not None) and (not dry_run_mode) and bool(executed_ok):
+                runtime['last_flip_at'] = now.astimezone(utc).isoformat()
+                runtime['active_asset'] = target_asset
             runtime['last_action'] = {
                 'result': 'rotation',
                 'from': from_asset,
@@ -2532,6 +3467,7 @@ async def run_s4_tick(now: datetime) -> None:
                 'dry_run': dry_run_mode or adapter is None,
                 'exchange': exchange_label,
                 'executed': executed_meta,
+                'executed_ok': bool(executed_meta.get('executed_ok')) if isinstance(executed_meta, dict) and 'executed_ok' in executed_meta else bool(executed_meta),
                 'target_btc_pct': target_btc_pct,
                 'target_gold_pct': target_gold_pct,
                 'planned_usd': plan_usd,
@@ -2589,6 +3525,7 @@ async def run_s4_tick(now: datetime) -> None:
 
     runtime['exposure'] = exposure
     runtime['last_action_result'] = [{'status': 'EXECUTED' if rotation_executed else 'NOOP'}]
+    runtime.pop('last_error', None)
 
     save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
 
@@ -2638,6 +3575,13 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
         if not decision.actions:
             return {'decision': 'noop', 'mode': mode, 'cdc': cdc_status}
         async def handle_global_buy(action):
+            if not claim_dedupe_key(action.dedupe_key, action.request_id):
+                return ActionResult(
+                    request_id=action.request_id,
+                    dedupe_key=action.dedupe_key,
+                    status=ActionStatus.SKIPPED,
+                    detail="duplicate_action_db",
+                )
             amt = float(action.payload.get('amount') or amount)
             await purchase_btc(now, amt, schedule_id, context={
                 'request_id': action.request_id,
@@ -2660,6 +3604,13 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
             )
 
         async def handle_global_reserve(action):
+            if not claim_dedupe_key(action.dedupe_key, action.request_id):
+                return ActionResult(
+                    request_id=action.request_id,
+                    dedupe_key=action.dedupe_key,
+                    status=ActionStatus.SKIPPED,
+                    detail="duplicate_action_db",
+                )
             amt = float(action.payload.get('amount') or amount)
             new_reserve_val = increment_reserve(amt)
             notify_context = {
@@ -2705,6 +3656,13 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
 
     # non-global modes
     async def handle_exchange_buy(action):
+        if not claim_dedupe_key(action.dedupe_key, action.request_id):
+            return ActionResult(
+                request_id=action.request_id,
+                dedupe_key=action.dedupe_key,
+                status=ActionStatus.SKIPPED,
+                detail="duplicate_action_db",
+            )
         exchange = str(action.payload.get('exchange') or '').lower()
         amt = float(action.payload.get('amount') or 0)
         context = {
@@ -2727,27 +3685,35 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
             data={'exchange': exchange, 'payload': result, 'request_id': action.request_id, 'dedupe_key': action.dedupe_key},
         )
 
-        async def handle_exchange_reserve(action):
-            exchange = str(action.payload.get('exchange') or '').lower()
-            amt = float(action.payload.get('amount') or 0)
-            new_val = increment_reserve_exchange(exchange, amt)
-            notify_context = {
-                'request_id': action.request_id,
-                'dedupe_key': action.dedupe_key,
-                'cdc_status': action.payload.get('cdc_status', cdc_status),
-                'timestamp': now,
-            }
-            _attach_holdings_snapshot(
-                notify_context,
-                exchange,
-                assets=("BTC", "USDT"),
-            )
-            try:
-                notify_weekly_dca_skipped_exchange(exchange, amt, new_val, context=notify_context)
-            except Exception:
-                pass
+
+    async def handle_exchange_reserve(action):
+        if not claim_dedupe_key(action.dedupe_key, action.request_id):
             return ActionResult(
                 request_id=action.request_id,
+                dedupe_key=action.dedupe_key,
+                status=ActionStatus.SKIPPED,
+                detail="duplicate_action_db",
+            )
+        exchange = str(action.payload.get('exchange') or '').lower()
+        amt = float(action.payload.get('amount') or 0)
+        new_val = increment_reserve_exchange(exchange, amt)
+        notify_context = {
+            'request_id': action.request_id,
+            'dedupe_key': action.dedupe_key,
+            'cdc_status': action.payload.get('cdc_status', cdc_status),
+            'timestamp': now,
+        }
+        _attach_holdings_snapshot(
+            notify_context,
+            exchange,
+            assets=("BTC", "USDT"),
+        )
+        try:
+            notify_weekly_dca_skipped_exchange(exchange, amt, new_val, context=notify_context)
+        except Exception:
+            pass
+        return ActionResult(
+            request_id=action.request_id,
             dedupe_key=action.dedupe_key,
             status=ActionStatus.SUCCESS,
             data={
@@ -2777,7 +3743,11 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
 
 async def check_cdc_transition_and_act(now: datetime) -> None:
     """Detect CDC transitions and execute actions (half-sell or reserve-buy)."""
-    state = load_strategy_state()
+    try:
+        state = load_strategy_state(fail_on_error=True)
+    except Exception as exc:
+        logging.error("CDC transition check skipped: strategy_state unavailable (%s)", exc)
+        return
     # Respect global toggle
     if int(state.get('cdc_enabled', 1)) == 0:
         return
@@ -2786,8 +3756,13 @@ async def check_cdc_transition_and_act(now: datetime) -> None:
     if prev == curr:
         return
 
+    if prev not in ('up', 'down'):
+        logging.warning("CDC transition detected with unknown previous state (%s); updating state without actions", prev)
+        save_strategy_state({'last_cdc_status': curr, 'last_transition_at': now.strftime('%Y-%m-%d %H:%M:%S')})
+        return
+
     try:
-        notify_cdc_transition(prev, curr)
+        notify_cdc_transition(prev, curr, timestamp=now)
     except Exception:
         pass
 
@@ -2861,6 +3836,7 @@ async def run_loop_scheduler():
     last_run_times = {}  # Track last run time for each schedule_id
     last_transition_check = datetime.now(timezone('Asia/Bangkok')) - timedelta(seconds=60)
     last_s4_tick = datetime.now(timezone('Asia/Bangkok')) - timedelta(minutes=5)
+    last_dedupe_cleanup = datetime.now(timezone('Asia/Bangkok')) - timedelta(hours=DEDUPE_CLEANUP_INTERVAL_HOURS)
 
     while True:
         try:
@@ -2902,6 +3878,20 @@ async def run_loop_scheduler():
                     last_s4_tick = now
             except Exception as e:
                 logging.error(f"S4 tick error: {e}")
+
+            # Periodic cleanup of DB dedupe table (safe, best-effort)
+            try:
+                if DEDUPE_CLEANUP_ENABLED and (now - last_dedupe_cleanup).total_seconds() >= DEDUPE_CLEANUP_INTERVAL_HOURS * 3600:
+                    cleanup_action_dedupe()
+                    last_dedupe_cleanup = now
+            except Exception as e:
+                logging.warning(f"Dedupe cleanup error: {e}")
+
+            # Daily heartbeat (08:00–08:15 Asia/Bangkok) - deduped via action_dedupe
+            try:
+                maybe_send_daily_heartbeat(now)
+            except Exception as e:
+                logging.warning("Heartbeat error: %s", e)
 
             for schedule in config_cache:
                 # Support both schema shapes
@@ -2950,6 +3940,7 @@ async def run_loop_scheduler():
 
 if __name__ == "__main__":
     health_server = None
+    scheduler_lock_conn = None
     try:
         # Ensure strategy tables exist (best-effort)
         try:
@@ -2976,10 +3967,18 @@ if __name__ == "__main__":
             db.commit(); cursor.close(); db.close()
         except Exception as _e:
             logging.warning(f"Strategy tables ensure failed (will rely on app migration): {_e}")
+
+        # Optional: ensure action dedupe infra
+        ensure_action_dedupe_table()
         # Start health check server
         health_server = start_health_check()
         
         if health_server:
+            # Optional: single-instance scheduler lock
+            scheduler_lock_conn = acquire_scheduler_lock()
+            if SCHEDULER_DB_LOCK_ENABLED and scheduler_lock_conn is None:
+                logging.error("Exiting without starting scheduler due to lock contention.")
+                sys.exit(0)
             logging.info("🚀 Starting BTC DCA scheduler...")
             send_line_message("🚀 BTC DCA Scheduler Started")
             asyncio.run(run_loop_scheduler())
@@ -2998,3 +3997,4 @@ if __name__ == "__main__":
         if health_server:
             health_server.shutdown()
             logging.info("Health check server shutdown")
+        release_scheduler_lock(scheduler_lock_conn)

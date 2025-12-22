@@ -1,0 +1,21 @@
+[Unit]
+Description=DCA Scheduler (trading engine)
+Wants=network-online.target
+After=network-online.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+User=oneclimate-dev
+WorkingDirectory=/home/oneclimate-dev/yterayut-project/DCA
+EnvironmentFile=/home/oneclimate-dev/yterayut-project/DCA/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/oneclimate-dev/yterayut-project/DCA/venv/bin/python main.py
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+SyslogIdentifier=dca-scheduler
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

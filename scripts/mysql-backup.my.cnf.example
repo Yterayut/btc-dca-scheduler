@@ -1,0 +1,7 @@
+[client]
+host=localhost
+user=kiriyah
+password=REPLACE_ME
+
+# chmod 600 ~/.my.cnf
+# For backup: mysqldump will read credentials from this file (no password in process args).

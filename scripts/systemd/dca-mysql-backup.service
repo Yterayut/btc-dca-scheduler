@@ -1,0 +1,17 @@
+[Unit]
+Description=DCA MySQL backup (mysqldump)
+Wants=network-online.target
+After=network-online.target mysql.service mariadb.service
+
+[Service]
+Type=oneshot
+User=oneclimate-dev
+WorkingDirectory=/home/oneclimate-dev/yterayut-project/DCA
+EnvironmentFile=/home/oneclimate-dev/yterayut-project/DCA/.env
+Environment=BACKUP_DIR=/home/oneclimate-dev/backups/mysql
+Environment=BACKUP_KEEP_DAYS=30
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/oneclimate-dev/yterayut-project/DCA/scripts/backup_mysql.sh
+SyslogIdentifier=dca-mysql-backup
+StandardOutput=journal
+StandardError=journal

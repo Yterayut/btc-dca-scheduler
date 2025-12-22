@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="th">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="60">
+    <title>S4 Strategy Dashboard</title>
+    <style>
+      :root {
+        --bg: #f0f0e8;
+        --card: #ffffff;
+        --text: #2c2c2c;
+        --muted: #8a8377;
+        --line: #d8cfbf;
+        --green: #198754;
+        --red: #dc3545;
+        --yellow: #ca8a04;
+      }
+      body {
+        font-family: "Trebuchet MS", "DejaVu Sans", sans-serif;
+        background-color: var(--bg);
+        padding: 20px;
+        color: var(--text);
+        margin: 0;
+      }
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      .header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+      .btn-refresh {
+        background: #fff;
+        border: 1px solid var(--line);
+        padding: 6px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.9em;
+      }
+      .btn-refresh:hover {
+        background: #f3efe6;
+      }
+      .card {
+        background: var(--card);
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.06);
+        margin-bottom: 15px;
+        border: 1px solid var(--line);
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 10px;
+      }
+      .label {
+        font-size: 0.75em;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        margin-bottom: 4px;
+      }
+      .value {
+        font-size: 1.1em;
+        font-weight: 600;
+      }
+      .text-green { color: var(--green); }
+      .text-red { color: var(--red); }
+      .text-yellow { color: var(--yellow); }
+      .text-muted { color: var(--muted); font-weight: normal; font-size: 0.9em; }
+      hr {
+        border: 0;
+        border-top: 1px dotted var(--line);
+        margin: 14px 0;
+      }
+      .time-format {
+        font-family: "Courier New", monospace;
+        font-size: 0.95em;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header-row">
+        <h1>S4 Strategy Status</h1>
+        <button onclick="window.location.reload();" class="btn-refresh">↻ Refresh</button>
+      </div>
+
+      {% if data.error %}
+      <div class="card">
+        <div class="text-red">Error: {{ data.error }}</div>
+      </div>
+      {% endif %}
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="label">Active Asset</div>
+            <div class="value {{ 'text-red' if data.active_asset == 'GOLD' else 'text-green' }}">
+              {{ data.active_asset }}
+            </div>
+            <div class="label" style="margin-top:5px;">Exchange</div>
+            <div class="value">{{ data.exchange }}</div>
+          </div>
+          <div>
+            <div class="label">CDC Signal</div>
+            <div class="value {{ 'text-green' if data.cdc_status == 'UP' else 'text-red' }}">
+              {{ data.cdc_status }} <span class="text-muted">({{ data.signal_source }})</span>
+            </div>
+            <div class="label" style="margin-top:5px;">Signal Time</div>
+            <div class="value time-format">{{ data.signal_time }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Portfolio</h3>
+        {% set p = data.portfolio or {} %}
+        <div class="row">
+          <span>Total Value</span>
+          <span class="value">${{ (p.total_usd or 0) | floatformat(2) }}</span>
+        </div>
+        <hr>
+        <div class="row">
+          <span>BTC</span>
+          <span>${{ (p.btc.notional_usd or 0) | floatformat(2) }} <span class="text-muted">({{ (p.btc.weight_pct or 0) | floatformat(1) }}%)</span></span>
+        </div>
+        <div class="row">
+          <span class="text-muted">BTC Cost / PnL</span>
+          <span class="text-muted">
+            ${{ (p.btc.cost or 0) | floatformat(2) }} |
+            {% set pnl = p.btc.pnl or 0 %}
+            {% set sign = '+' if pnl >= 0 else '' %}
+            {{ sign }}${{ pnl | floatformat(2) }} ({{ (p.btc.pnl_pct or 0) | floatformat(2) }}%)
+          </span>
+        </div>
+        <div class="row">
+          <span>GOLD</span>
+          <span>${{ (p.gold.notional_usd or 0) | floatformat(2) }} <span class="text-muted">({{ (p.gold.weight_pct or 0) | floatformat(1) }}%)</span></span>
+        </div>
+        <div class="row">
+          <span class="text-muted">GOLD Cost / PnL</span>
+          <span class="text-muted">
+            ${{ (p.gold.cost or 0) | floatformat(2) }} |
+            {% set gpnl = p.gold.pnl or 0 %}
+            {% set gsign = '+' if gpnl >= 0 else '' %}
+            {{ gsign }}${{ gpnl | floatformat(2) }} ({{ (p.gold.pnl_pct or 0) | floatformat(2) }}%)
+          </span>
+        </div>
+        <hr>
+        <div class="row">
+          <span>Total PnL</span>
+          <span class="value {{ 'text-green' if (p.pnl_total or 0) >= 0 else 'text-red' }}">
+            {% set tpnl = p.pnl_total or 0 %}
+            {% set tsign = '+' if tpnl >= 0 else '' %}
+            {{ tsign }}${{ tpnl | floatformat(2) }} ({{ (p.pnl_total_pct or 0) | floatformat(2) }}%)
+          </span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="label">Hold Reason</div>
+            <div class="value text-yellow">{{ data.gates.last_hold_reason or '-' }}</div>
+          </div>
+          <div>
+            <div class="label">Signal History</div>
+            <div class="value">{{ data.gates.signal_history_len or 0 }} entries</div>
+          </div>
+          <div>
+            <div class="label">Last Flip</div>
+            <div class="value time-format">{{ data.gates.last_flip_at or 'N/A' }}</div>
+          </div>
+          <div>
+            <div class="label">Flips (30d)</div>
+            <div class="value">{{ data.gates.flips_30d or 0 }} / {{ data.gates.max_flips_30d or 0 }}</div>
+          </div>
+          <div>
+            <div class="label">Confirm Progress</div>
+            {% set streak = data.gates.confirm_streak or 0 %}
+            {% set days = data.gates.confirm_days or 0 %}
+            {% set pending = days > 1 and streak < days %}
+            <div class="value {{ 'text-yellow' if pending else 'text-green' }}">{{ streak }} / {{ days }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="label">Last Status</div>
+            {% set status = data.last_status.status or 'N/A' %}
+            <div class="value {{ 'text-yellow' if 'HOLD' in status or 'NOOP' in status else '' }}">{{ status }}</div>
+            {% if data.last_status.reason %}
+            <div class="text-muted">Reason: {{ data.last_status.reason }}</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="label">Last Error</div>
+            <div class="value {{ 'text-red' if data.last_error.reason else '' }}">{{ data.last_error.reason or 'N/A' }}</div>
+            {% if data.last_error.at %}
+            <div class="text-muted time-format">{{ data.last_error.at }}</div>
+            {% endif %}
+            {% if data.last_error.detail %}
+            <div class="text-muted">Detail: {{ data.last_error.detail }}</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="label">Last Rotation</div>
+            {% if data.last_rotation.executed_at %}
+            <div class="value time-format">{{ data.last_rotation.executed_at }}</div>
+            <div class="text-muted">{{ data.last_rotation.from_asset }} -> {{ data.last_rotation.to_asset }} ({{ data.last_rotation.reason }})</div>
+            {% else %}
+            <div class="value">N/A</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      document.querySelectorAll('.time-format').forEach(el => {
+        const raw = el.innerText;
+        if (raw && raw !== 'N/A' && raw !== 'None') {
+          const date = new Date(raw);
+          if (!isNaN(date)) {
+            el.innerText = date.toLocaleString('en-GB', {
+              day: 'numeric', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
+          }
+        }
+      });
+    </script>
+  </body>
+</html>

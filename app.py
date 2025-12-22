@@ -1,11 +1,16 @@
+import asyncio
+from copy import deepcopy
 from flask import Flask, render_template, request, redirect, g, flash, jsonify
 from flask_socketio import SocketIO, emit
+import json
 import MySQLdb
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
+import time
 from dotenv import load_dotenv
 import logging
+from logging.handlers import RotatingFileHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 import functools
 from contextlib import contextmanager
@@ -15,6 +20,10 @@ from binance.client import Client
 from notify import send_line_message_with_retry, notify_cdc_toggle
 from exchanges.factory import get_adapter
 from main import increment_reserve, increment_reserve_exchange
+from compliance import fetch_events
+from services.balance_service import fetch_balances
+from decimal import Decimal
+from pathlib import Path
 
 try:
     # Optional import for price/balance
@@ -28,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
     handlers=[
-        logging.FileHandler('app.log'),
+        RotatingFileHandler('app.log', maxBytes=5 * 1024 * 1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -45,6 +54,10 @@ _cors_origins = os.getenv('CORS_ORIGIN', '*')
 if _cors_origins and _cors_origins != '*':
     _cors_origins = [o.strip() for o in _cors_origins.split(',') if o.strip()]
 socketio = SocketIO(app, cors_allowed_origins=_cors_origins or "*")
+
+# Track app start for diagnostics
+APP_START_TS = time.time()
+REPO_ROOT = Path(__file__).resolve().parent
 
 # Serve a tiny in-memory favicon to avoid 404 noise
 try:
@@ -67,6 +80,165 @@ try:
             return Response(status=204)
 except Exception:
     pass
+
+# ====== Strategy Metadata Defaults ======
+DEFAULT_STRATEGY_METADATA = {
+    'cdc_dca_v1': {
+        'display_name': 'CDC Reserve DCA',
+        'short_name': 'CDC',
+        'description': 'Classic color-based DCA with reserve deployment orchestrated through CDC signals.',
+        'category': 'core',
+        'status': 'active',
+        'allocation': {
+            'target_pct': 65.0,
+            'capital_source': 'auto_total_active_amount',
+            'buckets': [
+                {'label': 'Weekly DCA', 'target_pct': 45.0},
+                {'label': 'Reserve Deployments', 'target_pct': 20.0}
+            ]
+        },
+        'log_filters': [
+            {'id': 'cdc', 'label': 'CDC Actions'},
+            {'id': 'reserve', 'label': 'Reserve Moves'},
+            {'id': 'schedule', 'label': 'Schedule Engine'},
+            {'id': 'compliance', 'label': 'Compliance / Security'}
+        ],
+        'help_overlay': {
+            'title': 'CDC Strategy Overview',
+            'bullets': [
+                'Buys BTC automatically while CDC status is UP.',
+                'On status flip to DOWN the strategy harvests profits and tops up reserves.',
+                'Half-sell policy and exchange split can be tuned in the controls below.'
+            ],
+            'links': [
+                {'label': 'CDC Playbook', 'href': 'https://docs.internal/strategies/cdc'},
+                {'label': 'Reserve Guard Checklist', 'href': 'https://docs.internal/checklists/reserve-guard'}
+            ]
+        },
+        'guards': [
+            {'id': 'spread_guard', 'label': 'Spread Guard', 'status': 'active', 'description': 'Prevents half-sell/reserve buy when spread widens beyond guard rails.'},
+            {'id': 'liquidity_guard', 'label': 'Liquidity Guard', 'status': 'active', 'description': 'Checks top-of-book spread and rejects thin markets.'},
+            {'id': 'depth_guard', 'label': 'Depth Guard', 'status': 'active', 'description': 'Requires aggregated order book depth within ±1% band to exceed configured floor.'},
+            {'id': 'twap_guard', 'label': 'TWAP Guard', 'status': 'active', 'description': 'Blocks orders when spot drifts beyond TWAP deviation threshold.'},
+            {'id': 'notional_cap', 'label': 'Notional Cap', 'status': 'active', 'description': 'Hard limit per order notional via strategy_state.*_max_usdt.'}
+        ]
+    },
+    's4_multi_leg': {
+        'display_name': 'S4 Swing Overlay',
+        'short_name': 'S4',
+        'description': 'Four-signal swing allocator combining CDC, TWAP, depth and flow to stage opportunistic entries.',
+        'category': 'overlay',
+        'status': 'active',
+        'allocation': {
+            'target_pct': 35.0,
+            'capital_source': 'manual',
+            'capital_usdt': 10000.0,
+            'buckets': [
+                {'label': 'Spot Core', 'target_pct': 20.0},
+                {'label': 'TWAP Adds', 'target_pct': 7.5},
+                {'label': 'Hedge Offsets', 'target_pct': 7.5}
+            ]
+        },
+        'config': {
+            'target_btc_pct_up': 0.65,
+            'target_btc_pct_down': 0.35,
+            'rebalance_threshold_pct': 5.0,
+            'min_flip_usd': 500.0,
+            'max_flip_pct': 35.0,
+            'cooldown_minutes': 90,
+            'capital_usdt': 10000.0,
+            'exchange': 'okx'
+        },
+        'log_filters': [
+            {'id': 's4', 'label': 'S4 Signals'},
+            {'id': 'twap', 'label': 'TWAP Windows'},
+            {'id': 'hedge', 'label': 'Hedge Actions'}
+        ],
+        'help_overlay': {
+            'title': 'S4 Quick Start',
+            'bullets': [
+                'S4 listens to CDC status plus proprietary flow signals.',
+                'Deploys capital in four legs: base, add, hedge, unwind.',
+                'Enable once depth/TWAP guards are calibrated and monitors lit green.'
+            ],
+            'links': [
+                {'label': 'S4 Concept Note', 'href': 'https://docs.internal/strategies/s4'},
+                {'label': 'Guard Calibration Sheet', 'href': 'https://docs.internal/guard-calibration'}
+            ]
+        },
+        'guards': [
+            {'id': 'depth_guard', 'label': 'Depth Guard', 'status': 'pending', 'description': 'Requires aggregated order book depth >= 5M USDT within 1% bands.'},
+            {'id': 'twap_guard', 'label': 'TWAP Guard', 'status': 'pending', 'description': 'Ensures TWAP deviation stays within configured tolerance before staging orders.'},
+            {'id': 'notional_cap', 'label': 'Notional Cap', 'status': 'planning', 'description': 'Hard caps per asset to avoid oversizing during volatile sessions.'}
+        ]
+    }
+}
+
+
+def _merge_strategy_dict(base: dict, override: dict) -> dict:
+    """Recursively merge strategy metadata dictionaries."""
+    if not isinstance(base, dict):
+        return {}
+    if not isinstance(override, dict):
+        return base
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_strategy_dict(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = value
+    return merged
+
+
+def _strategy_metadata_for(mode: str, override_raw: str | None) -> dict:
+    """Return default metadata merged with DB overrides for a strategy mode."""
+    base = deepcopy(DEFAULT_STRATEGY_METADATA.get(mode, {}))
+    if override_raw:
+        try:
+            override = json.loads(override_raw)
+            base = _merge_strategy_dict(base, override if isinstance(override, dict) else {})
+        except json.JSONDecodeError as exc:
+            logging.warning(f"Invalid metadata_json for strategy {mode}: {exc}")
+    return base
+
+
+def _dt_to_iso(value):
+    """Convert datetime to ISO format string if possible."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _json_sanitize(value):
+    """Recursively convert values so json.dumps works (datetime → iso, Decimal → float)."""
+    if isinstance(value, dict):
+        return {k: _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_sanitize(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def _safe_float(value) -> float:
+    """Convert input to float with safe fallback."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_int(value):
+    """Convert input to int when possible."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
 
 # Ensure API requests never return HTML error pages
 @app.errorhandler(404)
@@ -187,6 +359,250 @@ def get_db_connection():
     except MySQLdb.OperationalError as e:
         logging.error(f"Database connection error: {e}")
         raise
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_s4_asset_from_purchase(price: float | None, fee_asset: str | None) -> str | None:
+    asset_hint = (fee_asset or "").strip().upper()
+    if asset_hint in ("BTC", "XAUT", "PAXG"):
+        return "BTC" if asset_hint == "BTC" else "GOLD"
+    price_f = _safe_float(price, 0.0)
+    if price_f <= 0:
+        return None
+    threshold = _safe_float(os.getenv("S4_PNL_BTC_PRICE_THRESHOLD", "10000"), 10000.0)
+    return "BTC" if price_f >= threshold else "GOLD"
+
+
+def _infer_s4_asset_from_symbol(symbol: str | None) -> str | None:
+    sym = (symbol or "").upper()
+    if "XAUT" in sym or "PAXG" in sym:
+        return "GOLD"
+    if "BTC" in sym:
+        return "BTC"
+    return None
+
+
+def _load_s4_fifo_open_lots(cursor, exchange: str, asset: str) -> list[dict]:
+    lots: list[dict] = []
+    cursor.execute(
+        """
+        SELECT purchase_time, btc_quantity, usdt_amount, btc_price, fee_buy_asset
+        FROM purchase_history
+        WHERE exchange = %s
+        ORDER BY purchase_time ASC
+        """,
+        (exchange,),
+    )
+    purchases = cursor.fetchall()
+    cursor.execute(
+        """
+        SELECT symbol, btc_quantity
+        FROM sell_history
+        WHERE exchange = %s
+        ORDER BY sell_time ASC
+        """,
+        (exchange,),
+    )
+    sells = cursor.fetchall()
+
+    for purchase_time, qty, notional, price, fee_asset in purchases:
+        inferred = _infer_s4_asset_from_purchase(price, fee_asset)
+        if inferred != asset:
+            continue
+        qty_f = _safe_float(qty, 0.0)
+        if qty_f <= 0:
+            continue
+        notional_f = _safe_float(notional, 0.0)
+        cost_per_unit = notional_f / qty_f if qty_f else 0.0
+        lots.append({"qty": qty_f, "cost": cost_per_unit, "timestamp": purchase_time})
+
+    for symbol, sell_qty in sells:
+        inferred = _infer_s4_asset_from_symbol(symbol)
+        if inferred != asset:
+            continue
+        remaining = _safe_float(sell_qty, 0.0)
+        idx = 0
+        while remaining > 0 and idx < len(lots):
+            lot = lots[idx]
+            available = _safe_float(lot.get("qty"), 0.0)
+            if available <= 0:
+                idx += 1
+                continue
+            consume = min(available, remaining)
+            lot["qty"] = max(0.0, available - consume)
+            remaining -= consume
+            if lot["qty"] <= 1e-9:
+                lot["qty"] = 0.0
+            else:
+                idx += 1
+    return [lot for lot in lots if _safe_float(lot.get("qty"), 0.0) > 1e-9]
+
+
+def _sum_lots_cost(lots: list[dict]) -> float:
+    return sum(_safe_float(lot.get("qty")) * _safe_float(lot.get("cost")) for lot in lots)
+
+
+def _s4_confirm_streak(history: list[dict], status: str | None) -> int:
+    if not history:
+        return 0
+    target = (status or "").lower()
+    if not target:
+        return 0
+    items = [h for h in history if isinstance(h, dict) and h.get("date")]
+    items.sort(key=lambda x: x.get("date") or "")
+    streak = 0
+    last_date = None
+    for entry in reversed(items):
+        if str(entry.get("status") or "").lower() != target:
+            break
+        try:
+            current_date = datetime.fromisoformat(str(entry.get("date"))).date()
+        except Exception:
+            break
+        if last_date and (last_date - current_date).days != 1:
+            break
+        streak += 1
+        last_date = current_date
+    return streak
+
+
+def _build_s4_status_data() -> dict:
+    data: dict = {
+        "active_asset": "UNKNOWN",
+        "cdc_status": "N/A",
+        "signal_source": "N/A",
+        "signal_time": "N/A",
+        "exchange": "okx",
+        "portfolio": {},
+        "gates": {},
+        "last_status": {},
+        "last_error": {},
+        "last_rotation": {},
+    }
+    with get_db_cursor() as (cursor, _):
+        cursor.execute("SELECT * FROM strategy_state WHERE mode='s4_multi_leg' LIMIT 1")
+        row = cursor.fetchone()
+        if not row:
+            data["error"] = "No S4 strategy state found."
+            return data
+        cols = [d[0] for d in cursor.description]
+        record = dict(zip(cols, row))
+
+        metadata_raw = record.get("metadata_json")
+        metadata = {}
+        if metadata_raw:
+            try:
+                metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+            except Exception:
+                metadata = {}
+
+        runtime = metadata.get("runtime") or {}
+        config = metadata.get("config") or {}
+        confirm_days = int(os.getenv("S4_CONFIRM_DAYS", "2") or 2)
+        data["exchange"] = str(config.get("exchange") or "okx").lower()
+        data["active_asset"] = runtime.get("active_asset") or "UNKNOWN"
+        data["cdc_status"] = str(runtime.get("last_cdc_status") or "N/A").upper()
+        data["signal_source"] = runtime.get("signal_source") or "N/A"
+        data["signal_time"] = runtime.get("last_signal_at") or "N/A"
+
+        exp = runtime.get("exposure") if isinstance(runtime, dict) else {}
+        total_usd = _safe_float(exp.get("total_usd"), 0.0) if isinstance(exp, dict) else 0.0
+        btc_value = _safe_float((exp.get("btc") or {}).get("notional_usd"), 0.0) if isinstance(exp, dict) else 0.0
+        gold_value = _safe_float((exp.get("gold") or {}).get("notional_usd"), 0.0) if isinstance(exp, dict) else 0.0
+        btc_weight = _safe_float((exp.get("btc") or {}).get("weight"), 0.0) * 100 if isinstance(exp, dict) else 0.0
+        gold_weight = _safe_float((exp.get("gold") or {}).get("weight"), 0.0) * 100 if isinstance(exp, dict) else 0.0
+
+        exchange = data["exchange"]
+        lots_btc = _load_s4_fifo_open_lots(cursor, exchange, "BTC")
+        lots_gold = _load_s4_fifo_open_lots(cursor, exchange, "GOLD")
+        cost_btc = _sum_lots_cost(lots_btc)
+        cost_gold = _sum_lots_cost(lots_gold)
+        cost_total = cost_btc + cost_gold
+        pnl_total = total_usd - cost_total if cost_total > 0 else 0.0
+        pnl_total_pct = (pnl_total / cost_total) * 100.0 if cost_total > 0 else 0.0
+
+        def _pnl(value: float, cost: float) -> tuple[float, float]:
+            if cost <= 0:
+                return 0.0, 0.0
+            pnl = value - cost
+            pct = (pnl / cost) * 100.0
+            return pnl, pct
+
+        btc_pnl, btc_pnl_pct = _pnl(btc_value, cost_btc)
+        gold_pnl, gold_pnl_pct = _pnl(gold_value, cost_gold)
+
+        data["portfolio"] = {
+            "total_usd": total_usd,
+            "cost_total": cost_total,
+            "pnl_total": pnl_total,
+            "pnl_total_pct": pnl_total_pct,
+            "btc": {
+                "notional_usd": btc_value,
+                "weight_pct": btc_weight,
+                "cost": cost_btc,
+                "pnl": btc_pnl,
+                "pnl_pct": btc_pnl_pct,
+            },
+            "gold": {
+                "notional_usd": gold_value,
+                "weight_pct": gold_weight,
+                "cost": cost_gold,
+                "pnl": gold_pnl,
+                "pnl_pct": gold_pnl_pct,
+            },
+        }
+
+        data["gates"] = {
+            "signal_history_len": len(runtime.get("signal_history") or []) if isinstance(runtime.get("signal_history"), list) else 0,
+            "last_flip_at": runtime.get("last_flip_at") or "N/A",
+            "flips_30d": runtime.get("flip_count_30d") or 0,
+            "max_flips_30d": config.get("max_flips_30d") or os.getenv("S4_MAX_FLIPS_30D", "2"),
+            "last_hold_reason": runtime.get("last_hold_reason") or "",
+            "confirm_days": confirm_days,
+            "confirm_streak": min(
+                _s4_confirm_streak(runtime.get("signal_history") or [], runtime.get("last_cdc_status")),
+                max(confirm_days, 0),
+            ),
+        }
+
+        last_results = runtime.get("last_action_result")
+        if isinstance(last_results, list) and last_results:
+            res = last_results[0] if isinstance(last_results[0], dict) else {}
+            data["last_status"] = {
+                "status": res.get("status") or "N/A",
+                "reason": res.get("reason") or "",
+            }
+
+        last_err = runtime.get("last_error")
+        if isinstance(last_err, dict):
+            data["last_error"] = {
+                "at": last_err.get("at") or "",
+                "reason": last_err.get("reason") or "",
+                "detail": last_err.get("detail") or "",
+            }
+
+        cursor.execute(
+            """
+            SELECT executed_at, from_asset, to_asset, reason
+            FROM strategy_rotation_log
+            WHERE strategy_mode='s4_multi_leg'
+              AND metadata_json LIKE '%"executed_ok": true%'
+            ORDER BY executed_at DESC
+            LIMIT 1
+            """
+        )
+        rot_row = cursor.fetchone()
+        if rot_row:
+            rot_cols = [d[0] for d in cursor.description]
+            data["last_rotation"] = dict(zip(rot_cols, rot_row))
+
+    return data
 
 @app.teardown_appcontext
 def close_db_connection(exception):
@@ -657,6 +1073,23 @@ def migrate_data_if_needed():
             except Exception as e:
                 logging.warning(f"Could not ensure okx_max_usdt column: {e}")
 
+            # 3.11b เพิ่มคอลัมน์ binance_max_usdt ใน strategy_state (default 0.00)
+            try:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='binance_max_usdt'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                has_col = cursor.fetchone()[0] > 0
+                if not has_col:
+                    logging.info("Adding column binance_max_usdt (default 0.00) to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN binance_max_usdt DECIMAL(18,2) NOT NULL DEFAULT 0.00 AFTER okx_max_usdt")
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not ensure binance_max_usdt column: {e}")
+
             # 3.12 สร้าง okx_trades table ถ้ายังไม่มี
             try:
                 cursor.execute("SHOW TABLES LIKE 'okx_trades'")
@@ -683,6 +1116,57 @@ def migrate_data_if_needed():
             except Exception as e:
                 logging.warning(f"Could not create okx_trades: {e}")
 
+            # 3.12b สร้าง compliance_audit_log สำหรับ audit trail
+            try:
+                cursor.execute("SHOW TABLES LIKE 'compliance_audit_log'")
+                if not cursor.fetchone():
+                    logging.info("Creating compliance_audit_log table...")
+                    cursor.execute(
+                        """
+                        CREATE TABLE compliance_audit_log (
+                            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                            event_time DATETIME NOT NULL,
+                            event_type VARCHAR(32) NOT NULL,
+                            exchange VARCHAR(16) NULL,
+                            notional_usdt DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+                            btc_quantity DECIMAL(18,8) NOT NULL DEFAULT 0.00000000,
+                            price_usdt DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+                            realized_pnl_usdt DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+                            metadata_blob MEDIUMTEXT NULL,
+                            metadata_encrypted TINYINT(1) NOT NULL DEFAULT 0,
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            KEY idx_compliance_time (event_time),
+                            KEY idx_compliance_type (event_type)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                        """
+                    )
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not ensure compliance_audit_log: {e}")
+
+            # 3.12c สร้าง strategy_fee_totals สำหรับสะสมค่าธรรมเนียมตาม exchange/strategy
+            try:
+                cursor.execute("SHOW TABLES LIKE 'strategy_fee_totals'")
+                if not cursor.fetchone():
+                    logging.info("Creating strategy_fee_totals table...")
+                    cursor.execute(
+                        """
+                        CREATE TABLE strategy_fee_totals (
+                            exchange VARCHAR(16) NOT NULL,
+                            strategy VARCHAR(64) NOT NULL,
+                            fee_type ENUM('buy','sell') NOT NULL,
+                            fee_asset VARCHAR(32) NOT NULL,
+                            fee_usd DECIMAL(24,8) NOT NULL DEFAULT 0.00000000,
+                            fee_asset_amount DECIMAL(24,8) NOT NULL DEFAULT 0.00000000,
+                            last_updated DATETIME NOT NULL,
+                            PRIMARY KEY (exchange, strategy, fee_type, fee_asset)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                        """
+                    )
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not create strategy_fee_totals: {e}")
+
             # 3.13 เพิ่มคอลัมน์ exchange_mode/binance_amount/okx_amount ใน schedules
             try:
                 cursor.execute(
@@ -693,10 +1177,27 @@ def migrate_data_if_needed():
                     (os.getenv('DB_NAME'),)
                 )
                 has_col = cursor.fetchone()[0] > 0
+                db_name = os.getenv('DB_NAME')
                 if not has_col:
                     logging.info("Adding columns exchange_mode/binance_amount/okx_amount to schedules...")
-                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both') NOT NULL DEFAULT 'global' AFTER purchase_amount")
+                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both','s4') NOT NULL DEFAULT 'global' AFTER purchase_amount")
                     db.commit()
+                else:
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_SCHEMA=%s AND TABLE_NAME='schedules' AND COLUMN_NAME='exchange_mode'
+                            """,
+                            (db_name,)
+                        )
+                        col_type = cursor.fetchone()
+                        if col_type and 's4' not in (col_type[0] or ''):
+                            logging.info("Extending schedules.exchange_mode enum to include 's4'...")
+                            cursor.execute("ALTER TABLE schedules MODIFY COLUMN exchange_mode ENUM('global','binance','okx','both','s4') NOT NULL DEFAULT 'global'")
+                            db.commit()
+                    except Exception as sub_exc:
+                        logging.warning(f"Could not extend exchange_mode enum: {sub_exc}")
                 # amounts
                 cursor.execute(
                     """
@@ -761,6 +1262,192 @@ def migrate_data_if_needed():
             except Exception as e:
                 logging.warning(f"Could not ensure half_sell_policy: {e}")
 
+            # 3.16 เพิ่มคอลัมน์ last_run_at ใน strategy_state
+            try:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='last_run_at'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                if cursor.fetchone()[0] == 0:
+                    logging.info("Adding column last_run_at to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN last_run_at DATETIME NULL AFTER last_transition_at")
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not ensure last_run_at: {e}")
+
+            # 3.17 เพิ่มคอลัมน์ allocation_target_pct และ allocation_actual_pct
+            try:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='allocation_target_pct'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                if cursor.fetchone()[0] == 0:
+                    logging.info("Adding allocation_target_pct to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN allocation_target_pct DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER reserve_okx_usdt")
+                    db.commit()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='allocation_actual_pct'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                if cursor.fetchone()[0] == 0:
+                    logging.info("Adding allocation_actual_pct to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN allocation_actual_pct DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER allocation_target_pct")
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not ensure allocation columns: {e}")
+
+            # 3.18 เพิ่มคอลัมน์ strategy_status และ metadata_json
+            try:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='strategy_status'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                if cursor.fetchone()[0] == 0:
+                    logging.info("Adding strategy_status to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN strategy_status VARCHAR(32) NULL AFTER allocation_actual_pct")
+                    db.commit()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='strategy_state' AND COLUMN_NAME='metadata_json'
+                    """,
+                    (os.getenv('DB_NAME'),)
+                )
+                if cursor.fetchone()[0] == 0:
+                    logging.info("Adding metadata_json to strategy_state...")
+                    cursor.execute("ALTER TABLE strategy_state ADD COLUMN metadata_json TEXT NULL AFTER strategy_status")
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not ensure strategy metadata columns: {e}")
+
+            # 3.19 ตั้งค่า metadata เริ่มต้นสำหรับแต่ละกลยุทธ์
+            try:
+                cursor.execute("SELECT metadata_json FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
+                row = cursor.fetchone()
+                if row and (row[0] is None or not str(row[0]).strip()):
+                    cursor.execute(
+                        "UPDATE strategy_state SET metadata_json=%s, strategy_status=%s WHERE mode='cdc_dca_v1'",
+                        (json.dumps(DEFAULT_STRATEGY_METADATA.get('cdc_dca_v1', {})), DEFAULT_STRATEGY_METADATA.get('cdc_dca_v1', {}).get('status', 'active'))
+                    )
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not backfill CDC metadata: {e}")
+
+            try:
+                cursor.execute("SELECT COUNT(*) FROM strategy_state WHERE mode='s4_multi_leg'")
+                exists = cursor.fetchone()[0] > 0
+                if not exists:
+                    logging.info("Seeding strategy_state row for s4_multi_leg...")
+                    metadata_payload = json.dumps({
+                        'config': DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}).get('config', {}),
+                        'runtime': {}
+                    })
+                    cursor.execute(
+                        """
+                        INSERT INTO strategy_state
+                            (mode, last_cdc_status, last_transition_at, last_run_at, reserve_usdt, red_epoch_active,
+                             last_half_sell_at, cdc_enabled, sell_percent, sell_percent_binance, sell_percent_okx,
+                             exchange, okx_max_usdt, binance_max_usdt, reserve_binance_usdt, reserve_okx_usdt, half_sell_policy,
+                             allocation_target_pct, allocation_actual_pct, strategy_status, metadata_json)
+                        VALUES
+                            (%s, NULL, NULL, NULL, 0.00, 0, NULL, 0, 0, 0, 0,
+                             'binance', 10.00, 0.00, 0.00, 0.00, 'auto_proportional',
+                             %s, %s, %s, %s)
+                        """,
+                        (
+                            's4_multi_leg',
+                            DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}).get('allocation', {}).get('target_pct', 0.0),
+                            0.0,
+                            DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}).get('status', 'planning'),
+                            metadata_payload
+                        )
+                    )
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not seed S4 strategy row: {e}")
+
+            try:
+                cursor.execute("SELECT metadata_json FROM strategy_state WHERE mode='s4_multi_leg' LIMIT 1")
+                row = cursor.fetchone()
+                if row:
+                    needs_update = False
+                    metadata_blob = row[0]
+                    if metadata_blob:
+                        try:
+                            meta = json.loads(metadata_blob)
+                        except json.JSONDecodeError:
+                            meta = {}
+                            needs_update = True
+                    else:
+                        meta = {}
+                        needs_update = True
+                    if 'config' not in meta:
+                        meta['config'] = DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}).get('config', {})
+                        needs_update = True
+                    if 'runtime' not in meta:
+                        meta['runtime'] = {}
+                        needs_update = True
+                    if needs_update:
+                        cursor.execute(
+                            "UPDATE strategy_state SET metadata_json=%s WHERE mode='s4_multi_leg'",
+                            (json.dumps(meta),)
+                        )
+                db.commit()
+            except Exception as e:
+                logging.warning(f"Could not align S4 metadata config/runtime: {e}")
+
+            try:
+                cursor.execute(
+                    "UPDATE strategy_state SET allocation_target_pct=%s WHERE mode='cdc_dca_v1' AND (allocation_target_pct IS NULL OR allocation_target_pct = 0)",
+                    (DEFAULT_STRATEGY_METADATA.get('cdc_dca_v1', {}).get('allocation', {}).get('target_pct', 0.0),)
+                )
+                cursor.execute(
+                    "UPDATE strategy_state SET allocation_target_pct=%s WHERE mode='s4_multi_leg' AND (allocation_target_pct IS NULL OR allocation_target_pct = 0)",
+                    (DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}).get('allocation', {}).get('target_pct', 0.0),)
+                )
+                db.commit()
+            except Exception as e:
+                logging.warning(f"Could not backfill allocation targets: {e}")
+
+            # 3.20 สร้าง strategy_rotation_log เพื่อบันทึกการหมุนพอร์ต
+            try:
+                cursor.execute("SHOW TABLES LIKE 'strategy_rotation_log'")
+                if not cursor.fetchone():
+                    logging.info("Creating strategy_rotation_log table...")
+                    cursor.execute(
+                        """
+                        CREATE TABLE strategy_rotation_log (
+                            id INT PRIMARY KEY AUTO_INCREMENT,
+                            executed_at DATETIME NOT NULL,
+                            strategy_mode VARCHAR(32) NOT NULL,
+                            from_asset VARCHAR(16) NOT NULL,
+                            to_asset VARCHAR(16) NOT NULL,
+                            notional_usd DECIMAL(18,2) NOT NULL,
+                            cdc_status VARCHAR(16) NULL,
+                            delta_pct DECIMAL(9,4) NULL,
+                            reason VARCHAR(64) NULL,
+                            metadata_json TEXT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            INDEX idx_mode_time (strategy_mode, executed_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+                        """
+                    )
+                    db.commit()
+            except Exception as e:
+                logging.warning(f"Could not create strategy_rotation_log: {e}")
+
             # 4. ตรวจสอบ Foreign Key
             cursor.execute("""
                 SELECT COUNT(*) FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
@@ -805,6 +1492,7 @@ def get_total_active_amount():
                             WHEN exchange_mode = 'both' THEN COALESCE(binance_amount,0) + COALESCE(okx_amount,0)
                             WHEN exchange_mode = 'binance' THEN COALESCE(binance_amount,0)
                             WHEN exchange_mode = 'okx' THEN COALESCE(okx_amount,0)
+                            WHEN exchange_mode = 's4' THEN COALESCE(purchase_amount,0)
                             ELSE COALESCE(purchase_amount,0)
                         END
                     ) AS total
@@ -917,7 +1605,8 @@ def index():
             # ดึงประวัติการซื้อ
             cursor.execute("""
                 SELECT ph.id, ph.purchase_time, ph.usdt_amount, ph.btc_quantity, 
-                       ph.btc_price, ph.order_id, ph.schedule_id, s.schedule_time
+                       ph.btc_price, ph.order_id, ph.schedule_id, s.schedule_time,
+                       ph.fee_buy_usdt, ph.fee_buy_asset
                 FROM purchase_history ph
                 LEFT JOIN schedules s ON ph.schedule_id = s.id
                 ORDER BY ph.purchase_time DESC
@@ -1057,13 +1746,57 @@ def api_analytics():
         with get_db_cursor() as (cursor, _):
             cursor.execute(
                 """
-                SELECT purchase_time, usdt_amount, btc_quantity, btc_price
+                SELECT purchase_time, usdt_amount, btc_quantity, btc_price, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount
                 FROM purchase_history
                 WHERE purchase_time IS NOT NULL
                 ORDER BY purchase_time ASC
                 """
             )
             rows = cursor.fetchall()
+
+        fee_price_cache: dict[str, float] = {}
+
+        def fee_amount_to_usdt(
+            fee_usdt_value: float | None,
+            asset: str | None,
+            amount: float | None,
+            ref_price: float | None,
+        ) -> float:
+            """Resolve fee into USDT using asset/amount fallback when direct USDT value is unavailable."""
+            asset_code = (asset or '').strip().upper()
+            amt = float(amount or 0.0)
+            reference = float(ref_price or 0.0)
+            converted = 0.0
+
+            if asset_code and amt > 0.0:
+                if asset_code == 'USDT':
+                    converted = amt
+                elif asset_code == 'BTC':
+                    converted = amt * reference
+                else:
+                    cached = fee_price_cache.get(asset_code)
+                    if cached is None:
+                        cached = 0.0
+                        try:
+                            resp = requests.get(
+                                'https://api.binance.com/api/v3/ticker/price',
+                                params={'symbol': f'{asset_code}USDT'},
+                                timeout=3,
+                            )
+                            if resp.status_code == 200:
+                                payload_px = resp.json()
+                                if isinstance(payload_px, dict):
+                                    cached = float(payload_px.get('price') or 0.0)
+                        except Exception:
+                            cached = 0.0
+                        fee_price_cache[asset_code] = cached
+                    if cached > 0.0:
+                        converted = amt * cached
+
+            fee_usdt_val = float(fee_usdt_value or 0.0)
+            if converted > 0.0:
+                return converted
+            return fee_usdt_val
 
         timestamps = []
         cumulative_usdt = []
@@ -1073,15 +1806,19 @@ def api_analytics():
         total_usdt = 0.0
         total_btc = 0.0
 
+        total_fees_buy = 0.0
+
         for row in rows:
-            ts, usdt, btc, price = row
+            ts, usdt, btc, price, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount = row
             # Coalesce None to 0 for robustness
             usdt = float(usdt or 0.0)
             btc = float(btc or 0.0)
             price = float(price or 0.0)
+            fee_buy = fee_amount_to_usdt(fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount, price)
 
             total_usdt += usdt
             total_btc += btc
+            total_fees_buy += max(fee_buy, 0.0)
 
             timestamps.append(str(ts))
             cumulative_usdt.append(total_usdt)
@@ -1121,6 +1858,7 @@ def api_analytics():
 
         payload = {
             'total_invested': round(total_usdt, 2),
+            'total_buy_fees': round(total_fees_buy, 4),
             'total_btc': round(total_btc, 8),
             'avg_price': round(avg_price, 2),
             'success_rate': success_rate,
@@ -1136,6 +1874,23 @@ def api_analytics():
             'pnl_abs': round(pnl_abs, 2) if pnl_abs is not None else 0.0,
             'pnl_pct': round(pnl_pct, 2) if pnl_pct is not None else 0.0,
         }
+
+        try:
+            with get_db_cursor() as (cursor, _):
+                cursor.execute(
+                    """
+                    SELECT price, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount
+                    FROM sell_history
+                    """
+                )
+                sell_rows = cursor.fetchall()
+            total_sell_fees = 0.0
+            for price, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount in sell_rows:
+                fee_s = fee_amount_to_usdt(fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount, price)
+                total_sell_fees += max(fee_s, 0.0)
+            payload['total_sell_fees'] = round(total_sell_fees, 4)
+        except Exception:
+            payload['total_sell_fees'] = 0.0
 
         return jsonify(payload)
 
@@ -1164,7 +1919,7 @@ def add_schedule():
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both'):
+    if ex_mode not in ('global','binance','okx','both','s4'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:
@@ -1260,7 +2015,7 @@ def edit_schedule(schedule_id):
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both'):
+    if ex_mode not in ('global','binance','okx','both','s4'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:
@@ -1458,6 +2213,16 @@ def admin_dashboard():
         flash("Error loading admin dashboard", 'error')
         return redirect('/')
 
+@app.route('/s4')
+def s4_status():
+    """Human-readable S4 status page."""
+    try:
+        data = _build_s4_status_data()
+        return render_template('s4_status.html', data=data)
+    except Exception as exc:
+        logging.error(f"Error in /s4 route: {exc}")
+        return render_template('s4_status.html', data={"error": str(exc)})
+
 @app.route('/health')
 def health_check():
     """Health check endpoint"""
@@ -1487,6 +2252,75 @@ def health_check():
             'timestamp': datetime.now().isoformat(),
             'error': str(e)
         }), 503
+
+# Read-only diagnostics for ops/CLI
+@app.route('/api/health')
+def api_health():
+    """Extended health endpoint returning JSON only (read-only)."""
+    now = datetime.now().isoformat()
+    db_status = "unknown"
+    db_error = None
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        db_status = "connected"
+    except Exception as exc:
+        db_status = "error"
+        db_error = str(exc)
+
+    # Scheduler pid / health
+    scheduler_pid = None
+    scheduler_alive = False
+    pid_path = REPO_ROOT / "scheduler.pid"
+    if pid_path.exists():
+        try:
+            scheduler_pid = int(pid_path.read_text().strip())
+            try:
+                os.kill(scheduler_pid, 0)
+                scheduler_alive = True
+            except OSError:
+                scheduler_alive = False
+        except Exception:
+            scheduler_pid = None
+
+    health_check_port = int(os.getenv('HEALTH_CHECK_PORT', '8001') or 8001)
+    scheduler_health = last_scheduler_status
+    try:
+        r = requests.get(f"http://localhost:{health_check_port}", timeout=2)
+        if r.status_code == 200 and r.text:
+            scheduler_health = r.text
+    except Exception:
+        pass
+
+    dry_run = str(os.getenv('STRATEGY_DRY_RUN') or os.getenv('DRY_RUN') or "0").strip().lower() in ("1","true","yes","on")
+    use_testnet = str(os.getenv('USE_BINANCE_TESTNET') or os.getenv('BINANCE_TESTNET') or os.getenv('OKX_TESTNET') or "0").strip().lower() in ("1","true","yes","on")
+
+    payload = {
+        "ok": True,
+        "timestamp": now,
+        "status": "healthy" if scheduler_health == "Scheduler is running" else "degraded",
+        "app": {
+            "pid": os.getpid(),
+            "uptime_seconds": int(time.time() - APP_START_TS),
+        },
+        "scheduler": {
+            "pid": scheduler_pid,
+            "alive": scheduler_alive,
+            "health_port": health_check_port,
+            "health_status": scheduler_health,
+        },
+        "database": {
+            "status": db_status,
+            "error": db_error,
+        },
+        "env": {
+            "dry_run": dry_run,
+            "use_testnet": use_testnet,
+        },
+    }
+    code = 200 if payload["status"] == "healthy" and db_status == "connected" else 503
+    return jsonify(payload), code
 
 # ====== SocketIO Events ======
 @socketio.on('request_latest')
@@ -1586,6 +2420,7 @@ def api_wallet():
             'portfolio_value': 0.0,
             'reserve': _safe_float(reserve_value, 0.0),
             'error': None,
+            'extra_assets': {},
         }
         try:
             adapter = get_adapter(exchange, testnet=testnet, dry_run=dry_run)
@@ -1594,13 +2429,25 @@ def api_wallet():
             logging.warning(f"wallet snapshot init {exchange}: {exc}")
             return snap
 
+        asset_plan = ['USDT', 'BTC']
+        if exchange.lower() == 'okx':
+            asset_plan.append('XAUT')
+        if exchange.lower() == 'binance':
+            asset_plan.append('PAXG')
+
         try:
-            usdt = adapter.get_balance('USDT')
-            btc = adapter.get_balance('BTC')
-            snap['usdt_free'] = _safe_float(usdt.get('free'))
-            snap['usdt_locked'] = _safe_float(usdt.get('locked'))
-            snap['btc_free'] = _safe_float(btc.get('free'))
-            snap['btc_locked'] = _safe_float(btc.get('locked'))
+            for asset in asset_plan:
+                bal = adapter.get_balance(asset)
+                free = _safe_float(bal.get('free'))
+                locked = _safe_float(bal.get('locked'))
+                if asset == 'USDT':
+                    snap['usdt_free'] = free
+                    snap['usdt_locked'] = locked
+                elif asset in ('BTC',):
+                    snap['btc_free'] = free
+                    snap['btc_locked'] = locked
+                else:
+                    snap['extra_assets'][asset] = {'free': free, 'locked': locked}
         except Exception as exc:
             snap['error'] = str(exc)
             logging.warning(f"wallet snapshot balance {exchange}: {exc}")
@@ -1690,7 +2537,7 @@ def _get_binance_client():
         api_secret = os.getenv('BINANCE_API_SECRET')
         if api_key and api_secret:
             testnet = _env_flag('USE_BINANCE_TESTNET', False) or _env_flag('BINANCE_TESTNET', False)
-            return Client(api_key=api_key, api_secret=api_secret, testnet=testnet)
+            return Client(api_key=api_key, api_secret=api_secret, testnet=testnet, requests_params={'timeout': 15})
     except Exception:
         return None
     return None
@@ -1763,20 +2610,330 @@ def api_cdc_action_zone():
         _CDC_CACHE.update({'data': payload, 'expires': time.time() + 30})
     return jsonify(payload), 200
 
+
+@app.route('/api/strategies')
+def api_strategies():
+    """Return consolidated strategy metadata for UI strategy selector."""
+    columns = [
+        'mode', 'cdc_enabled', 'last_cdc_status', 'last_transition_at', 'last_run_at',
+        'reserve_usdt', 'reserve_binance_usdt', 'reserve_okx_usdt',
+        'allocation_target_pct', 'allocation_actual_pct', 'strategy_status', 'metadata_json',
+        'half_sell_policy', 'sell_percent', 'sell_percent_binance', 'sell_percent_okx'
+    ]
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT mode, cdc_enabled, last_cdc_status, last_transition_at, last_run_at,
+                       reserve_usdt, reserve_binance_usdt, reserve_okx_usdt,
+                       allocation_target_pct, allocation_actual_pct, strategy_status, metadata_json,
+                       half_sell_policy, sell_percent, sell_percent_binance, sell_percent_okx
+                FROM strategy_state
+                ORDER BY mode
+                """
+            )
+            rows = cursor.fetchall()
+    except Exception as exc:
+        logging.error(f"strategies endpoint error: {exc}")
+        return jsonify({'strategies': [], 'error': str(exc)}), 200
+
+    if not rows:
+        return jsonify({'strategies': [], 'active_strategy': None, 'capital_pool_usdt': 0.0, 'derived': {}})
+
+    feature_s4_enabled = _env_flag('FEATURE_S4_ENABLED', False)
+    if not feature_s4_enabled:
+        rows = [row for row in rows if row[0] != 's4_multi_leg']
+        if not rows:
+            return jsonify({'strategies': [], 'active_strategy': None, 'capital_pool_usdt': 0.0, 'derived': {}})
+
+    weekly_active_total = get_total_active_amount()
+    strategy_buffers = []
+    total_hint = 0.0
+
+    for fetched in rows:
+        row = dict(zip(columns, fetched))
+        raw_metadata = {}
+        raw_blob = row.get('metadata_json')
+        if raw_blob:
+            try:
+                raw_metadata = json.loads(raw_blob)
+            except json.JSONDecodeError as exc:
+                logging.warning(f"Strategy {row['mode']} metadata parse error: {exc}")
+                raw_metadata = {}
+
+        metadata = _strategy_metadata_for(row['mode'], raw_blob)
+        allocation_cfg = metadata.get('allocation') or {}
+
+        target_pct_raw = row.get('allocation_target_pct') or allocation_cfg.get('target_pct') or 0.0
+        try:
+            target_pct = float(target_pct_raw or 0.0)
+        except (TypeError, ValueError):
+            target_pct = 0.0
+
+        capital_source = allocation_cfg.get('capital_source') or 'manual'
+        capital_hint = None
+
+        metrics_meta = metadata.get('metrics') or {}
+        metrics_cap = metrics_meta.get('capital_usdt')
+        if isinstance(metrics_cap, (int, float)):
+            capital_hint = float(metrics_cap)
+
+        config_meta = metadata.get('config') or {}
+        config_cap = config_meta.get('capital_usdt')
+        if capital_hint is None and isinstance(config_cap, (int, float)):
+            capital_hint = float(config_cap)
+
+        alloc_cap = allocation_cfg.get('capital_usdt')
+        if capital_hint is None and isinstance(alloc_cap, (int, float)):
+            capital_hint = float(alloc_cap)
+
+        if capital_hint is None:
+            if capital_source == 'auto_total_active_amount':
+                capital_hint = weekly_active_total
+            elif capital_source == 'reserve_total':
+                capital_hint = _safe_float(row.get('reserve_usdt'))
+
+        if capital_hint is None:
+            capital_hint = _safe_float(row.get('reserve_usdt'))
+
+        capital_hint = max(float(capital_hint), 0.0)
+        total_hint += capital_hint
+
+        strategy_buffers.append({
+            'row': row,
+            'metadata': metadata,
+            'target_pct': target_pct,
+            'capital_hint': capital_hint
+        })
+
+    strategies = []
+    for entry in strategy_buffers:
+        row = entry['row']
+        metadata = entry['metadata']
+        actual_pct_raw = row.get('allocation_actual_pct') or 0.0
+        try:
+            actual_pct = float(actual_pct_raw)
+        except (TypeError, ValueError):
+            actual_pct = 0.0
+
+        if actual_pct <= 0:
+            if total_hint > 0:
+                actual_pct = round((entry['capital_hint'] / total_hint) * 100.0, 2)
+            else:
+                actual_pct = round(entry['target_pct'], 2)
+        else:
+            actual_pct = round(actual_pct, 2)
+
+        target_pct_display = round(entry['target_pct'], 2) if entry['target_pct'] else 0.0
+        reserves = {
+            'total': _safe_float(row.get('reserve_usdt')),
+            'binance': _safe_float(row.get('reserve_binance_usdt')),
+            'okx': _safe_float(row.get('reserve_okx_usdt')),
+        }
+        strategy_status = row.get('strategy_status') or metadata.get('status') or ('active' if row.get('cdc_enabled') else 'inactive')
+
+        runtime_data = {}
+        if isinstance(raw_metadata, dict):
+            runtime_data = raw_metadata.get('runtime') or {}
+
+        strategies.append({
+            'id': row['mode'],
+            'display_name': metadata.get('display_name', row['mode']),
+            'short_name': metadata.get('short_name', (row['mode'] or '').upper()),
+            'category': metadata.get('category', 'core'),
+            'status': strategy_status,
+            'enabled': bool(row.get('cdc_enabled')),
+            'last_status': row.get('last_cdc_status'),
+            'last_transition_at': _dt_to_iso(row.get('last_transition_at')),
+            'last_run_at': _dt_to_iso(row.get('last_run_at')),
+            'reserves': reserves,
+            'allocation': {
+                'target_pct': target_pct_display,
+                'actual_pct': actual_pct,
+                'capital_hint_usdt': round(entry['capital_hint'], 2)
+            },
+            'guards': metadata.get('guards', []),
+            'log_filters': metadata.get('log_filters', []),
+            'help_overlay': metadata.get('help_overlay'),
+            'metadata': metadata,
+             'runtime': runtime_data,
+            'parameters': {
+                'half_sell_policy': row.get('half_sell_policy'),
+                'sell_percent': _safe_int(row.get('sell_percent')),
+                'sell_percent_binance': _safe_int(row.get('sell_percent_binance')),
+                'sell_percent_okx': _safe_int(row.get('sell_percent_okx'))
+            }
+        })
+
+    active_strategy = next((s['id'] for s in strategies if s['enabled']), None)
+    response = {
+        'strategies': strategies,
+        'active_strategy': active_strategy,
+        'capital_pool_usdt': round(total_hint, 2),
+        'derived': {
+            'weekly_active_total_usdt': round(weekly_active_total, 2)
+        },
+        'generated_at': datetime.utcnow().isoformat() + 'Z'
+    }
+    return jsonify(response)
+
+
+@app.route('/api/strategy_holdings')
+def api_strategy_holdings():
+    """Return cached holdings snapshot for key exchanges/assets."""
+    refresh_flag = str(request.args.get('refresh', '')).strip().lower() in ('1', 'true', 'yes', 'force')
+    exchanges = set()
+    assets = {'BTC', 'USDT'}
+    s4_gold_asset = None
+
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute("SELECT exchange FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                cdc_exchange = str(row[0] or '').strip().lower()
+                if cdc_exchange:
+                    exchanges.add(cdc_exchange)
+    except Exception as exc:
+        logging.debug(f"strategy_holdings: cdc exchange lookup failed: {exc}")
+
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute("SELECT metadata_json FROM strategy_state WHERE mode='s4_multi_leg' LIMIT 1")
+            row = cursor.fetchone()
+            if row and row[0]:
+                try:
+                    metadata = json.loads(row[0])
+                except json.JSONDecodeError:
+                    metadata = {}
+                config = metadata.get('config') or {}
+                exch = str(config.get('exchange') or 'okx').strip().lower()
+                if exch in ('binance', 'okx'):
+                    exchanges.add(exch)
+                    s4_gold_asset = 'PAXG' if exch == 'binance' else 'XAUT'
+    except Exception as exc:
+        logging.debug(f"strategy_holdings: s4 metadata lookup failed: {exc}")
+
+    if not exchanges:
+        exchanges.add('binance')
+    if s4_gold_asset:
+        assets.add(s4_gold_asset)
+
+    try:
+        snapshot = fetch_balances(sorted(exchanges), sorted(assets), force_refresh=refresh_flag)
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logging.error(f"strategy_holdings error: {exc}")
+        return jsonify({'ok': False, 'error': 'fetch_failed'}), 500
+
+    holdings_meta = None
+    if isinstance(snapshot, dict):
+        holdings_meta = snapshot.pop('_meta', None)
+
+    response = {
+        'ok': True,
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'exchanges': sorted(exchanges),
+        'assets': sorted(assets),
+        'holdings': snapshot if isinstance(snapshot, dict) else {},
+        'meta': holdings_meta,
+        'force_refresh': refresh_flag,
+    }
+    if s4_gold_asset:
+        response['s4_gold_asset'] = s4_gold_asset
+    return jsonify(response)
+
+
+@app.route('/api/fee_totals')
+def api_fee_totals():
+    """Return cumulative fee totals per exchange/strategy and summarized by exchange."""
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT exchange, strategy, fee_type, fee_asset, fee_usd, fee_asset_amount, last_updated
+                FROM strategy_fee_totals
+                ORDER BY exchange, strategy, fee_type, fee_asset
+                """
+            )
+            rows = cursor.fetchall()
+    except Exception as exc:
+        logging.error(f"fee_totals error: {exc}")
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+    totals = []
+    summary: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        exchange, strategy, fee_type, fee_asset, fee_usd, fee_asset_amount, last_updated = row
+        record = {
+            'exchange': exchange,
+            'strategy': strategy,
+            'fee_type': fee_type,
+            'fee_asset': fee_asset,
+            'fee_usd': float(fee_usd or 0.0),
+            'fee_asset_amount': float(fee_asset_amount or 0.0),
+            'last_updated': last_updated.isoformat() if last_updated else None,
+        }
+        totals.append(record)
+
+        ex_summary = summary.setdefault(exchange, {'buy': {'fee_usd': 0.0, 'fee_asset': {}}, 'sell': {'fee_usd': 0.0, 'fee_asset': {}}})
+        bucket = ex_summary.get(fee_type)
+        if bucket is None:
+            bucket = {'fee_usd': 0.0, 'fee_asset': {}}
+            ex_summary[fee_type] = bucket
+        bucket['fee_usd'] += float(fee_usd or 0.0)
+        asset_map = bucket.setdefault('fee_asset', {})
+        asset_key = fee_asset or 'UNKNOWN'
+        asset_map[asset_key] = asset_map.get(asset_key, 0.0) + float(fee_asset_amount or 0.0)
+
+    response = {
+        'ok': True,
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'totals': totals,
+        'summary': summary,
+    }
+    return jsonify(response)
+
 @app.route('/api/strategy_state')
 def api_strategy_state():
     try:
         with get_db_cursor() as (cursor, _):
-            cursor.execute("SELECT cdc_enabled, last_cdc_status, reserve_usdt, last_transition_at, sell_percent, exchange, okx_max_usdt, reserve_binance_usdt, reserve_okx_usdt, half_sell_policy, sell_percent_binance, sell_percent_okx FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
+            cursor.execute("SELECT cdc_enabled, last_cdc_status, reserve_usdt, last_transition_at, sell_percent, exchange, okx_max_usdt, binance_max_usdt, reserve_binance_usdt, reserve_okx_usdt, half_sell_policy, sell_percent_binance, sell_percent_okx FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
             row = cursor.fetchone()
         if not row:
-            return jsonify({'cdc_enabled': False, 'last_cdc_status': None, 'reserve_usdt': 0.0, 'reserve_binance_usdt': 0.0, 'reserve_okx_usdt': 0.0, 'last_transition_at': None, 'sell_percent': 50, 'exchange': 'binance', 'okx_max_usdt': float(os.getenv('OKX_MAX_USDT') or 10.0), 'half_sell_policy': 'auto_proportional', 'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'), 'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')})
+            return jsonify({'cdc_enabled': False, 'last_cdc_status': None, 'reserve_usdt': 0.0, 'reserve_binance_usdt': 0.0, 'reserve_okx_usdt': 0.0, 'last_transition_at': None, 'sell_percent': 50, 'exchange': 'binance', 'okx_max_usdt': float(os.getenv('OKX_MAX_USDT') or 10.0), 'binance_max_usdt': float(os.getenv('BINANCE_MAX_USDT') or 0.0), 'half_sell_policy': 'auto_proportional', 'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'), 'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')})
         # Build response with backward compatibility
         exchange = (row[5] or 'binance')
         sell_percent_global = int(row[4] or 50)
-        sp_bz = int(row[10] if row[10] is not None else sell_percent_global)
-        sp_okx = int(row[11] if row[11] is not None else sell_percent_global)
+        sp_bz = int(row[11] if row[11] is not None else sell_percent_global)
+        sp_okx = int(row[12] if row[12] is not None else sell_percent_global)
         current_sp = sp_okx if str(exchange).lower() == 'okx' else sp_bz
+        okx_db_val = row[6]
+        bz_db_val = row[7]
+        if okx_db_val is None:
+            env_okx = os.getenv('OKX_MAX_USDT')
+            try:
+                okx_max = float(env_okx) if env_okx not in (None, '') else 10.0
+            except (TypeError, ValueError):
+                okx_max = 10.0
+        else:
+            try:
+                okx_max = float(okx_db_val)
+            except (TypeError, ValueError):
+                okx_max = 10.0
+        if bz_db_val is None:
+            env_bz = os.getenv('BINANCE_MAX_USDT')
+            try:
+                binance_max = float(env_bz) if env_bz not in (None, '') else 0.0
+            except (TypeError, ValueError):
+                binance_max = 0.0
+        else:
+            try:
+                binance_max = float(bz_db_val)
+            except (TypeError, ValueError):
+                binance_max = 0.0
+
         return jsonify({
             'cdc_enabled': bool(row[0]),
             'last_cdc_status': row[1],
@@ -1786,10 +2943,11 @@ def api_strategy_state():
             'sell_percent_binance': sp_bz,
             'sell_percent_okx': sp_okx,
             'exchange': exchange,
-            'okx_max_usdt': float(row[6] or (os.getenv('OKX_MAX_USDT') or 10.0)),
-            'reserve_binance_usdt': float(row[7] or 0),
-            'reserve_okx_usdt': float(row[8] or 0),
-            'half_sell_policy': row[9] or 'auto_proportional',
+            'okx_max_usdt': okx_max,
+            'binance_max_usdt': binance_max,
+            'reserve_binance_usdt': float(row[8] or 0),
+            'reserve_okx_usdt': float(row[9] or 0),
+            'half_sell_policy': row[10] or 'auto_proportional',
             'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'),
             'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
         })
@@ -1843,18 +3001,25 @@ def api_strategy_toggle():
     try:
         data = request.get_json(force=True, silent=True) or {}
         enabled = bool(data.get('enabled'))
+        mode = str(data.get('mode') or 'cdc_dca_v1').strip().lower()
+        allowed_modes = {'cdc_dca_v1', 's4_multi_leg'}
+        if mode not in allowed_modes:
+            return jsonify({'ok': False, 'error': f'invalid_mode:{mode}'}), 400
         with get_db_cursor() as (cursor, db):
-            cursor.execute("UPDATE strategy_state SET cdc_enabled = %s WHERE mode='cdc_dca_v1'", (1 if enabled else 0,))
+            cursor.execute("UPDATE strategy_state SET cdc_enabled = %s WHERE mode=%s", (1 if enabled else 0, mode))
+            if cursor.rowcount == 0:
+                return jsonify({'ok': False, 'error': f'mode_not_found:{mode}'}), 404
             db.commit()
         # Notify via LINE
-        try:
-            notify_cdc_toggle(enabled, {
-                'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'),
-                'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN'),
-            })
-        except Exception as e:
-            logging.warning(f"CDC toggle notify failed: {e}")
-        return jsonify({'ok': True, 'cdc_enabled': enabled})
+        if mode == 'cdc_dca_v1':
+            try:
+                notify_cdc_toggle(enabled, {
+                    'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'),
+                    'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN'),
+                })
+            except Exception as e:
+                logging.warning(f"CDC toggle notify failed: {e}")
+        return jsonify({'ok': True, 'mode': mode, 'enabled': enabled})
     except Exception as e:
         logging.error(f"strategy_toggle error: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -1870,12 +3035,12 @@ def api_okx_config():
             return jsonify({'ok': False, 'error': 'admin_token_not_configured'}), 400
         if token != admin_token:
             return jsonify({'ok': False, 'error': 'invalid_admin_token'}), 403
-        max_usdt = data.get('okx_max_usdt')
+        raw_value = data.get('okx_max_usdt')
         try:
-            max_usdt = float(max_usdt)
-            if max_usdt <= 0:
-                raise ValueError('okx_max_usdt must be > 0')
-        except Exception:
+            max_usdt = float(raw_value)
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid okx_max_usdt'}), 400
+        if max_usdt < 0:
             return jsonify({'ok': False, 'error': 'invalid okx_max_usdt'}), 400
         with get_db_cursor() as (cursor, db):
             cursor.execute("UPDATE strategy_state SET okx_max_usdt=%s WHERE mode='cdc_dca_v1'", (max_usdt,))
@@ -1884,6 +3049,163 @@ def api_okx_config():
     except Exception as e:
         logging.error(f"okx_config error: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/binance_config', methods=['POST'])
+def api_binance_config():
+    """Update Binance config (e.g., binance_max_usdt). Admin-only."""
+    try:
+        admin_token = os.getenv('ADMIN_TOKEN')
+        data = request.get_json(force=True, silent=True) or {}
+        token = data.get('token')
+        if not admin_token:
+            return jsonify({'ok': False, 'error': 'admin_token_not_configured'}), 400
+        if token != admin_token:
+            return jsonify({'ok': False, 'error': 'invalid_admin_token'}), 403
+        max_usdt = data.get('binance_max_usdt')
+        try:
+            max_usdt = float(max_usdt)
+            if max_usdt < 0:
+                raise ValueError('binance_max_usdt must be >= 0')
+        except Exception:
+            return jsonify({'ok': False, 'error': 'invalid binance_max_usdt'}), 400
+        with get_db_cursor() as (cursor, db):
+            cursor.execute("UPDATE strategy_state SET binance_max_usdt=%s WHERE mode='cdc_dca_v1'", (max_usdt,))
+            db.commit()
+        return jsonify({'ok': True, 'binance_max_usdt': max_usdt})
+    except Exception as e:
+        logging.error(f"binance_config error: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/s4_config', methods=['POST'])
+def api_s4_config():
+    """Update S4 strategy configuration (admin token required)."""
+    try:
+        admin_token = os.getenv('ADMIN_TOKEN')
+        data = request.get_json(force=True, silent=True) or {}
+        token = data.get('token')
+        if not admin_token:
+            return jsonify({'ok': False, 'error': 'admin_token_not_configured'}), 400
+        if token != admin_token:
+            return jsonify({'ok': False, 'error': 'invalid_admin_token'}), 403
+
+        updates: dict[str, float | int | None] = {}
+
+        def _maybe_ratio(field: str, *, min_val: float = 0.0, max_val: float = 100.0, allow_null: bool = False):
+            if field not in data:
+                return
+            raw = data[field]
+            if allow_null and (raw is None or (isinstance(raw, str) and raw.strip() == '')):
+                updates[field] = None
+                return
+            try:
+                val = float(raw)
+            except Exception:
+                raise ValueError(f"{field} must be numeric")
+            if val < min_val or val > max_val:
+                raise ValueError(f"{field} must be between {min_val} and {max_val}")
+            updates[field] = round(val / 100.0, 6)
+
+        def _maybe_percent(field: str, *, min_val: float = 0.0, max_val: float = 100.0):
+            if field not in data:
+                return
+            try:
+                val = float(data[field])
+            except Exception:
+                raise ValueError(f"{field} must be numeric")
+            if val < min_val or val > max_val:
+                raise ValueError(f"{field} must be between {min_val} and {max_val}")
+            updates[field] = round(val, 6)
+
+        def _maybe_positive(field: str, *, allow_zero: bool = False):
+            if field not in data:
+                return
+            try:
+                val = float(data[field])
+            except Exception:
+                raise ValueError(f"{field} must be numeric")
+            if allow_zero:
+                if val < 0:
+                    raise ValueError(f"{field} must be >= 0")
+            else:
+                if val <= 0:
+                    raise ValueError(f"{field} must be > 0")
+            updates[field] = round(val, 6)
+
+        def _maybe_int(field: str, *, allow_zero: bool = True):
+            if field not in data:
+                return
+            try:
+                val = int(float(data[field]))
+            except Exception:
+                raise ValueError(f"{field} must be integer")
+            if not allow_zero and val <= 0:
+                raise ValueError(f"{field} must be > 0")
+            if allow_zero and val < 0:
+                raise ValueError(f"{field} must be >= 0")
+            updates[field] = val
+
+        try:
+            _maybe_ratio('target_btc_pct_up', min_val=0.0, max_val=100.0)
+            _maybe_ratio('target_btc_pct_down', min_val=0.0, max_val=100.0)
+            _maybe_ratio('target_gold_pct_up', min_val=0.0, max_val=100.0, allow_null=True)
+            _maybe_ratio('target_gold_pct_down', min_val=0.0, max_val=100.0, allow_null=True)
+            _maybe_percent('rebalance_threshold_pct', min_val=0.1, max_val=50.0)
+            _maybe_percent('max_flip_pct', min_val=0.1, max_val=100.0)
+            _maybe_positive('min_flip_usd')
+            _maybe_positive('capital_usdt', allow_zero=True)
+            _maybe_int('cooldown_minutes', allow_zero=True)
+            if 'exchange' in data:
+                exch = str(data.get('exchange') or '').strip().lower()
+                if exch not in ('binance', 'okx'):
+                    raise ValueError("exchange must be 'binance' or 'okx'")
+                updates['exchange'] = exch
+        except ValueError as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+
+        if not updates:
+            return jsonify({'ok': False, 'error': 'no fields to update'}), 400
+
+        # Fetch existing metadata (separate connection)
+        with get_db_cursor() as (cursor, db):
+            cursor.execute("SELECT metadata_json FROM strategy_state WHERE mode='s4_multi_leg' LIMIT 1")
+            row = cursor.fetchone()
+
+        if row and row[0]:
+            try:
+                metadata = json.loads(row[0])
+            except json.JSONDecodeError:
+                metadata = {}
+        else:
+            metadata = deepcopy(DEFAULT_STRATEGY_METADATA.get('s4_multi_leg', {}))
+
+        config = metadata.get('config') or {}
+        for key, value in updates.items():
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
+        metadata['config'] = config
+
+        runtime = metadata.get('runtime') or {}
+        runtime.pop('exposure', None)
+        metadata['runtime'] = runtime
+
+        metadata_json = json.dumps(_json_sanitize(metadata))
+
+        # Apply update using new cursor to avoid reuse issues
+        with get_db_cursor() as (cursor, db):
+            cursor.execute(
+                "UPDATE strategy_state SET metadata_json=%s, updated_at=NOW() WHERE mode='s4_multi_leg'",
+                (metadata_json,)
+            )
+            db.commit()
+
+        return jsonify({'ok': True, 'config': metadata.get('config', {})})
+    except Exception as e:
+        logging.exception(f"s4_config error: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 
 @app.route('/api/okx_trades_sync', methods=['POST'])
 def api_okx_trades_sync():
@@ -2143,6 +3465,59 @@ def api_reserve_log():
         logging.error(f"reserve_log error: {e}")
         return jsonify({'items': [], 'error': str(e)}), 200
 
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+@app.route('/api/compliance_events')
+def api_compliance_events():
+    try:
+        limit = int(request.args.get('limit') or 200)
+        start = _parse_iso_datetime(request.args.get('start'))
+        end = _parse_iso_datetime(request.args.get('end'))
+        events = fetch_events(limit=limit, start=start, end=end)
+        return jsonify({'events': events, 'generated_at': datetime.utcnow().isoformat() + 'Z'})
+    except Exception as e:
+        logging.error(f"compliance_events error: {e}")
+        return jsonify({'events': [], 'error': str(e)}), 200
+
+@app.route('/api/compliance_export')
+def api_compliance_export():
+    """Export compliance audit log as CSV."""
+    try:
+        limit = int(request.args.get('limit') or 500)
+        start = _parse_iso_datetime(request.args.get('start'))
+        end = _parse_iso_datetime(request.args.get('end'))
+        events = fetch_events(limit=limit, start=start, end=end)
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['event_time','event_type','exchange','notional_usdt','btc_quantity','price_usdt','realized_pnl_usdt','metadata'])
+        for e in events:
+            writer.writerow([
+                e.get('event_time'),
+                e.get('event_type'),
+                e.get('exchange'),
+                e.get('notional_usdt'),
+                e.get('btc_quantity'),
+                e.get('price_usdt'),
+                e.get('realized_pnl_usdt'),
+                json.dumps(e.get('metadata', {}), ensure_ascii=False),
+            ])
+        data = output.getvalue().encode('utf-8')
+        from flask import Response
+        import datetime as _dt
+        fname = f"compliance_audit_{_dt.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
+        return Response(data, mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename={fname}'})
+    except Exception as e:
+        logging.error(f"compliance_export error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/sell_history')
 def api_sell_history():
     try:
@@ -2150,7 +3525,8 @@ def api_sell_history():
         with get_db_cursor() as (cursor, _):
             cursor.execute(
                 """
-                SELECT sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent
+                SELECT sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent,
+                       fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount
                 FROM sell_history ORDER BY sell_time DESC LIMIT %s
                 """,
                 (limit,)
@@ -2163,7 +3539,10 @@ def api_sell_history():
             'usdt_received': float(r[3]),
             'price': float(r[4]),
             'order_id': r[5],
-            'sell_percent': (int(r[6]) if r[6] is not None else None)
+            'sell_percent': (int(r[6]) if r[6] is not None else None),
+            'fee_sell_usdt': float(r[7]) if r[7] is not None else None,
+            'fee_sell_asset': r[8],
+            'fee_sell_asset_amount': float(r[9]) if r[9] is not None else None,
         } for r in rows]
         return jsonify({'items': data})
     except Exception as e:
@@ -2176,7 +3555,8 @@ def api_purchase_history_export():
     try:
         exch = (request.args.get('exchange') or 'all').strip().lower()
         q = (
-            "SELECT purchase_time, COALESCE(exchange,''), usdt_amount, btc_quantity, btc_price, order_id, schedule_id "
+            "SELECT purchase_time, COALESCE(exchange,''), usdt_amount, btc_quantity, btc_price, order_id, schedule_id, "
+            "fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount "
             "FROM purchase_history"
         )
         params = []
@@ -2191,10 +3571,19 @@ def api_purchase_history_export():
         import io, csv
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['time','exchange','usdt_amount','btc_quantity','btc_price','order_id','schedule_id'])
+        writer.writerow(['time','exchange','usdt_amount','btc_quantity','btc_price','order_id','schedule_id','fee_buy_usdt','fee_buy_asset','fee_buy_asset_amount'])
         for r in rows:
             writer.writerow([
-                str(r[0]) if r[0] else '', r[1] or '', float(r[2] or 0.0), float(r[3] or 0.0), float(r[4] or 0.0), r[5] or '', r[6] or ''
+                str(r[0]) if r[0] else '',
+                r[1] or '',
+                float(r[2] or 0.0),
+                float(r[3] or 0.0),
+                float(r[4] or 0.0),
+                r[5] or '',
+                r[6] or '',
+                float(r[7] or 0.0),
+                r[8] or '',
+                float(r[9] or 0.0),
             ])
         csv_data = output.getvalue().encode('utf-8')
         from flask import Response
@@ -2211,7 +3600,8 @@ def api_sell_history_export():
     try:
         exch = (request.args.get('exchange') or 'all').strip().lower()
         q = (
-            "SELECT sell_time, symbol, COALESCE(exchange,''), btc_quantity, usdt_received, price, order_id, sell_percent "
+            "SELECT sell_time, symbol, COALESCE(exchange,''), btc_quantity, usdt_received, price, order_id, sell_percent, "
+            "fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount "
             "FROM sell_history"
         )
         params = []
@@ -2226,10 +3616,20 @@ def api_sell_history_export():
         import io, csv
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['time','symbol','exchange','btc_quantity','usdt_received','price','order_id','sell_percent'])
+        writer.writerow(['time','symbol','exchange','quantity','usdt_received','price','order_id','sell_percent','fee_sell_usdt','fee_sell_asset','fee_sell_asset_amount'])
         for r in rows:
             writer.writerow([
-                str(r[0]) if r[0] else '', r[1] or '', r[2] or '', float(r[3] or 0.0), float(r[4] or 0.0), float(r[5] or 0.0), r[6] or '', r[7] if r[7] is not None else ''
+                str(r[0]) if r[0] else '',
+                r[1] or '',
+                r[2] or '',
+                float(r[3] or 0.0),
+                float(r[4] or 0.0),
+                float(r[5] or 0.0),
+                r[6] or '',
+                r[7] if r[7] is not None else '',
+                float(r[8] or 0.0),
+                r[9] or '',
+                float(r[10] or 0.0),
             ])
         data = output.getvalue().encode('utf-8')
         from flask import Response
@@ -2316,10 +3716,15 @@ def api_use_reserve_now():
         if not admin_token or token != admin_token:
             return jsonify({'ok': False, 'error': 'forbidden'}), 403
 
-        now = datetime.utcnow()
-        from strategies.base import StrategyAction, StrategyActionType, make_request_id, dedupe_key_for
-        from strategies.runtime import StrategyOrchestrator
-        from strategies.cdc import CdcDcaStrategy, TransitionDecisionInput
+        now = datetime.now(timezone.utc)
+        from strategies.base import (
+            StrategyAction,
+            StrategyActionType,
+            StrategyDecision,
+            ActionStatus,
+            make_request_id,
+            dedupe_key_for,
+        )
         from main import handle_reserve_buy_action, strategy_orchestrator
 
         # Build a reserve-buy action, optionally scoped to exchange
@@ -2334,11 +3739,27 @@ def api_use_reserve_now():
             payload=payload,
         )
 
-        result = asyncio.run(handle_reserve_buy_action(now, action))
-        data = result.data or {}
+        decision = StrategyDecision(issued_at=now, actions=(action,))
+
+        async def _execute():
+            handlers = {
+                StrategyActionType.RESERVE_BUY: (lambda act: handle_reserve_buy_action(now, act)),
+            }
+            results = await strategy_orchestrator.execute(decision, handlers)
+            return results
+
+        results = asyncio.run(_execute())
+        if not results:
+            return jsonify({'ok': False, 'error': 'no_action_executed'}), 500
+        result = results[0]
+        payload = result.data or {}
         if result.status is ActionStatus.SUCCESS:
-            return jsonify({'ok': True, 'result': data})
-        return jsonify({'ok': False, 'error': data.get('payload', {}).get('error', result.detail or 'failed'), 'result': data}), 500
+            return jsonify({'ok': True, 'result': payload})
+        return jsonify({
+            'ok': False,
+            'error': payload.get('payload', {}).get('error', result.detail or 'failed'),
+            'result': payload,
+        }), 500
     except Exception as e:
         logging.error(f"use_reserve_now error: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
