@@ -134,6 +134,25 @@ class StrategyOrchestratorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(results[0].status, ActionStatus.SUCCESS)
         self.assertIs(results[1].status, ActionStatus.SKIPPED)
 
+    async def test_orchestrator_handles_handler_exception(self):
+        orchestrator = StrategyOrchestrator()
+        now = datetime.now(timezone.utc)
+        action = StrategyAction(
+            action_type=StrategyActionType.DCA_BUY,
+            request_id="req",
+            dedupe_key="key",
+            payload={"amount": 10},
+        )
+        decision = StrategyDecision(issued_at=now, actions=(action,))
+
+        async def handler(_: StrategyAction) -> ActionResult:
+            raise RuntimeError("boom")
+
+        results = await orchestrator.execute(decision, {StrategyActionType.DCA_BUY: handler})
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0].status, ActionStatus.FAILED)
+        self.assertEqual(results[0].detail, "boom")
+
 
 if __name__ == "__main__":
     unittest.main()

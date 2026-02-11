@@ -1,0 +1,15 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.log
+*.pid
+*.out
+*.lock
+node_modules
+venv
+backup_files
+log
+*.gz
+*.zip
+

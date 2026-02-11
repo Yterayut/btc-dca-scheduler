@@ -1,6 +1,6 @@
 Project Memory — BTC DCA Dashboard
 
-Updated: 2025-12-18
+Updated: 2025-12-22
 
 Summary
 - Stack: Python 3 + Flask + Flask-SocketIO + MySQL + Binance SDK.
@@ -8,6 +8,33 @@ Summary
 - Templates: templates/index.html (new UI), templates/admin.html.
 - Scheduler/worker: main.py (trading engine, health server via env HEALTH_CHECK_PORT).
 - Ops hardening (Dec-2025): scheduler DB lock + distributed dedupe + dedupe cleanup + S4 hardening gates + S4 OKX execution hardening.
+
+2025-12-22 — Ops Completion: Systemd + Heartbeat + S4 Status + Restore Drill
+
+Highlights
+- Systemd services (journald): `scripts/systemd/dca-web.service`, `dca-scheduler.service`, `dca-mysql-backup.service` + timer; enabled and running.
+- Secure backups: `scripts/backup_mysql.sh` + `~/.my.cnf` (chmod 600) + daily timer; verified manual backup output to `~/backups/mysql`.
+- Daily heartbeat: scheduler sends LINE 08:00–08:15 ICT, deduped by `action_dedupe` key `heartbeat:YYYY-MM-DD`, includes S4 status + gates + last flip + portfolio.
+- Flex heartbeat: verified Flex delivery works for Daily Heartbeat (LINE Flex allowlist includes `heartbeat`).
+- S4 CLI status: `venv/bin/python scripts/dca_tool.py s4 status` shows holdings, FIFO cost basis, per‑asset PnL, total PnL, gates, last status/error.
+- S4 web page: `/s4` added with readable time formatting, color coding, auto‑refresh + manual refresh; shows per‑asset PnL and confirm progress (Day X/Y).
+- S4 error hygiene: `last_error` cleared on successful/NOOP ticks; HOLD reasons stored separately (no stale error noise).
+- Confirm progress: now counts consecutive daily signal streak (capped by confirm days) for accurate “X / Y” display.
+- Restore drill: created `btc_dca_test`, restored latest gzip backup, verified `purchase_history` count 75 vs 75, dropped test DB.
+
+Ops helpers
+- Aliases in `~/.bashrc`: `dcaweb`, `dcasched`, `dcastatus`, `dcahealth`, `dcas4`, `dcabackup`.
+- Restore script: `scripts/restore_drill.sh` auto‑creates test DB, restores latest backup, compares counts, drops test DB.
+
+Git
+- Commit: `fb1360c` “Release v1.0: S4 Hardening, Dashboard, Systemd, Backup verified”
+- Tag: `v1.0-stable` pushed to `origin` (GitHub `Yterayut/btc-dca-scheduler`)
+
+Guideline — Daily Monitoring Window (S4/OKX)
+- Do not change scheduler config: the loop ticks every ~5 minutes and naturally picks up new daily candles when data updates.
+- Daily close anchor: crypto 1D close at 00:00 UTC (07:00 ICT).
+- Recommended human check window: 07:15–08:00 ICT (feed settled + bot ticked).
+- Heartbeat 08:00–08:15 ICT is the official daily summary (confirm/flip status stabilized).
 
 2025-12-22 — Restore Drill (Backup Verification)
 
@@ -161,6 +188,101 @@ Troubleshooting Tips
 - If frontend shows “Unexpected token '<'”, check that /api/* returns JSON (curl and verify Content-Type: application/json). The catch-all handler should prevent HTML responses.
 - To confirm the active server: ss -ltnp | rg 5001 and ps -fp <pid>.
 - Logs: app.log (web), web.out (process stdout), btc_purchase_log.log (engine).
+
+2025-12-22 — CDC Signal Source Labeling (Heartbeat + UI + S4 Notifications)
+
+What changed
+- Heartbeat payload now includes `signal_source` from S4 runtime (fallback binance_cdc if only CDC state exists).
+- Heartbeat messaging shows `CDC Signal: UP/DOWN (SOURCE)` instead of plain CDC value to avoid confusion with action-zone transitions.
+- S4 notifications updated to show CDC Signal with source:
+  - `notify_s4_dca_buy` and `notify_s4_rotation` render `CDC Signal: UP/DOWN (SOURCE)`.
+  - Source label mapping: `okx_ratio` → “OKX BTC/XAUT”, `binance_cdc` → “Binance BTCUSDT”.
+- UI updated to display CDC source labels consistently:
+  - Summary “S4 CDC Signal” card source uses mapped label.
+  - S4 meta row shows mapped signal source.
+
+Notes
+- Mapping is label-only; logic still uses okx_ratio primary when S4 hardening enabled and falls back to binance_cdc otherwise.
+
+2026-01-20 — S4 Confirm/Flip Fix + Dedupe for S4 DCA
+
+What changed
+- Fixed S4 confirmation logic so flips occur only after confirmation: added `runtime.last_confirmed_status`/`last_confirmed_at` and use this for rotation decisions; `last_cdc_status` still tracks latest signal for UI.
+- Cleared stale `runtime.last_hold_reason`/`last_hold_detail` when no HOLD gate triggers in a tick to prevent UI showing old `confirm_pending`.
+- Added DB dedupe for S4 DCA buys in `execute_s4_dca` with key `s4_dca:YYYY-MM-DD:schedule_id` to prevent duplicate buys even if multiple schedulers run.
+- Added LINE alert when S4 DCA is skipped by dedupe (throttled 6h per schedule via `_s4_should_alert`).
+
+Operational notes
+- Root cause of duplicate S4 DCA buys: multiple `main.py` processes running. Fix by using **one** supervisor.
+- Recommended: run scheduler via systemd only (service `dca-scheduler`) and avoid `dca_tool start` to prevent double processes.
+
+2026-01-28 — S4 Neutral Zone Phase 1/1.5 (Log-only) + Spec + Daily Flex
+
+Highlights
+- Spec finalized and stored at `docs/strategies/s4-neutral-zone-spec.md` (also copied to `docs/s4-neutral-zone-spec.md`).
+- New pure helper `strategies/s4_neutral_zone.py` computes neutral/weak/btc/gold state from EMA12/EMA26 (log-only; no behavior changes).
+- OKX ratio series + EMA helpers added in `strategies/s4_utils.py` to support neutral calculations.
+- `main.py` logs neutral state changes + daily EOD summary (log-only) and persists runtime metrics.
+- DB tables created for log collection (manual creation + auto-ensure in `main.py`):
+  - `s4_neutral_zone_eod` (daily closed candle summary)
+  - `s4_neutral_zone_state_changes` (event-driven state transitions)
+- Added report script `scripts/s4_neutral_zone_report.py` for EOD + state-change summaries (CSV export supported) and auto-loads `.env`.
+- Added SQL quick-check script `scripts/s4_neutral_zone_queries.py`.
+- Added dashboard/CSV generator `scripts/s4_neutral_zone_dashboard.py` (writes `static/s4_neutral_zone_dashboard.html` + CSVs in `log/`).
+- Added daily + weekly LINE Flex notifiers:
+  - `scripts/s4_neutral_zone_daily_notify.py`
+  - `scripts/s4_neutral_zone_weekly_notify.py`
+  - cron:
+  - `20 8 * * * .../venv/bin/python scripts/s4_neutral_zone_daily_notify.py >> log/s4_neutral_zone_daily_notify.log 2>&1`
+  - `20 9 * * 1 .../venv/bin/python scripts/s4_neutral_zone_weekly_notify.py >> log/s4_neutral_zone_weekly_notify.log 2>&1`
+- Created backups:
+  - `backup_files/s4-neutral-zone-spec_20260128.tar.gz`
+  - `backup_files/dca_full_backup_20260128.tar.gz`
+
+Operational notes
+- Tables may be missing until `main.py` runs or manual SQL is executed; report script requires DB_* envs.
+- For ad-hoc table creation, use explicit `load_dotenv(dotenv_path=".env")` when running via stdin.
+- Phase status: collecting logs only; next step is wait 30–90 days before Phase 0.5 (threshold selection).
+
+2026-01-29 — S4 Neutral Zone Live Monitoring Status (Checklist)
+
+Summary
+- Phase 1 + 1.5 running live: EOD log + Flex daily/weekly + dashboard/CSV are working.
+- Dashboard shows first real row: `2026-01-27 gold_signal` with EMA gap 4.6117% and slope -3.8224 (CDC down, asset GOLD).
+- State change log is still empty (expected early; no state flips yet).
+
+Monitoring checklist (during 30–90 day collection window)
+- Weekly: confirm EOD rows are present (no missing dates).
+- Weekly: state values always in 4-state enum (neutral/weak/btc/gold).
+- Watch for red flags:
+  - No EOD rows for >2 days → cron/scheduler issue.
+  - neutral_zone ~0% for weeks → thresholds too tight (fix later in Phase 0.5).
+  - neutral_zone >60% → thresholds too wide.
+  - frequent state changes intraday → logic issue (should be daily close).
+
+Next steps
+- Wait for 30+ EOD rows and 5–10 state changes.
+- Then move to Phase 0.5 (threshold selection) using CSV exports.
+
+2026-02-02 — S4 Neutral Zone Ops: Lag, Backfill, Cron, Dedupe Fix
+
+Highlights
+- Added EOD lag indicator: `eod_lag_days` stored in DB and shown in Flex + dashboard.
+- Daily/weekly Flex now show **Alert: EOD lag > 1 day** and theme switches to warning when lag > 1.
+- Cron schedule adjusted (Bangkok):
+  - Daily Flex 09:20, dashboard refresh 09:25, weekly Flex (Mon) 09:30.
+- Added daily backfill cron (09:35) to fill last 2 UTC days via `scripts/s4_neutral_zone_backfill.py`.
+- Backfill executed for 2026-01-29 → 2026-01-31; OKX data not yet available for 2026-02-01/02 at the time.
+- Added `Updated (BKK)` to Flex cards to avoid confusion with stale screenshots.
+- Updated `run_s4_tick` to log OKX series regardless of active exchange (log-only Phase 1.5).
+
+Operational fixes
+- S4 DCA dedupe moved **after** basic checks (balance/price) to avoid false skip when funds are insufficient.
+- Dedupe key for 2026-02-02 cleared manually to allow a fresh S4 DCA test.
+
+Notes
+- If OKX daily candle lags, EOD lag increases but logic remains correct; flip timing would be delayed once Phase 2 is enabled.
+- Scheduler log source is systemd journal; `scheduler.out` can be stale.
 
 
 2025-10-19 — LINE Dashboard Dark Theme & Flex Test

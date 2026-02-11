@@ -10,6 +10,9 @@ class OrderResult:
     executed_qty: float
     cummulative_quote_qty: float
     avg_price: float
+    fee_usd: float = 0.0
+    fee_asset: str | None = None
+    fee_asset_amount: float = 0.0
 
 
 class ExchangeAdapter(ABC):
@@ -22,25 +25,55 @@ class ExchangeAdapter(ABC):
     def symbol(self) -> str:
         """Return BTC/USDT symbol for this exchange (e.g., 'BTCUSDT' or 'BTC-USDT')."""
 
-    @abstractmethod
     def get_price(self) -> float:
         """Return current last price for BTC/USDT."""
+        return self.get_price_symbol(self.symbol())
 
     @abstractmethod
     def get_balance(self, asset: str) -> dict:
         """Return balance dict {'free': float, 'locked': float} for given asset."""
 
-    @abstractmethod
     def get_filters(self) -> dict:
         """Return precision/minimum constraints for trading the BTC/USDT symbol."""
+        return self.get_symbol_filters(self.symbol())
 
-    @abstractmethod
     def place_market_buy_quote(self, usdt_amount: float) -> OrderResult:
         """Place market buy by quote amount (USDT). Returns executed result."""
+        return self.place_market_buy_quote_symbol(self.symbol(), usdt_amount)
 
-    @abstractmethod
     def place_market_sell_qty(self, qty_btc: float) -> OrderResult:
         """Place market sell by BTC quantity. Returns executed result."""
+        return self.place_market_sell_qty_symbol(self.symbol(), qty_btc)
+
+    # --- Symbol-aware helpers (default to BTC symbol) ---
+    @abstractmethod
+    def get_price_symbol(self, symbol: str) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_symbol_filters(self, symbol: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def place_market_buy_quote_symbol(self, symbol: str, quote_amount: float) -> OrderResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def place_market_sell_qty_symbol(self, symbol: str, quantity: float) -> OrderResult:
+        raise NotImplementedError
+
+    def get_top_of_book(self) -> dict:
+        """Return best bid/ask snapshot as {'bid': float, 'ask': float, 'ts': float|None}."""
+        raise NotImplementedError("top-of-book access not implemented for this adapter")
+
+    # --- Optional market data helpers for advanced guards ---
+    def get_depth_snapshot(self, *, limit: int = 20) -> dict:
+        """Return depth snapshot as {'bids': [(price, qty)], 'asks': [...]}. Override when supported."""
+        raise NotImplementedError("depth snapshot not implemented for this adapter")
+
+    def get_recent_candles(self, *, interval: str = "1m", limit: int = 30) -> list[dict]:
+        """Return recent candles as [{'open_time','close','high','low','close'}]. Override when supported."""
+        raise NotImplementedError("recent candles not implemented for this adapter")
 
     # Generic helpers
     @staticmethod

@@ -145,6 +145,7 @@ class CdcDcaStrategy(StrategyEngine):
             "mode": data.mode,
         }
         metadata = {"cdc_enabled": data.cdc_enabled}
+        metadata["cdc_status"] = data.cdc_status
         if action_kind is StrategyActionType.RESERVE_MOVE:
             metadata["reserve_direction"] = "increase"
             metadata["reserve_channel"] = "global"
@@ -229,6 +230,7 @@ class CdcDcaStrategy(StrategyEngine):
                         "exchange": ex_low,
                         "percent": pct,
                     },
+                    metadata={"cdc_status": data.current_status},
                 )
             )
         return actions
@@ -244,6 +246,7 @@ class CdcDcaStrategy(StrategyEngine):
                     "mode": "global",
                     "amount": max(float(data.reserve_usdt or 0.0), 0.0),
                 },
+                metadata={"cdc_status": data.current_status},
             )
         )
         for exchange, amount in (
@@ -260,6 +263,7 @@ class CdcDcaStrategy(StrategyEngine):
                         "exchange": exchange,
                         "amount": max(float(amount or 0), 0.0),
                     },
+                    metadata={"cdc_status": data.current_status},
                 )
             )
         return actions
@@ -292,6 +296,7 @@ class CdcDcaStrategy(StrategyEngine):
             "cdc_status": cdc_status,
         }
         metadata = {"reserve_direction": "increase" if action_kind is StrategyActionType.RESERVE_MOVE else "decrease"}
+        metadata["cdc_status"] = cdc_status
         return StrategyAction(
             action_type=action_kind,
             request_id=context.request_id,

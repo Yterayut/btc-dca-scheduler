@@ -14,10 +14,12 @@ env/
 
 # Logs and data files
 *.log
+*.log.*
 *.txt
 *.sql
 *.sqlite
 *.sqlite3
+*.db
 
 # Runtime artifacts
 log/
@@ -44,6 +46,7 @@ backup_files/
 # IDE
 .vscode/
 .idea/
+*.code-workspace
 
 # OS
 .DS_Store

@@ -18,5 +18,23 @@ def get_btc_price():
         print(f"Error fetching price: {e}")
         return None
 
+def get_gold_price():
+    """Return the current GOLD (PAXG/USDT) price.
+
+    Allows overriding via env `S4_GOLD_PRICE_OVERRIDE` to support offline tests.
+    """
+    override = os.getenv("S4_GOLD_PRICE_OVERRIDE")
+    if override:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            pass
+    try:
+        ticker = client.get_symbol_ticker(symbol="PAXGUSDT")
+        return float(ticker["price"])
+    except Exception as e:
+        print(f"Error fetching gold price: {e}")
+        return None
+
 def get_client():
     return client

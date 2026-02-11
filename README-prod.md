@@ -1,13 +1,10 @@
 Production Readiness Guide — BTC DCA
 
 1) Environment and flags
-- Create `.env.production` (do not commit). Example keys:
-  - DB_HOST, DB_USER, DB_PASSWORD, DB_NAME
-  - BINANCE_API_KEY, BINANCE_API_SECRET
-  - OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE, OKX_LIVE_ENABLED=1
-  - ADMIN_TOKEN=<secure-random>
-  - CORS_ORIGIN=https://your.domain.com
-  - Optional: USE_BINANCE_TESTNET=0, DRY_RUN=0, STRATEGY_DRY_RUN=0
+- รัน `scripts/setup_production_env.sh` เพื่อสร้างไฟล์ `.env.production` ตัวอย่าง (จะไม่ทับไฟล์ที่มีอยู่)
+- เติมค่า DB/API/LINE/ADMIN_TOKEN/APP_ENCRYPTION_KEY ให้ครบในไฟล์นี้ (ห้าม commit)
+- รวมค่าแนะนำที่สำคัญ (ตั้งค่า 0 = production, 1 = test) เช่น `DRY_RUN=0`, `OKX_LIVE_ENABLED=1`, `FEATURE_S4_ENABLED=1`
+- สามารถ symlink `.env.production` เป็น `.env` หรือใช้ export ผ่าน systemd unit/environment manager
 
 2) Set strategy flags (CDC and global exchange)
 - Dry run example:
@@ -40,4 +37,3 @@ Production Readiness Guide — BTC DCA
 7) Safety
 - Keep only one `main.py` (scheduler) process. The web app already prevents multiple instances.
 - Prefer storing secrets in environment/secret managers; rotate keys after migration.
-

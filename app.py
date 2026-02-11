@@ -1180,7 +1180,7 @@ def migrate_data_if_needed():
                 db_name = os.getenv('DB_NAME')
                 if not has_col:
                     logging.info("Adding columns exchange_mode/binance_amount/okx_amount to schedules...")
-                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both','s4') NOT NULL DEFAULT 'global' AFTER purchase_amount")
+                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca') NOT NULL DEFAULT 'global' AFTER purchase_amount")
                     db.commit()
                 else:
                     try:
@@ -1192,9 +1192,9 @@ def migrate_data_if_needed():
                             (db_name,)
                         )
                         col_type = cursor.fetchone()
-                        if col_type and 's4' not in (col_type[0] or ''):
-                            logging.info("Extending schedules.exchange_mode enum to include 's4'...")
-                            cursor.execute("ALTER TABLE schedules MODIFY COLUMN exchange_mode ENUM('global','binance','okx','both','s4') NOT NULL DEFAULT 'global'")
+                        if col_type and ('s4' not in (col_type[0] or '') or 'pure_dca' not in (col_type[0] or '')):
+                            logging.info("Extending schedules.exchange_mode enum to include 's4' and 'pure_dca'...")
+                            cursor.execute("ALTER TABLE schedules MODIFY COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca') NOT NULL DEFAULT 'global'")
                             db.commit()
                     except Exception as sub_exc:
                         logging.warning(f"Could not extend exchange_mode enum: {sub_exc}")
@@ -1483,7 +1483,7 @@ def get_total_active_amount():
     try:
         with get_db_cursor() as (cursor, _):
             try:
-                # รวมยอดให้ถูกต้องตามโหมด: global → purchase_amount,
+                # รวมยอดให้ถูกต้องตามโหมด: global/pure_dca/s4 → purchase_amount,
                 # binance → binance_amount, okx → okx_amount, both → ผลรวมสองฝั่ง
                 cursor.execute(
                     """
@@ -1493,6 +1493,7 @@ def get_total_active_amount():
                             WHEN exchange_mode = 'binance' THEN COALESCE(binance_amount,0)
                             WHEN exchange_mode = 'okx' THEN COALESCE(okx_amount,0)
                             WHEN exchange_mode = 's4' THEN COALESCE(purchase_amount,0)
+                            WHEN exchange_mode = 'pure_dca' THEN COALESCE(purchase_amount,0)
                             ELSE COALESCE(purchase_amount,0)
                         END
                     ) AS total
@@ -1919,7 +1920,7 @@ def add_schedule():
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both','s4'):
+    if ex_mode not in ('global','binance','okx','both','s4','pure_dca'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:
@@ -2015,7 +2016,7 @@ def edit_schedule(schedule_id):
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both','s4'):
+    if ex_mode not in ('global','binance','okx','both','s4','pure_dca'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:

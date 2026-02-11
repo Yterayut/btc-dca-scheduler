@@ -12,6 +12,7 @@ from .base import (
     dedupe_key_for,
 )
 from .cdc import CdcDcaStrategy, WeeklyDcaDecisionInput, TransitionDecisionInput
+from .s4 import S4Strategy, S4DecisionInput
 from .runtime import StrategyOrchestrator
 
 __all__ = [
@@ -29,5 +30,7 @@ __all__ = [
     "CdcDcaStrategy",
     "WeeklyDcaDecisionInput",
     "TransitionDecisionInput",
+    "S4Strategy",
+    "S4DecisionInput",
     "StrategyOrchestrator",
 ]

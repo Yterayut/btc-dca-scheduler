@@ -348,6 +348,25 @@ def send_console_message(message: str) -> bool:
     print(f"{'='*60}\n")
     return True
 
+
+def _format_cdc_source_label(source: str | None) -> str:
+    if not source:
+        return ""
+    normalized = str(source).strip().lower()
+    if normalized in {"okx_ratio", "okx_btc_xaut", "okx-btc-xaut"}:
+        return "OKX BTC/XAUT"
+    if normalized in {"binance_cdc", "binance_btcusdt", "binance-btcusdt"}:
+        return "Binance BTCUSDT"
+    return str(source)
+
+
+def _format_cdc_signal_text(status: str | None, source: str | None) -> str:
+    status_text = str(status or "unknown").upper()
+    source_label = _format_cdc_source_label(source)
+    if source_label:
+        return f"{status_text} ({source_label})"
+    return status_text
+
 def notify_s4_rotation(payload: dict) -> bool:
     """Send a LINE notification when S4 rotation action is emitted."""
     try:
@@ -357,6 +376,7 @@ def notify_s4_rotation(payload: dict) -> bool:
     from_leg = str(payload.get('from') or 'BTC').upper()
     to_leg = str(payload.get('to') or 'GOLD').upper()
     cdc_status = str(payload.get('cdc_status') or 'unknown').upper()
+    cdc_source = payload.get('signal_source')
     btc_price = payload.get('btc_price')
     gold_price = payload.get('gold_price')
     notes = payload.get('notes') or {}
@@ -364,13 +384,16 @@ def notify_s4_rotation(payload: dict) -> bool:
     exchange = str(payload.get('exchange') or 'BINANCE').upper()
     executed = payload.get('executed')
     meta_entries = _meta_entries(payload if isinstance(payload, dict) else {})
+    if not cdc_source and isinstance(notes, dict):
+        cdc_source = notes.get('signal_source')
+    cdc_display = _format_cdc_signal_text(cdc_status, cdc_source)
 
     if flex_allowed('s4_rotation'):
         sections: list[tuple[str, str]] = [
             ("Exchange", exchange),
             ("Amount", f"{amount:,.2f} USDT"),
             ("Legs", f"{from_leg} → {to_leg}"),
-            ("CDC", cdc_status),
+            ("CDC Signal", cdc_display),
         ]
         try:
             if btc_price:
@@ -444,7 +467,7 @@ def notify_s4_rotation(payload: dict) -> bool:
     lines = [
         "🔄 S4 Rotation Triggered",
         f"{from_leg} → {to_leg} | {amount:,.2f} USDT",
-        f"CDC: {cdc_status} | Exchange: {exchange}",
+        f"CDC Signal: {cdc_display} | Exchange: {exchange}",
     ]
     try:
         if btc_price:
@@ -518,6 +541,7 @@ def notify_s4_dca_buy(payload: dict) -> bool:
     schedule_label = payload.get('schedule_label')
     order_id = payload.get('order_id')
     cdc_status = payload.get('cdc_status')
+    cdc_source = payload.get('signal_source')
     try:
         fee_usdt = float(payload.get('fee_usdt') or 0.0)
     except (TypeError, ValueError):
@@ -532,6 +556,7 @@ def notify_s4_dca_buy(payload: dict) -> bool:
         payload.get('holdings_meta'),
     )
     meta_entries = _meta_entries(payload)
+    cdc_display = _format_cdc_signal_text(cdc_status, cdc_source)
 
     if flex_allowed('s4_dca'):
         sections = [
@@ -553,8 +578,8 @@ def notify_s4_dca_buy(payload: dict) -> bool:
             schedule_text = str(schedule_label)
         if schedule_text:
             sections.append(("Schedule", schedule_text))
-        if cdc_status:
-            sections.append(("CDC", str(cdc_status).upper()))
+        if cdc_status or cdc_source:
+            sections.append(("CDC Signal", cdc_display))
 
         sections.append(("Mode", "DRY RUN" if dry_run else "LIVE"))
         if order_id:
@@ -605,8 +630,8 @@ def notify_s4_dca_buy(payload: dict) -> bool:
         status_bits.append(f"Schedule: #{schedule_id}")
     elif schedule_label:
         status_bits.append(f"Schedule: {schedule_label}")
-    if cdc_status:
-        status_bits.append(f"CDC: {str(cdc_status).upper()}")
+    if cdc_status or cdc_source:
+        status_bits.append(f"CDC Signal: {cdc_display}")
     if status_bits:
         lines.append(" | ".join(status_bits))
     mode_bits: list[str] = []
@@ -630,6 +655,66 @@ def notify_s4_dca_buy(payload: dict) -> bool:
         lines.append(holdings_line)
     lines.extend(meta_entries)
 
+    return send_line_message_with_retry("\n".join(lines))
+
+
+def notify_daily_heartbeat(payload: dict) -> bool:
+    """Send a daily heartbeat message (Flex when allowed)."""
+    status = str(payload.get("status") or "RUNNING")
+    time_local = str(payload.get("time") or payload.get("time_local") or "")
+    pid = payload.get("pid")
+    asset = str(payload.get("asset") or "UNKNOWN")
+    cdc = str(payload.get("cdc") or "unknown")
+    cdc_source = payload.get("signal_source")
+    gates = str(payload.get("gates") or "")
+    last_flip = str(payload.get("last_flip") or "")
+    portfolio = str(payload.get("portfolio") or "")
+    cdc_display = _format_cdc_signal_text(cdc, cdc_source)
+
+    if flex_allowed("heartbeat"):
+        sections = [
+            ("Status", status),
+            ("Time", time_local),
+            ("PID", str(pid) if pid is not None else "-"),
+            ("S4 Asset", asset),
+            ("CDC Signal", cdc_display),
+        ]
+        if gates:
+            sections.append(("Gates", gates))
+        if last_flip:
+            sections.append(("Last Flip", last_flip))
+        if portfolio:
+            sections.append(("Portfolio", portfolio))
+
+        bubble = build_basic_bubble(
+            "Daily Heartbeat",
+            sections,
+            subtitle="Scheduler OK",
+            theme="info",
+        )
+        flex_message = make_flex_message(
+            f"Heartbeat {asset} {cdc}",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for heartbeat; falling back to text message")
+
+    lines = [
+        "Daily Heartbeat",
+        f"Status: {status}",
+    ]
+    if time_local:
+        lines.append(f"Time: {time_local}")
+    if pid is not None:
+        lines.append(f"PID: {pid}")
+    lines.append(f"S4: Asset={asset} | CDC Signal={cdc_display}")
+    if gates:
+        lines.append(f"Gates: {gates}")
+    if last_flip:
+        lines.append(f"Last Flip: {last_flip}")
+    if portfolio:
+        lines.append(f"Portfolio: {portfolio}")
     return send_line_message_with_retry("\n".join(lines))
 
 def format_purchase_message(purchase_data: dict) -> str:
@@ -696,6 +781,56 @@ def send_purchase_notification(purchase_data: dict) -> bool:
     Returns:
         bool: True ถ้าส่งสำเร็จ
     """
+    timestamp = _utc_stamp(purchase_data.get('timestamp'))
+    meta_entries = _meta_entries(purchase_data)
+    footer_bits: list[str] = []
+    if meta_entries:
+        footer_bits.append(" | ".join(meta_entries))
+
+    if flex_allowed('weekly_dca'):
+        try:
+            usdt_amount = float(purchase_data.get('usdt_amount', 0))
+        except (TypeError, ValueError):
+            usdt_amount = 0.0
+        try:
+            btc_qty = float(purchase_data.get('btc_quantity', 0))
+        except (TypeError, ValueError):
+            btc_qty = 0.0
+        try:
+            btc_price = float(purchase_data.get('btc_price', 0))
+        except (TypeError, ValueError):
+            btc_price = 0.0
+
+        sections = [
+            ("Amount", f"{usdt_amount:,.2f} USDT"),
+            ("Filled", f"{btc_qty:.8f} BTC @ ฿{btc_price:,.2f}"),
+        ]
+        exchange = purchase_data.get('exchange')
+        if exchange:
+            sections.insert(0, ("Exchange", format_exchange_label(exchange)))
+
+        schedule_id = purchase_data.get('schedule_id')
+        if schedule_id not in (None, ''):
+            sections.append(("Schedule", f"#{schedule_id}"))
+        order_id = purchase_data.get('order_id')
+        if order_id not in (None, ''):
+            sections.append(("Order", str(order_id)))
+
+        bubble = build_basic_bubble(
+            "DCA BTC Success",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="success",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"DCA BTC Success {usdt_amount:,.2f} USDT",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for DCA BTC success; falling back to text message")
+
     message = format_purchase_message(purchase_data)
     return send_line_message_with_retry(message)
 
@@ -709,6 +844,47 @@ def send_error_notification(error_data: dict) -> bool:
     Returns:
         bool: True ถ้าส่งสำเร็จ
     """
+    timestamp = _utc_stamp(error_data.get('timestamp'))
+    meta_entries = _meta_entries(error_data)
+    footer_bits: list[str] = []
+    if meta_entries:
+        footer_bits.append(" | ".join(meta_entries))
+
+    if flex_allowed('weekly_dca'):
+        sections = [
+            ("Error", _reason_text(error_data.get('error_message'))),
+        ]
+        schedule_id = error_data.get('schedule_id')
+        if schedule_id not in (None, ''):
+            sections.append(("Schedule", f"#{schedule_id}"))
+
+        attempted = error_data.get('usdt_amount')
+        try:
+            attempted_val = float(attempted)
+        except (TypeError, ValueError):
+            attempted_val = None
+        if attempted_val is not None:
+            sections.append(("Attempted", f"{attempted_val:,.2f} USDT"))
+
+        exchange = error_data.get('exchange')
+        if exchange:
+            sections.insert(0, ("Exchange", format_exchange_label(exchange)))
+
+        bubble = build_basic_bubble(
+            "DCA BTC Error",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="danger",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            "DCA BTC Error",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for DCA BTC error; falling back to text message")
+
     message = format_error_message(error_data)
     return send_line_message_with_retry(message)
 
@@ -877,13 +1053,41 @@ def send_email_notification(message: str, email: str = None) -> bool:
     return True
 
 # ====== Strategy notifications (stubs ready to use) ======
-def notify_cdc_transition(prev_status: str, curr_status: str) -> bool:
-    icon = '🟢' if (curr_status or '').lower() == 'up' else '🔻'
+def notify_cdc_transition(prev_status: str, curr_status: str, *, window: str = "1D", timestamp=None) -> bool:
+    curr_lower = (curr_status or '').lower()
+    icon = '🟢' if curr_lower == 'up' else '🔻'
+    theme: str = "info"
+    if curr_lower == 'up':
+        theme = "success"
+    elif curr_lower == 'down':
+        theme = "danger"
+
+    ts = _utc_stamp(timestamp)
+
+    if flex_allowed('weekly_dca'):
+        sections = [
+            ("Previous", prev_status or 'unknown'),
+            ("Current", curr_status or 'unknown'),
+        ]
+        bubble = build_basic_bubble(
+            "CDC Action Zone Transition",
+            sections,
+            subtitle=f"{window} · {ts}",
+            theme=theme,
+        )
+        flex_message = make_flex_message(
+            f"CDC Action Zone {prev_status or '-'} → {curr_status or '-'}",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for CDC transition; falling back to text message")
+
     lines = [
-        f"{icon} CDC Action Zone Transition (1D)",
+        f"{icon} CDC Action Zone Transition ({window})",
         f"Prev: {prev_status or 'unknown'}",
         f"Curr: {curr_status or 'unknown'}",
-        f"Time: {_utc_stamp()}",
+        f"Time: {ts}",
     ]
     return send_line_message_with_retry("\n".join(lines))
 
@@ -949,9 +1153,56 @@ def notify_half_sell_executed(data: dict) -> bool:
 def notify_half_sell_skipped(data: dict) -> bool:
     pct = data.get('pct')
     header = f"⚠️ Sell {pct}% Skipped" if pct is not None else "⚠️ Half-Sell Skipped"
+    timestamp = _utc_stamp(data.get('timestamp'))
+    meta_entries = _meta_entries(data)
+
+    if flex_allowed('half_sell'):
+        exchange = data.get('exchange')
+        try:
+            btc_free = float(data.get('btc_free', 0))
+        except (TypeError, ValueError):
+            btc_free = 0.0
+        min_notional_val = data.get('min_notional')
+        try:
+            min_notional_text = f"{float(min_notional_val):,.2f}"
+        except (TypeError, ValueError):
+            min_notional_text = str(min_notional_val or '-')
+
+        sections = [
+            ("Reason", _reason_text(data.get('reason'))),
+            ("BTC Free", f"{btc_free:.8f}"),
+            ("stepSize", str(data.get('step', '-'))),
+            ("MinNotional", min_notional_text),
+        ]
+        if pct is not None:
+            sections.insert(0, ("Percent", f"{pct}%"))
+        if exchange:
+            sections.insert(0, ("Exchange", format_exchange_label(exchange)))
+        if data.get('cdc_status'):
+            sections.append(("CDC", str(data['cdc_status']).upper()))
+
+        footer_bits: list[str] = []
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            header.replace("⚠️ ", ""),
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="warning",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            "Half-Sell Skipped",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for half-sell skipped; falling back to text message")
+
     lines = [
         header,
-        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Time: {timestamp}",
         f"Reason: {_reason_text(data.get('reason'))}",
         f"BTC Free: {data.get('btc_free', 0):.8f}",
         f"stepSize: {data.get('step', '-')}",
@@ -1190,9 +1441,54 @@ def notify_reserve_buy_executed(data: dict) -> bool:
     return send_line_message_with_retry("\n".join(lines))
 
 def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:
+    timestamp = _utc_stamp(data.get('timestamp'))
+    meta_entries = _meta_entries(data)
+
+    if flex_allowed('reserve_buy'):
+        try:
+            spend = float(data.get('spend', 0))
+        except (TypeError, ValueError):
+            spend = 0.0
+        min_notional_val = data.get('min_notional')
+        try:
+            min_notional_text = f"{float(min_notional_val):,.2f}"
+        except (TypeError, ValueError):
+            min_notional_text = str(min_notional_val or '-')
+        try:
+            reserve_amount = float(data.get('reserve', 0))
+        except (TypeError, ValueError):
+            reserve_amount = 0.0
+
+        sections = [
+            ("Spend", f"{spend:,.2f} < {min_notional_text}"),
+            ("Reserve", f"{reserve_amount:,.2f} USDT"),
+        ]
+        exchange = data.get('exchange')
+        if exchange:
+            sections.insert(0, ("Exchange", format_exchange_label(exchange)))
+
+        footer_bits: list[str] = []
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Reserve Buy Skipped",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="warning",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            "Reserve Buy Skipped",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for reserve buy skipped; falling back to text message")
+
     lines = [
         "⚠️ Reserve Buy Skipped",
-        f"Time: {_utc_stamp(data.get('timestamp'))}",
+        f"Time: {timestamp}",
         f"Spend: {data.get('spend', 0):,.2f} < {data.get('min_notional', 0):,.2f}",
         f"Reserve: {data.get('reserve', 0):,.2f} USDT",
     ]
@@ -1204,11 +1500,91 @@ def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:
 
 def notify_liquidity_blocked(action: str, data: dict) -> bool:
     action_label = action.replace('_', ' ').title()
+    timestamp = _utc_stamp(data.get('timestamp'))
+    exchange_label = format_exchange_label(data.get('exchange'))
+    meta_entries = _meta_entries(data)
+
+    channel_map = {
+        'half_sell': 'half_sell',
+        'reserve_buy': 'reserve_buy',
+        'dca_buy': 'weekly_dca',
+    }
+    channel = channel_map.get(action.lower())
+
+    if flex_allowed(channel):
+        def _safe_float(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        sections = [
+            ("Action", action_label),
+            ("Exchange", exchange_label),
+        ]
+        spread = data.get('spread_pct')
+        spread_max = data.get('threshold_pct')
+        spread_val = _safe_float(spread)
+        if spread_val is not None:
+            max_val = _safe_float(spread_max) or 0.0
+            sections.append(("Spread", f"{spread_val:.2f}% (max {max_val:.2f}%)"))
+        reason = data.get('reason')
+        if reason:
+            sections.append(("Reason", _reason_text(reason)))
+        expected = data.get('expected_notional')
+        expected_val = _safe_float(expected)
+        if expected_val is not None:
+            sections.append(("Notional", f"{expected_val:,.2f} USDT"))
+
+        depth_info = data.get('depth')
+        if isinstance(depth_info, dict):
+            bid = _safe_float(depth_info.get('bid_notional'))
+            ask = _safe_float(depth_info.get('ask_notional'))
+            band = _safe_float(depth_info.get('band_pct')) or 0.0
+            if bid is not None and ask is not None:
+                sections.append(("Depth Bid/Ask", f"{bid:,.0f} / {ask:,.0f} USDT within ±{band:.2f}%"))
+
+        twap_info = data.get('twap')
+        if isinstance(twap_info, dict):
+            twap_val = _safe_float(twap_info.get('twap'))
+            deviation = _safe_float(twap_info.get('deviation_pct')) or 0.0
+            threshold = _safe_float(twap_info.get('threshold_pct')) or 0.0
+            if twap_val is not None:
+                sections.append(("TWAP", f"{twap_val:,.2f} USDT (Δ {deviation:.2f}% / max {threshold:.2f}%)"))
+
+        cap = data.get('cap')
+        cap_val = _safe_float(cap)
+        if cap_val is not None:
+            sections.append(("Cap", f"{cap_val:,.2f} USDT"))
+        attempt = data.get('attempt')
+        attempt_val = _safe_float(attempt)
+        if attempt_val is not None:
+            sections.append(("Attempt", f"{attempt_val:,.2f} USDT"))
+
+        footer_bits: list[str] = []
+        if meta_entries:
+            footer_bits.append(" | ".join(meta_entries))
+
+        bubble = build_basic_bubble(
+            "Liquidity Block",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme="danger",
+            footer_note="\n".join(footer_bits) if footer_bits else None,
+        )
+        flex_message = make_flex_message(
+            f"Liquidity Block ({action_label})",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for liquidity block; falling back to text message")
+
     lines = [
         "🛑 Liquidity Block",
         f"Action: {action_label}",
-        f"Time: {_utc_stamp(data.get('timestamp'))}",
-        f"Exchange: {format_exchange_label(data.get('exchange'))}",
+        f"Time: {timestamp}",
+        f"Exchange: {exchange_label}",
     ]
     if data.get('spread_pct') is not None:
         lines.append(f"Spread: {data.get('spread_pct', 0):.3f}% (max {data.get('threshold_pct', 0):.3f}%)")
@@ -1266,6 +1642,32 @@ def notify_cdc_toggle(enabled: bool, flags: dict | None = None) -> bool:
     except Exception:
         pass
     suffix_text = f" ({'/'.join(suffix)})" if suffix else ''
+
+    timestamp = _utc_stamp()
+
+    if flex_allowed('weekly_dca'):
+        theme = "success" if enabled else "warning"
+        sections = [
+            ("Status", "Enabled" if enabled else "Disabled"),
+        ]
+        if suffix:
+            sections.append(("Flags", " / ".join(suffix)))
+        details = "ระบบจะทำ DCA ตาม CDC Action Zone" if enabled else "ระบบจะทำ DCA ตามตารางปกติ ไม่พิจารณา CDC"
+        sections.append(("Note", details))
+
+        bubble = build_basic_bubble(
+            "CDC Trading Mode",
+            sections,
+            subtitle=f"Time: {timestamp}",
+            theme=theme,
+        )
+        flex_message = make_flex_message(
+            f"CDC Trading {'Enabled' if enabled else 'Disabled'}",
+            bubble,
+        )
+        if send_line_flex_with_retry(flex_message):
+            return True
+        logging.warning("Flex send failed for CDC toggle; falling back to text message")
 
     if enabled:
         msg = f"🟢 CDC Trading Enabled (1D){suffix_text}\nระบบจะทำ DCA ตาม CDC Action Zone"

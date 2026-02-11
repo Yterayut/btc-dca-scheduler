@@ -577,6 +577,17 @@ Update State
 
 ---
 
+## 🛡️ Guard & Security (v3.1)
+
+- **Depth Guard**: ตรวจสอบ order book ภายใน ±`DEPTH_GUARD_BAND_PCT`% ต้องมี notional ≥ `DEPTH_GUARD_MIN_NOTIONAL_USDT` (ฟังก์ชัน `evaluate_depth_guard` ใน main.py)
+- **TWAP Guard**: ราคา spot ต้องไม่เบี่ยงจาก TWAP (1 นาที) เกิน `TWAP_GUARD_MAX_DEVIATION_PCT`
+- **Notional Cap**: จำกัด notional ต่อคำสั่งผ่าน `binance_max_usdt` / `okx_max_usdt` (ปรับได้บน Strategy UI)
+- **Compliance Audit Log**: บันทึกคำสั่งซื้อ/ขายและสำรองใน `compliance_audit_log` พร้อม metadata เข้ารหัส (`security_utils.py`)
+- **Security Alerts**: PnL หรือ notional เกิน threshold → LINE แจ้งเตือนผ่าน `notify_security_alert` และแสดงบน UI Compliance Log
+- **UI Integration**: History tab เพิ่ม “Compliance Audit Log” + log filter `Compliance / Security`
+
+---
+
 ## 🎯 สรุปหลักการทำงาน
 
 ### **Main Scheduler (main.py)**

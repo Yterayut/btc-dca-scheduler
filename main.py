@@ -31,6 +31,7 @@ from notify import (
     notify_security_alert,
     notify_s4_rotation,
     notify_s4_dca_buy,
+    notify_daily_heartbeat,
 )
 from exchanges.factory import get_adapter
 from services.balance_service import fetch_balances
@@ -41,7 +42,10 @@ from strategies.s4_utils import (
     plan_s4_rotation as _plan_s4_rotation,
     resolve_s4_target_allocations as _resolve_s4_target_allocations,
     fetch_okx_ratio_signal as _fetch_okx_ratio_signal,
+    fetch_okx_ratio_series as _fetch_okx_ratio_series,
+    compute_ema_series as _compute_ema_series,
 )
+from strategies.s4_neutral_zone import calculate_state as _s4_neutral_state, DEFAULT_NEUTRAL_CONFIG
 from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from contextlib import contextmanager
@@ -268,6 +272,7 @@ def maybe_send_daily_heartbeat(now: datetime) -> None:
 
     s4_asset = None
     s4_cdc = None
+    s4_signal_source = None
     cooldown_text = None
     confirm_text = None
     last_flip_text = None
@@ -276,6 +281,7 @@ def maybe_send_daily_heartbeat(now: datetime) -> None:
         record, _, _, runtime = get_s4_state()
         if record and isinstance(runtime, dict):
             s4_cdc = str(runtime.get('last_cdc_status') or '').lower() or None
+            s4_signal_source = runtime.get('signal_source')
             s4_asset = runtime.get('active_asset')
             if not s4_asset:
                 s4_asset = 'BTC' if (s4_cdc or 'up') == 'up' else 'GOLD'
@@ -290,6 +296,7 @@ def maybe_send_daily_heartbeat(now: datetime) -> None:
         logging.debug("Heartbeat S4 state read failed: %s", exc)
 
     effective_cdc = (s4_cdc or cdc_status or 'unknown')
+    signal_source = s4_signal_source or ('binance_cdc' if cdc_status else None)
     asset_text = s4_asset or 'unknown'
 
     lines = [
@@ -310,8 +317,19 @@ def maybe_send_daily_heartbeat(now: datetime) -> None:
     if portfolio_text:
         lines.append(f"Portfolio: {portfolio_text}")
 
+    payload = {
+        "status": "RUNNING",
+        "time": _format_dt_local(now) + " (Asia/Bangkok)",
+        "pid": os.getpid(),
+        "asset": asset_text,
+        "cdc": effective_cdc,
+        "signal_source": signal_source,
+        "gates": " | ".join(gates_bits) if gates_bits else "",
+        "last_flip": last_flip_text or "",
+        "portfolio": portfolio_text or "",
+    }
     try:
-        send_line_message_with_retry("\n".join(lines))
+        notify_daily_heartbeat(payload)
         logging.info("Daily heartbeat sent dedupe_key=%s", dedupe_key)
     except Exception as exc:
         logging.warning("Daily heartbeat notify failed: %s", exc)
@@ -994,6 +1012,108 @@ def _s4_update_signal_history(runtime: dict, entry: dict, *, keep: int = 14) -> 
     return history
 
 
+def _s4_log_neutral_state(
+    now: datetime,
+    runtime: dict,
+    *,
+    state: str,
+    metrics: dict,
+    ratio_close: float,
+    ema12: float,
+    ema26: float,
+    asof_date: str | None,
+    preset_name: str,
+) -> None:
+    gap = float(metrics.get('ema_gap_pct') or 0.0)
+    slope = float(metrics.get('slope_pct') or 0.0)
+    prev_state = runtime.get('neutral_state')
+
+    if prev_state and prev_state != state:
+        logging.info(
+            "S4 NEUTRAL STATE_CHANGE | ts=%s | old=%s | new=%s | gap=%.4f%% | slope=%.4f%%",
+            now.isoformat(),
+            prev_state,
+            state,
+            gap,
+            slope,
+        )
+        try:
+            with db_transaction() as (cursor, _):
+                cursor.execute(
+                    """
+                    INSERT INTO s4_neutral_zone_state_changes (
+                        ts, old_state, new_state, ema_gap_pct, slope_pct
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (now, prev_state, state, gap, slope),
+                )
+        except Exception:
+            logging.debug("S4 neutral state change DB log skipped", exc_info=True)
+
+    runtime['neutral_state'] = state
+    runtime['neutral_preset'] = preset_name
+    runtime['neutral_ratio_close'] = ratio_close
+    runtime['neutral_ema12'] = ema12
+    runtime['neutral_ema26'] = ema26
+    runtime['neutral_ema_gap_pct'] = gap
+    runtime['neutral_slope_pct'] = slope
+
+    if asof_date and runtime.get('neutral_eod_date') != asof_date:
+        try:
+            eod_date = datetime.fromisoformat(asof_date).date()
+        except Exception:
+            eod_date = None
+        now_utc_date = now.astimezone(utc).date()
+        lag_days = (now_utc_date - eod_date).days if eod_date else 0
+        logging.info(
+            "S4 NEUTRAL EOD_SUMMARY | date=%s | state=%s | ratio=%.6f | ema12=%.6f | ema26=%.6f | gap=%.4f%% | slope=%.4f%% | lag_days=%s",
+            asof_date,
+            state,
+            ratio_close,
+            ema12,
+            ema26,
+            gap,
+            slope,
+            lag_days,
+        )
+        runtime['neutral_eod_lag_days'] = lag_days
+        try:
+            with db_transaction() as (cursor, _):
+                cursor.execute(
+                    """
+                    INSERT INTO s4_neutral_zone_eod (
+                        date, ratio_close, ema12, ema26, ema_gap_pct, slope_pct,
+                        state, cdc_status, active_asset, eod_lag_days
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        ratio_close=VALUES(ratio_close),
+                        ema12=VALUES(ema12),
+                        ema26=VALUES(ema26),
+                        ema_gap_pct=VALUES(ema_gap_pct),
+                        slope_pct=VALUES(slope_pct),
+                        state=VALUES(state),
+                        cdc_status=VALUES(cdc_status),
+                        active_asset=VALUES(active_asset),
+                        eod_lag_days=VALUES(eod_lag_days)
+                    """,
+                    (
+                        asof_date,
+                        ratio_close,
+                        ema12,
+                        ema26,
+                        gap,
+                        slope,
+                        state,
+                        runtime.get('last_cdc_status'),
+                        runtime.get('active_asset'),
+                        lag_days,
+                    ),
+                )
+        except Exception:
+            logging.debug("S4 neutral EOD DB log skipped", exc_info=True)
+        runtime['neutral_eod_date'] = asof_date
+
+
 def _s4_confirmed(history: list[dict], *, days: int) -> bool:
     if days <= 1:
         return True
@@ -1192,6 +1312,32 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
 
     if adapter is not None and not dry_run:
         try:
+            # Basic pre-check: ensure balance is sufficient before claiming dedupe.
+            balance = adapter.get_balance('USDT') or {}
+            available_usdt = _safe_float(balance.get('free'), 0.0)
+            if available_usdt < amount:
+                logging.warning(
+                    "S4 DCA skipped: insufficient USDT (need=%.2f, available=%.2f)",
+                    amount,
+                    available_usdt,
+                )
+                return None
+            day_key = now.astimezone(timezone('Asia/Bangkok')).date().isoformat()
+            dedupe_key = f"s4_dca:{day_key}:{schedule_id or 0}"
+            request_id = f"{dedupe_key}:{int(now.timestamp())}:{os.getpid()}"
+            if not claim_dedupe_key(dedupe_key, request_id):
+                logging.warning("S4 DCA dedupe hit: skip buy (dedupe_key=%s schedule_id=%s)", dedupe_key, schedule_id)
+                if _s4_should_alert(runtime, f"s4_dca_dedupe_{schedule_id}", now, min_interval_minutes=360):
+                    try:
+                        send_line_message_with_retry(
+                            "⚠️ S4 DCA skipped (dedupe)\n"
+                            f"Schedule: #{schedule_id}\n"
+                            f"Date: {day_key}\n"
+                            f"Key: {dedupe_key}"
+                        )
+                    except Exception:
+                        logging.debug("S4 DCA dedupe alert failed", exc_info=True)
+                return None
             order = adapter.place_market_buy_quote_symbol(symbol, amount)
             executed_qty = float(order.executed_qty or 0.0)
             avg_price = float(order.avg_price or 0.0)
@@ -1210,6 +1356,22 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
             executed_qty = 0.0
             avg_price = 0.0
         else:
+            day_key = now.astimezone(timezone('Asia/Bangkok')).date().isoformat()
+            dedupe_key = f"s4_dca:{day_key}:{schedule_id or 0}"
+            request_id = f"{dedupe_key}:{int(now.timestamp())}:{os.getpid()}"
+            if not claim_dedupe_key(dedupe_key, request_id):
+                logging.warning("S4 DCA dedupe hit: skip buy (dedupe_key=%s schedule_id=%s)", dedupe_key, schedule_id)
+                if _s4_should_alert(runtime, f"s4_dca_dedupe_{schedule_id}", now, min_interval_minutes=360):
+                    try:
+                        send_line_message_with_retry(
+                            "⚠️ S4 DCA skipped (dedupe)\n"
+                            f"Schedule: #{schedule_id}\n"
+                            f"Date: {day_key}\n"
+                            f"Key: {dedupe_key}"
+                        )
+                    except Exception:
+                        logging.debug("S4 DCA dedupe alert failed", exc_info=True)
+                return None
             executed_qty = amount / price
             avg_price = price
         fee_buy_usdt = 0.0
@@ -1282,6 +1444,7 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
 
     order_id_payload = _order_id_payload(order_id)
 
+    signal_source = runtime.get('signal_source')
     try:
         notify_s4_dca_buy({
             'asset': asset_label,
@@ -1298,6 +1461,7 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
             'fee_asset': fee_buy_asset,
             'fee_asset_amount': fee_buy_asset_amount,
             'cdc_status': runtime.get('last_cdc_status') or last_status,
+            'signal_source': signal_source,
             'holdings': holdings_payload,
             'holdings_meta': holdings_meta,
         })
@@ -1322,7 +1486,8 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
             status_bits.append(f"Schedule: {schedule_context.get('label')}")
         cdc_state = runtime.get('last_cdc_status') or last_status
         if cdc_state:
-            status_bits.append(f"CDC: {str(cdc_state).upper()}")
+            source_label = signal_source or 'binance_cdc'
+            status_bits.append(f"CDC Signal: {str(cdc_state).upper()} ({source_label})")
         if dry_run or adapter is None:
             status_bits.append("Mode: DRY RUN")
         else:
@@ -1592,14 +1757,20 @@ async def purchase_btc(now: datetime, purchase_amount: float, schedule_id: int, 
 
     except BinanceAPIException as e: # Legacy path safety
         # The specific logging for BinanceAPIException already happened in the inner try-except blocks
-        error_message = f"Binance API Error in purchase_btc (orderId: {order.get('orderId', 'N/A') if order else 'N/A'}): Code={e.code}, Message='{e.message}'"
+        current_order_id = 'N/A'
+        if 'order_id_from_details' in locals() and order_id_from_details:
+            current_order_id = order_id_from_details
+        error_message = f"Binance API Error in purchase_btc (orderId: {current_order_id}): Code={e.code}, Message='{e.message}'"
         logging.error(error_message) # Log again with order context if available
         print(error_message)
         send_line_message(error_message)
         raise # Important to re-raise to inform the scheduler loop
     except ValueError as e: # Catch ValueErrors, including from qty checks and float conversions
         # Specific logging for ValueError would have happened at the point of failure
-        error_message = f"ValueError in purchase_btc (orderId: {order.get('orderId', 'N/A') if order else 'N/A'}): {e}"
+        current_order_id = 'N/A'
+        if 'order_id_from_details' in locals() and order_id_from_details:
+            current_order_id = order_id_from_details
+        error_message = f"ValueError in purchase_btc (orderId: {current_order_id}): {e}"
         logging.error(error_message) # Log again with order context
         print(error_message)
         send_line_message(error_message)
@@ -2961,7 +3132,7 @@ async def run_s4_tick(now: datetime) -> None:
 
     cdc_status = str(cdc_snapshot.get('status') or 'down').lower()
     target_asset = 'BTC' if cdc_status == 'up' else 'GOLD'
-    previous_status = runtime.get('last_cdc_status')
+    previous_confirmed = str(runtime.get('last_confirmed_status') or runtime.get('last_cdc_status') or '').lower() or None
     runtime['last_cdc_status'] = cdc_status
     runtime['signal_source'] = signal_source
     runtime['last_signal_snapshot'] = {
@@ -2971,6 +3142,40 @@ async def run_s4_tick(now: datetime) -> None:
         'btc_close': cdc_snapshot.get('btc_close'),
         'gold_close': cdc_snapshot.get('gold_close'),
     }
+
+    # Phase 1: Neutral Zone log-only hooks (no behavior change).
+    try:
+        ratio_series = _fetch_okx_ratio_series()
+        ratios = [ratio for _, ratio in ratio_series]
+        ema12_series = _compute_ema_series(ratios, 12)
+        ema26_series = _compute_ema_series(ratios, 26)
+        if ema12_series and ema26_series:
+            ema12 = float(ema12_series[-1])
+            ema26 = float(ema26_series[-1])
+            ema12_history = list(reversed(ema12_series))
+            neutral_state, metrics = _s4_neutral_state(
+                ema12=ema12,
+                ema26=ema26,
+                ema12_history=ema12_history,
+                config=DEFAULT_NEUTRAL_CONFIG,
+            )
+            if neutral_state:
+                last_ts = ratio_series[-1][0]
+                ratio_close = float(ratio_series[-1][1])
+                asof_date = datetime.fromtimestamp(last_ts / 1000.0, tz=utc).date().isoformat()
+                _s4_log_neutral_state(
+                    now,
+                    runtime,
+                    state=str(neutral_state.value),
+                    metrics=metrics,
+                    ratio_close=ratio_close,
+                    ema12=ema12,
+                    ema26=ema26,
+                    asof_date=asof_date,
+                    preset_name=DEFAULT_NEUTRAL_CONFIG.name,
+                )
+    except Exception as exc:
+        logging.debug(f"S4 neutral zone log skipped: {exc}")
 
     # S4 hardening: confirmation/cooldown/max flip circuit breaker (NO-GO gates).
     if S4_HARDENING_ENABLED:
@@ -3029,8 +3234,10 @@ async def run_s4_tick(now: datetime) -> None:
         # 2-day confirmation (requires consecutive daily closes)
         confirm_days = max(int(S4_CONFIRM_DAYS or 0), 1)
         history = runtime.get('signal_history')
+        confirmed = True
         if isinstance(history, list) and confirm_days > 1:
-            if not _s4_confirmed(history, days=confirm_days):
+            confirmed = _s4_confirmed(history, days=confirm_days)
+            if not confirmed:
                 _s4_hold(
                     now,
                     metadata,
@@ -3042,6 +3249,12 @@ async def run_s4_tick(now: datetime) -> None:
                     alert_interval_minutes=720,
                 )
                 return
+        if confirmed:
+            runtime['last_confirmed_status'] = cdc_status
+            runtime['last_confirmed_at'] = now.isoformat()
+        # No HOLD gates triggered in this tick; clear stale HOLD markers for UI clarity.
+        runtime.pop('last_hold_reason', None)
+        runtime.pop('last_hold_detail', None)
 
     target_btc_pct, target_gold_pct = _resolve_s4_target_allocations(config, cdc_status)
     target_alloc = runtime.setdefault('target_allocations', {})
@@ -3054,8 +3267,11 @@ async def run_s4_tick(now: datetime) -> None:
     rotation_amount_usd = 0.0
     rotation_plan = None
 
-    if previous_status not in ('up', 'down'):
-        logging.warning("S4 transition with unknown previous CDC state (%s); skipping rotation and persisting current state", previous_status)
+    if previous_confirmed not in ('up', 'down'):
+        logging.warning(
+            "S4 transition with unknown previous CDC state (%s); skipping rotation and persisting current state",
+            previous_confirmed,
+        )
         runtime['active_asset'] = target_asset
         runtime['last_action'] = {
             'result': 'noop_unknown_prev',
@@ -3069,7 +3285,7 @@ async def run_s4_tick(now: datetime) -> None:
         save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
         return
 
-    if previous_status != cdc_status:
+    if previous_confirmed != cdc_status:
         rotation_plan = _plan_s4_rotation(
             current_btc_usd=usd_map.get('BTC', 0.0),
             current_gold_usd=usd_map.get('GOLD', 0.0),
@@ -3503,6 +3719,7 @@ async def run_s4_tick(now: datetime) -> None:
                     'to': to_asset,
                     'amount_usd': round(rotation_amount_usd or plan_usd, 2),
                     'cdc_status': cdc_status,
+                    'signal_source': signal_source,
                     'btc_price': btc_price,
                     'gold_price': gold_price,
                     'notes': notes_payload,
@@ -3543,6 +3760,33 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
         cdc_status = 'up'
     else:
         cdc_status = get_cdc_status_1d().get('status')
+
+    if mode == 'pure_dca':
+        day_key = now.astimezone(timezone('Asia/Bangkok')).date().isoformat()
+        dedupe_key = f"pure_dca:{day_key}:{schedule_id or 0}"
+        request_id = f"{dedupe_key}:{int(now.timestamp())}:{os.getpid()}"
+        if not claim_dedupe_key(dedupe_key, request_id):
+            return {
+                'decision': 'noop',
+                'mode': mode,
+                'reason': 'duplicate_action_db',
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+            }
+        await purchase_btc(now, float(amount or 0), schedule_id, context={
+            'request_id': request_id,
+            'dedupe_key': dedupe_key,
+            'cdc_status': 'pure_dca',
+            'timestamp': now,
+        })
+        return {
+            'decision': 'buy',
+            'amount': float(amount or 0),
+            'mode': mode,
+            'cdc': 'ignored',
+            'request_id': request_id,
+            'dedupe_key': dedupe_key,
+        }
 
     strategy = CdcDcaStrategy(
         config_params={
@@ -3915,7 +4159,7 @@ async def run_loop_scheduler():
                     last_run = last_run_times.get(schedule_id)
                     current_schedule_time = f"{now.strftime('%Y-%m-%d')} {schedule_time_str}"
                     if last_run != current_schedule_time:
-                        logging.info(f"⏰ Matched schedule ID {schedule_id} at {current_time_str}. Applying CDC gate...")
+                        logging.info(f"⏰ Matched schedule ID {schedule_id} at {current_time_str}. Evaluating schedule mode...")
                         if exchange_mode in ('global', None):
                             await gate_weekly_dca(now, schedule_id, float(purchase_amount))
                         else:
@@ -3962,6 +4206,37 @@ if __name__ == "__main__":
                     metadata_json TEXT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_mode_time (strategy_mode, executed_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS s4_neutral_zone_eod (
+                    date DATE PRIMARY KEY,
+                    ratio_close DECIMAL(12,6) NULL,
+                    ema12 DECIMAL(12,6) NULL,
+                    ema26 DECIMAL(12,6) NULL,
+                    ema_gap_pct DECIMAL(8,4) NULL,
+                    slope_pct DECIMAL(8,4) NULL,
+                    state VARCHAR(20) NULL,
+                    cdc_status VARCHAR(10) NULL,
+                    active_asset VARCHAR(10) NULL,
+                    eod_lag_days INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+            """)
+            try:
+                cursor.execute("ALTER TABLE s4_neutral_zone_eod ADD COLUMN eod_lag_days INT NULL")
+            except Exception:
+                pass
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS s4_neutral_zone_state_changes (
+                    id INT PRIMARY KEY AUTO_INCREMENT,
+                    ts DATETIME NOT NULL,
+                    old_state VARCHAR(20) NULL,
+                    new_state VARCHAR(20) NULL,
+                    ema_gap_pct DECIMAL(8,4) NULL,
+                    slope_pct DECIMAL(8,4) NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_neutral_state_change_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
             """)
             db.commit(); cursor.close(); db.close()
