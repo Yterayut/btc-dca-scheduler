@@ -22,6 +22,7 @@ from exchanges.factory import get_adapter
 from main import increment_reserve, increment_reserve_exchange
 from compliance import fetch_events
 from services.balance_service import fetch_balances
+from services.bootstrap import create_binance_client, env_flag as shared_env_flag
 from strategies.s4_observability import (
     derive_shadow_decision,
     mismatch_severity,
@@ -2899,10 +2900,7 @@ def api_wallet():
 import time
 
 def _env_flag(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ('1','true','yes','on')
+    return shared_env_flag(name, default)
 
 def _get_binance_client():
     try:
@@ -2918,7 +2916,13 @@ def _get_binance_client():
         api_secret = os.getenv('BINANCE_API_SECRET')
         if api_key and api_secret:
             testnet = _env_flag('USE_BINANCE_TESTNET', False) or _env_flag('BINANCE_TESTNET', False)
-            return Client(api_key=api_key, api_secret=api_secret, testnet=testnet, requests_params={'timeout': 15})
+            return create_binance_client(
+                {
+                    'BINANCE_API_KEY': api_key,
+                    'BINANCE_API_SECRET': api_secret,
+                },
+                testnet=testnet,
+            )
     except Exception:
         return None
     return None
