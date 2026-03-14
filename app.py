@@ -2874,8 +2874,8 @@ def api_wallet():
         reserve_okx = _safe_float(snapshot_row.get('reserve_okx_usdt'))
         total_reserve = _safe_float(snapshot_row.get('reserve_usdt'), reserve_binance + reserve_okx)
 
-        testnet = _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET') or _env_flag('OKX_TESTNET')
-        dry_run = _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
+        testnet = _runtime_testnet_enabled()
+        dry_run = _runtime_dry_run_enabled()
 
         binance_snapshot = _snapshot('binance', reserve_binance, testnet, dry_run)
         okx_snapshot = _snapshot('okx', reserve_okx, testnet, dry_run)
@@ -2902,6 +2902,15 @@ import time
 def _env_flag(name: str, default: bool = False) -> bool:
     return shared_env_flag(name, default)
 
+
+def _runtime_testnet_enabled() -> bool:
+    return _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET') or _env_flag('OKX_TESTNET')
+
+
+def _runtime_dry_run_enabled() -> bool:
+    return _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
+
+
 def _get_binance_client():
     try:
         if get_client is not None:
@@ -2915,7 +2924,7 @@ def _get_binance_client():
         api_key = os.getenv('BINANCE_API_KEY')
         api_secret = os.getenv('BINANCE_API_SECRET')
         if api_key and api_secret:
-            testnet = _env_flag('USE_BINANCE_TESTNET', False) or _env_flag('BINANCE_TESTNET', False)
+            testnet = _runtime_testnet_enabled()
             return create_binance_client(
                 {
                     'BINANCE_API_KEY': api_key,
@@ -3400,7 +3409,7 @@ def api_strategy_state():
             cursor.execute("SELECT cdc_enabled, last_cdc_status, reserve_usdt, last_transition_at, sell_percent, exchange, okx_max_usdt, binance_max_usdt, reserve_binance_usdt, reserve_okx_usdt, half_sell_policy, sell_percent_binance, sell_percent_okx FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
             row = cursor.fetchone()
         if not row:
-            return jsonify({'cdc_enabled': False, 'last_cdc_status': None, 'reserve_usdt': 0.0, 'reserve_binance_usdt': 0.0, 'reserve_okx_usdt': 0.0, 'last_transition_at': None, 'sell_percent': 50, 'exchange': 'binance', 'okx_max_usdt': float(os.getenv('OKX_MAX_USDT') or 10.0), 'binance_max_usdt': float(os.getenv('BINANCE_MAX_USDT') or 0.0), 'half_sell_policy': 'auto_proportional', 'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'), 'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')})
+            return jsonify({'cdc_enabled': False, 'last_cdc_status': None, 'reserve_usdt': 0.0, 'reserve_binance_usdt': 0.0, 'reserve_okx_usdt': 0.0, 'last_transition_at': None, 'sell_percent': 50, 'exchange': 'binance', 'okx_max_usdt': float(os.getenv('OKX_MAX_USDT') or 10.0), 'binance_max_usdt': float(os.getenv('BINANCE_MAX_USDT') or 0.0), 'half_sell_policy': 'auto_proportional', 'testnet': _runtime_testnet_enabled(), 'dry_run': _runtime_dry_run_enabled()})
         # Build response with backward compatibility
         exchange = (row[5] or 'binance')
         sell_percent_global = int(row[4] or 50)
@@ -3446,12 +3455,12 @@ def api_strategy_state():
             'reserve_binance_usdt': float(row[8] or 0),
             'reserve_okx_usdt': float(row[9] or 0),
             'half_sell_policy': row[10] or 'auto_proportional',
-            'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'),
-            'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
+            'testnet': _runtime_testnet_enabled(),
+            'dry_run': _runtime_dry_run_enabled()
         })
     except Exception as e:
         logging.error(f"strategy_state error: {e}")
-        return jsonify({'cdc_enabled': False, 'reserve_usdt': 0.0, 'exchange': 'binance', 'error': str(e), 'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'), 'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')}), 200
+        return jsonify({'cdc_enabled': False, 'reserve_usdt': 0.0, 'exchange': 'binance', 'error': str(e), 'testnet': _runtime_testnet_enabled(), 'dry_run': _runtime_dry_run_enabled()}), 200
 
 @app.route('/api/strategy_update', methods=['POST'])
 @app.route('/api/strategy_update/', methods=['POST'])
@@ -3512,8 +3521,8 @@ def api_strategy_toggle():
         if mode == 'cdc_dca_v1':
             try:
                 notify_cdc_toggle(enabled, {
-                    'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET'),
-                    'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN'),
+                    'testnet': _runtime_testnet_enabled(),
+                    'dry_run': _runtime_dry_run_enabled(),
                 })
             except Exception as e:
                 logging.warning(f"CDC toggle notify failed: {e}")
@@ -3874,8 +3883,8 @@ def api_strategy_exchange():
         try:
             from notify import notify_exchange_changed
             flags = {
-                'testnet': _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET') or _env_flag('OKX_TESTNET'),
-                'dry_run': _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
+                'testnet': _runtime_testnet_enabled(),
+                'dry_run': _runtime_dry_run_enabled()
             }
             notify_exchange_changed(exchange, flags)
         except Exception as ne:
@@ -3906,8 +3915,8 @@ def api_reserve_transfer():
             return jsonify({'ok': False, 'error': 'amount_must_be_positive'}), 400
 
         note = str(data.get('note') or '').strip() or None
-        testnet = _env_flag('USE_BINANCE_TESTNET') or _env_flag('BINANCE_TESTNET') or _env_flag('OKX_TESTNET')
-        dry_run = _env_flag('STRATEGY_DRY_RUN') or _env_flag('DRY_RUN')
+        testnet = _runtime_testnet_enabled()
+        dry_run = _runtime_dry_run_enabled()
 
         new_value = 0.0
         if exchange == 'global':
