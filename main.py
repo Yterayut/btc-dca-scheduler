@@ -3,7 +3,6 @@ import json
 import logging
 import time
 from logging.handlers import RotatingFileHandler
-import MySQLdb
 import asyncio
 import threading
 import socket
@@ -12,7 +11,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from binance.exceptions import BinanceAPIException
 from datetime import datetime, timedelta
 from pytz import timezone, utc
-from tenacity import retry, stop_after_attempt, wait_exponential
 import requests
 from collections.abc import Sequence
 from notify import (
@@ -52,8 +50,8 @@ from strategies.s4_observability import (
 )
 from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from contextlib import contextmanager
 from services.bootstrap import create_binance_client, env_flag, load_required_env_vars
+from services.db import db_transaction as _db_transaction, get_db_connection as _get_db_connection
 
 try:
     from utils import get_btc_price, get_gold_price
@@ -624,58 +622,11 @@ def start_health_check():
         logging.error(f"Failed to start health check server on port {port}: {e}")
         return None
 
-# MySQL connection with retry
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_db_connection():
-    """Connect to MySQL database with retry mechanism.
+    return _get_db_connection()
 
-    Returns:
-        MySQLdb.connection: Database connection object.
-    """
-    try:
-        db = MySQLdb.connect(
-            host=required_env_vars['DB_HOST'],
-            user=required_env_vars['DB_USER'],
-            passwd=required_env_vars['DB_PASSWORD'],
-            db=required_env_vars['DB_NAME'],
-            charset='utf8'
-        )
-        cursor = db.cursor()
-        cursor.execute("SELECT 1")
-        cursor.close()
-        return db
-    except MySQLdb.OperationalError as e:
-        logging.error(f"Database connection error: {e}")
-        raise
-
-@contextmanager
 def db_transaction():
-    """Context manager for DB cursor with automatic commit/rollback."""
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        yield cursor, conn
-        conn.commit()
-    except Exception:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise
-    finally:
-        try:
-            if cursor:
-                cursor.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
+    return _db_transaction()
 
 
 def fetch_schedule_context(schedule_id: int) -> dict:
