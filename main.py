@@ -9,10 +9,8 @@ import threading
 import socket
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from pytz import timezone, utc
 from tenacity import retry, stop_after_attempt, wait_exponential
 import requests
@@ -55,9 +53,7 @@ from strategies.s4_observability import (
 from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from contextlib import contextmanager
-
-# Load environment variables
-load_dotenv()
+from services.bootstrap import create_binance_client, env_flag, load_required_env_vars
 
 try:
     from utils import get_btc_price, get_gold_price
@@ -65,36 +61,15 @@ except Exception:
     get_btc_price = None
     get_gold_price = None
 
-# Validate environment variables
-required_env_vars = {
-    'DB_HOST': os.getenv('DB_HOST'),
-    'DB_USER': os.getenv('DB_USER'),
-    'DB_PASSWORD': os.getenv('DB_PASSWORD'),
-    'DB_NAME': os.getenv('DB_NAME'),
-    'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY'),
-    'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET')
-}
-missing_vars = [key for key, value in required_env_vars.items() if value is None]
-if missing_vars:
-    raise ValueError(f"Missing environment variables: {', '.join(missing_vars)}")
+required_env_vars = load_required_env_vars()
 
-# Binance client setup (supports Testnet)
 def _env_flag(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+    return env_flag(name, default)
 
 USE_TESTNET = _env_flag('USE_BINANCE_TESTNET', False) or _env_flag('BINANCE_TESTNET', False) or _env_flag('OKX_TESTNET', False)
 DRY_RUN = _env_flag('STRATEGY_DRY_RUN', False) or _env_flag('DRY_RUN', False)
 
-client = Client(
-    required_env_vars['BINANCE_API_KEY'],
-    required_env_vars['BINANCE_API_SECRET'],
-    testnet=USE_TESTNET,
-    requests_params={'timeout': 15},
-    ping=False,
-)
+client = create_binance_client(required_env_vars, testnet=USE_TESTNET)
 
 def is_dry_run() -> bool:
     return DRY_RUN
