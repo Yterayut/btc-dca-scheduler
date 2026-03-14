@@ -1,6 +1,6 @@
 Project Memory — BTC DCA Dashboard
 
-Updated: 2025-12-22
+Updated: 2026-03-12
 
 Summary
 - Stack: Python 3 + Flask + Flask-SocketIO + MySQL + Binance SDK.
@@ -8,6 +8,95 @@ Summary
 - Templates: templates/index.html (new UI), templates/admin.html.
 - Scheduler/worker: main.py (trading engine, health server via env HEALTH_CHECK_PORT).
 - Ops hardening (Dec-2025): scheduler DB lock + distributed dedupe + dedupe cleanup + S4 hardening gates + S4 OKX execution hardening.
+
+2026-03-12 — S4 Observability Alignment (PRD rollout)
+
+Done
+- Implemented `docs/s4-observability-alignment-plan.md` Phase A/B/C in code.
+- Added helper module `strategies/s4_observability.py`:
+  - `parse_bool`, `normalize_reason_filter`, `derive_shadow_decision`
+  - `next_unlock_from_gate_reason`, `mismatch_severity`
+- `main.py` updates:
+  - shadow gate now returns `next_unlock_condition` + `next_unlock_min_days`
+  - runtime mismatch tracking: `analytics_runtime_mismatch`, `mismatch_streak_days`, `mismatch_severity`
+  - throttled `notify_security_alert` for mismatch severity `warn/critical`
+  - heartbeat metadata now includes mismatch + unlock diagnostics
+- `app.py` updates:
+  - `/s4` builder now exposes `signal_layers` (EOD vs runtime) + `why_not_flip`
+  - `/api/s4_shadow_swaps` now supports filters:
+    - `reason=all|heartbeat|plan`
+    - `decision=ALL|HOLD|SWAP_TO_BTC|SWAP_TO_XAU`
+    - `include_mismatch=true|false`
+  - added `/api/s4_shadow_swaps_summary` (30/60/90-day operator summary)
+- `templates/s4_status.html` updates:
+  - new `Signal Layers` card with `MATCH/MISMATCH` badge
+  - new `Why Not Flip` section (gate reason + unlock condition)
+  - shadow table now shows decision/unlock/mismatch columns
+- Test updates:
+  - added `tests/test_s4_observability.py`
+  - adjusted `tests/test_notify_holdings.py` assertion for CDC label variants
+- Verification:
+  - `py_compile` pass
+  - targeted S4 tests pass
+  - full suite pass: `84 passed`
+- Runtime reload:
+  - `systemctl restart` required root, so processes were reloaded via `pkill` and service auto-restart
+  - confirmed new endpoints/UI live on port `5001`
+
+To do (next)
+- Observe shadow heartbeat daily for 90-day window and review `gate_*` blocking distribution.
+- Add CSV export endpoint (or script) for `/api/s4_shadow_swaps_summary` for monthly ops reporting.
+- Add integration tests for `/api/s4_shadow_swaps` filtering and `/s4` signal-layer rendering.
+- Monitor mismatch alerts for noise; tune throttle intervals if alerts are too frequent.
+- Keep execution unchanged: `S4_SWAP_EXEC_ENABLED=false`, run shadow-only until next decision review.
+
+2026-03-12 (later) — Unlock Fallback Fix + Live Validation
+
+Done
+- Fixed `/s4` and `/api/s4_shadow_swaps` to compute `next_unlock_condition` and `next_unlock_min_days` even when old heartbeat rows do not contain these fields.
+- Added fallback calculation from gate reason via `next_unlock_from_gate_reason(...)` in `app.py`.
+- Live page now correctly shows:
+  - `Why Not Flip: gate_cdc_up_required`
+  - `Next Unlock: 3 day(s)`
+  - `cdc_status must be up for 3 consecutive days`
+- Verified shadow table unlock column now matches gate policy.
+- Regression checks re-run successfully after fix:
+  - targeted S4 tests: pass
+  - full suite: `84 passed`
+
+To do (next refinement)
+- Decide mismatch severity policy for lagged analytics:
+  - current behavior can escalate to `CRITICAL` at streak >= 5 even when `eod_lag_days > 0`.
+  - consider cap (`INFO/WARN`) while lag > 0, and reserve `CRITICAL` for lag=0 divergence.
+- After policy decision, update `mismatch_severity(...)` and add explicit unit tests for lag-aware escalation.
+
+2026-03-13 — Mismatch Alert Noise Fix + Mobile Codex Session QoL
+
+Done
+- Fixed mismatch streak inflation bug in `main.py`:
+  - old logic incremented streak every scheduler tick (~5m)
+  - new logic counts by EOD date key only (`daily_eod` mode + `mismatch_last_counted_date`)
+- Updated severity policy in `strategies/s4_observability.py`:
+  - when `eod_lag_days > 0`, severity is capped to `INFO/WARN` (no `CRITICAL` from lagged snapshot mismatch)
+  - `CRITICAL` reserved for sustained mismatch with fresh analytics (`lag=0`)
+- Added/updated tests in `tests/test_s4_observability.py` for new lag-aware severity rules.
+- Added streak debug visibility:
+  - runtime now records `mismatch_streak_event`
+  - `/s4` Signal Layers shows `Event: ...` (e.g., `mismatch_detected`, `match_recovered_reset`, etc.)
+- Live validation after reload:
+  - `/s4` now shows realistic streak (e.g., `1d`) instead of inflated values (`254d+`)
+  - mismatch severity no longer escalates to false critical on lagged EOD snapshots
+- Full regression pass after change: `85 passed`.
+
+Mobile/SSH workflow improvement (operator QoL)
+- Added `dca` function in `~/.bashrc`:
+  - attaches existing tmux session `codex-dca` or creates new session in `~/yterayut-project/DCA` and starts `codex`
+- Verified from mobile terminal: entering `dca` opens/restores Codex session successfully.
+
+To do (next)
+- Optionally refine `mismatch_streak_event` vocabulary for operator readability (map internal tokens -> friendly labels).
+- Add integration test coverage for `/s4` rendering of `Event:` line and mismatch lifecycle transitions.
+- Keep monitoring LINE security alerts for 1-2 weeks to confirm noise level is acceptable after lag-aware severity cap.
 
 2025-12-22 — Ops Completion: Systemd + Heartbeat + S4 Status + Restore Drill
 
@@ -506,3 +595,104 @@ What changed
 Next steps / reminders
 - พิจารณาแนบ holdings ใน endpoints อื่น (wallet/report) หรือ socket.io feed หากต้อง real-time มากขึ้น
 - Monitor LINE ข้อความว่า holdings บรรทัดใหม่ไม่ยาวเกิน และ OKX/ Binance API rate ไม่โดนเกินเพราะ cache TTL = 30s
+
+2026-02-12 — Bitkub PURE_DCA Fill Accuracy + Monitor Lessons
+
+What changed
+- เพิ่มโหมด `bitkub` ใน schedule flow ให้ซื้อ DCA BTC/THB ได้บน Bitkub และแสดงบนหน้า Active Schedules (mode badge + quote asset THB)
+- แก้ปัญหาเคส “ซื้อจริงแต่ระบบแจ้ง not filled”:
+  - เดิม adapter อาจตอบกลับเร็วเกินไป ทำให้ `executed_qty/cummulative_quote_qty` ยังไม่ครบ
+  - เพิ่ม fallback ใน `purchase_on_exchange` ให้ infer จาก balance delta (BTC/THB ก่อน-หลังซื้อ) เฉพาะเมื่อ fill fields ไม่ครบ
+- เพิ่ม logging/observability สำหรับการแจ้งเตือน LINE:
+  - log success/fail/exception ของ weekly notify ชัดเจน
+  - log Flex สำเร็จ (`Line flex sent successfully ...`)
+- ทำให้รองรับ `order_id` จาก Bitkub ที่ไม่ใช่ตัวเลข:
+  - เก็บ `order_id` ดิบไว้ใช้ใน notify/result
+  - insert DB เป็น `NULL` ใน `purchase_history.order_id` เมื่อ parse เป็น int ไม่ได้ เพื่อกัน insert พัง
+- เพิ่มการดึงราคา fill ให้ตรง exchange มากขึ้น:
+  - เพิ่ม `BitkubAdapter.get_order_execution_symbol(...)` (ใช้ `/api/v3/market/order-info`)
+  - ใน `purchase_on_exchange` จะ “ใช้ order-info ก่อน” (qty/avg_price/quote_spent/fee)
+  - ใช้ balance-delta fallback เฉพาะตอน order-info ใช้ไม่ได้
+
+Validated outcomes
+- รอบ schedule `#37` (15 THB): trigger สำเร็จ, ซื้อจริง, LINE Flex ส่งสำเร็จ
+- รอบ schedule `#39` (17 THB): trigger สำเร็จ และ log ยืนยันใช้ `Bitkub fill from order-info`
+- ราคา/qty ใน LINE Flex ตรงกับข้อความจาก Bitkub มากขึ้นอย่างชัดเจน
+- DB ยืนยันมี record ใน `purchase_history` สำหรับรอบที่ execute สำเร็จ
+
+Issue discovered during monitoring
+- พบเคส schedule พลาดรอบ (`#38 @ 13:25`) แม้ config ถูกต้อง
+- สาเหตุ: job ตรวจทุก 30 วินาที แต่เงื่อนไข match อนุญาต time diff แค่ 15 วินาที
+  - ตัวตรวจวิ่งที่วินาที `:22` และ `:52` จึงอาจพลาดนาทีเป้าหมาย
+
+Key learnings
+- สำหรับ exchange ที่ตอบรับคำสั่งเร็ว ควรแยก “accepted order” ออกจาก “filled execution” และมี fallback ที่ deterministic
+- การ monitor ต้องดูทั้ง 3 จุดพร้อมกัน: scheduler log, LINE delivery log, และ DB write
+- Scheduler timing window ต้องสัมพันธ์กับ polling interval ไม่เช่นนั้นจะเกิด false-miss แม้ผู้ใช้ตั้งเวลาถูกต้อง
+
+Follow-ups
+- ปรับ schedule matching ให้ไม่พลาดนาที (เช่น minute-based match หรือขยาย tolerance)
+- เพิ่ม metric/alert สำหรับ “matched but not persisted”, “persisted but notify failed”, และ “missed window”
+
+2026-03-07 — OKX_PURE_DCA Skip Root Cause + Email Notify Rollout
+
+What changed
+- Implemented SMTP email sending in `notify.py` and wired email notifications for successful trade events (in addition to LINE):
+  - `notify_weekly_dca_buy`
+  - `notify_half_sell_executed`
+  - `notify_reserve_buy_executed`
+  - `notify_s4_dca_buy`
+  - `notify_s4_rotation`
+- Email is best-effort by design: failures do not break existing buy/sell flow or LINE notifications.
+- Added `.env.example` keys for email setup:
+  - `EMAIL_NOTIFICATIONS_ENABLED`, `TRADE_NOTIFY_EMAIL`
+  - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`
+  - `SMTP_USE_TLS`, `SMTP_USE_SSL`, `EMAIL_FROM`
+- Patched `send_email_notification()` fallback recipient lookup to include `TRADE_NOTIFY_EMAIL` (not just `EMAIL_TO`), fixing direct test call behavior.
+
+Validation (email)
+- Real send test succeeded: `EMAIL_TEST_RESULT True` after `.env` SMTP config was added.
+- Compile/smoke checks passed; scheduler process restarted and running.
+
+Operational issue investigated (OKX_PURE_DCA)
+- User reported repeated misses for schedule `#46`:
+  - `19:00`, `friday`, `10.00 USDT`, `okx_pure_dca`, active.
+- Findings from DB/logs:
+  - Scheduler matched at run time (`Matched schedule ID 46 at 19:00`).
+  - No `purchase_history` row for `schedule_id=46`.
+  - `action_dedupe` key was claimed for that run.
+  - New detailed log showed explicit guard reason:
+    - `DCA buy liquidity block (depth) ... reason=depth_insufficient`
+    - detail included `min_notional` (~240,840) below threshold (1,000,000).
+
+Root cause
+- `okx_pure_dca` was routed through `purchase_on_exchange()` using the same liquidity guards as normal modes.
+- This conflicted with expected semantics of “pure DCA buy every slot (ignore CDC-style gating)”.
+
+Fix applied (targeted, minimal impact)
+- In `purchase_on_exchange()` added conditional guard bypass when context marks mode as `okx_pure_dca`:
+  - Bypass `depth_guard`, `twap_guard`, `notional_cap` only for this mode.
+  - Keep existing behavior for all other modes unchanged.
+- Added explicit warning logs for bypass decisions to preserve traceability.
+
+Relevant code refs
+- `main.py`: guard bypass gate + logs around lines `2166`, `2188`, `2213`, `2233`.
+- `main.py`: detailed block reason logs added earlier around lines `2182`, `2202`, `2217`.
+- `notify.py`: SMTP implementation + trade email hooks + recipient fallback.
+
+Validation (OKX_PURE_DCA fix)
+- Mock smoke test confirmed:
+  - `okx_pure_dca` executes even when depth guard returns false.
+  - normal `okx` mode still skips with `depth_insufficient` (unchanged behavior).
+- Scheduler restarted after patch; `main.py` and `app.py` running.
+
+Known environment context
+- LINE channel frequently returns HTTP 429 (monthly limit reached), so relying on email notifications is now important for trade alerts.
+
+Next session checklist
+1. Monitor next `okx_pure_dca` schedule run and verify:
+   - `purchase_history` insert present
+   - LINE path may still 429, but email should send
+   - log should show either executed order or explicit exchange-side failure reason
+2. If exchange-side rejections appear (not guard-related), inspect OKX min notional / balance / API errors.
+3. Consider documenting mode semantics in UI help text to clarify guard behavior differences.

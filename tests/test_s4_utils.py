@@ -86,6 +86,13 @@ def test_cdc_status_from_series_detects_downtrend():
     assert status["status"] == "down"
 
 
+def test_get_s4_dca_target_asset():
+    assert s4_utils.get_s4_dca_target_asset("up") == "BTC"
+    assert s4_utils.get_s4_dca_target_asset("UP") == "BTC"
+    assert s4_utils.get_s4_dca_target_asset("down") == "GOLD"
+    assert s4_utils.get_s4_dca_target_asset(None) == "GOLD"
+
+
 def test_build_ratio_series_alignment():
     btc = [
         (1000, 20000.0),

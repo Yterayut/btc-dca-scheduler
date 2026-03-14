@@ -248,7 +248,7 @@
         }
         .wallet-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(3, minmax(180px, 1fr));
             gap: 1rem;
             margin-top: 1.5rem;
         }
@@ -1535,12 +1535,6 @@
                 <div class="summary-value" id="summary-capital-amount">0.00 USDT</div>
                 <div class="summary-subtitle">S4 status: <strong id="summary-s4-status">—</strong></div>
             </div>
-            <div class="summary-card summary-alerts">
-                <div class="summary-heading">Recent Alerts</div>
-                <ul id="summary-alert-list" class="summary-alert-list">
-                    <li style="opacity:0.65;">No recent alerts</li>
-                </ul>
-            </div>
         </div>
 
         <!-- Wallet & Reserves -->
@@ -1576,13 +1570,6 @@
                         <div class="stat-label">OKX Portfolio (USDT)</div>
                     </div>
                 </div>
-                <div class="wallet-item" data-threshold="10" data-key="wallet-okx-reserve">
-                    <div class="stat-card">
-                        <div class="stat-icon"><i class="fas fa-piggy-bank"></i></div>
-                        <div class="stat-value" id="wallet-okx-reserve">0.00</div>
-                        <div class="stat-label">OKX Reserve (USDT)</div>
-                    </div>
-                </div>
                 <div class="wallet-item" data-threshold="10" data-key="wallet-binance-usdt">
                     <div class="stat-card">
                         <div class="stat-icon"><i class="fas fa-wallet"></i></div>
@@ -1604,11 +1591,18 @@
                         <div class="stat-label">Binance Portfolio (USDT)</div>
                     </div>
                 </div>
-                <div class="wallet-item" data-threshold="10" data-key="wallet-binance-reserve">
+                <div class="wallet-item" data-threshold="50" data-key="wallet-bitkub-thb">
                     <div class="stat-card">
-                        <div class="stat-icon"><i class="fas fa-piggy-bank"></i></div>
-                        <div class="stat-value" id="wallet-binance-reserve">0.00</div>
-                        <div class="stat-label">Binance Reserve (USDT)</div>
+                        <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+                        <div class="stat-value" id="wallet-bitkub-thb">0.00</div>
+                        <div class="stat-label">Bitkub THB (free)</div>
+                    </div>
+                </div>
+                <div class="wallet-item" data-threshold="50" data-key="wallet-bitkub-value">
+                    <div class="stat-card">
+                        <div class="stat-icon"><i class="fas fa-coins"></i></div>
+                        <div class="stat-value" id="wallet-bitkub-value">0.00</div>
+                        <div class="stat-label">Bitkub Portfolio (THB)</div>
                     </div>
                 </div>
                 <div class="wallet-item" data-threshold="10" data-key="wallet-total-reserve">
@@ -1728,6 +1722,8 @@
                         <option value="all" selected>ALL</option>
                         <option value="global">GLOBAL</option>
                         <option value="pure_dca">PURE DCA</option>
+                        <option value="okx_pure_dca">OKX PURE DCA</option>
+                        <option value="bitkub">BITKUB</option>
                         <option value="binance">BINANCE</option>
                         <option value="okx">OKX</option>
                         <option value="both">BOTH</option>
@@ -1741,7 +1737,7 @@
                                         <th>ID</th>
                                         <th>Time</th>
                                         <th>Days</th>
-                                        <th>Amount (USDT)</th>
+                                        <th>Amount (QUOTE)</th>
                                         <th>Mode</th>
                                         <th>Split Amounts</th>
                                         <th>Next Run</th>
@@ -1762,7 +1758,9 @@
                                             <span class="btn btn-secondary btn-sm">{{ schedule[2] }}</span>
                                         </td>
                                         <td>
+                                            {% set quote_asset = 'THB' if row_mode == 'bitkub' else 'USDT' %}
                                             <span class="bitcoin-color font-bold">{{ schedule[3]|floatformat(2) }}</span>
+                                            <span class="badge">{{ quote_asset }}</span>
                                         </td>
                                         <td>
                                             <span class="badge">{{ row_mode|upper }}</span>
@@ -1770,8 +1768,10 @@
                                         <td>
                                             {% if row_mode == 's4' %}
                                                 <span class="badge">S4 Auto (active asset)</span>
-                                            {% elif row_mode == 'pure_dca' %}
+                                            {% elif row_mode == 'pure_dca' or row_mode == 'okx_pure_dca' %}
                                                 <span class="opacity-75">-</span>
+                                            {% elif row_mode == 'bitkub' %}
+                                                <span class="badge">Direct BTC/THB</span>
                                             {% elif schedule|length > 7 %}
                                                 <span class="badge">BZ: {{ schedule[6] if schedule[6] else 0.0 }}</span>
                                                 <span class="badge">OKX: {{ schedule[7] if schedule[7] else 0.0 }}</span>
@@ -1819,11 +1819,11 @@
                 </h2>
                 <form action="/add_schedule" method="POST" onsubmit="return validateAddForm(event)">
                     <div class="form-group">
-                        <label for="amount">
+                        <label for="amount" id="amount-label">
                             <i class="fas fa-dollar-sign"></i>
                             Amount to Purchase (USDT)
                         </label>
-                        <input type="number" name="amount" id="amount" class="form-control" step="0.01" required placeholder="Enter amount in USDT">
+                        <input type="number" name="amount" id="amount" class="form-control" step="0.01" required placeholder="Enter amount">
                     </div>
                     
                     <div class="form-group">
@@ -1868,6 +1868,8 @@
                     <select id="ex-mode" name="exchange_mode" class="form-control" style="max-width:220px;">
                         <option value="global" selected>Global (use Strategy exchange)</option>
                         <option value="pure_dca">Pure DCA (no CDC)</option>
+                        <option value="okx_pure_dca">OKX Pure DCA (no CDC)</option>
+                        <option value="bitkub">Bitkub (BTC/THB)</option>
                         <option value="binance">Binance</option>
                         <option value="okx">OKX</option>
                         <option value="both">Both (split)</option>
@@ -1911,6 +1913,7 @@
                         <option value="all">All</option>
                         <option value="binance">Binance</option>
                         <option value="okx">OKX</option>
+                        <option value="bitkub">Bitkub</option>
                     </select>
                     <button class="btn btn-secondary btn-sm" onclick="exportPurchaseHistory()">
                         <i class="fas fa-file-export"></i>
@@ -1922,16 +1925,19 @@
                         <thead>
                             <tr>
                                 <th>Time</th>
-                                <th>USDT</th>
+                                <th>Quote</th>
                                 <th>BTC</th>
                                 <th>Price</th>
-                                <th>Fee (USDT)</th>
+                                <th>Fee</th>
+                                <th>Exchange</th>
                                 <th>Order ID</th>
                                 <th>Schedule</th>
                             </tr>
                         </thead>
                         <tbody id="history-table">
                             {% for record in history %}
+                            {% set row_exchange = (record[10] or '')|lower %}
+                            {% set row_quote_asset = 'THB' if row_exchange == 'bitkub' else 'USDT' %}
                             <tr>
                                 <td>
                                     <i class="fas fa-calendar"></i>
@@ -1939,6 +1945,7 @@
                                 </td>
                                 <td>
                                     <span class="bitcoin-color font-bold">{{ record[2]|floatformat(2) if record[2] else '0.00' }}</span>
+                                    <span class="badge">{{ row_quote_asset }}</span>
                                 </td>
                                 <td>
                                     <span class="font-bold">{{ record[3]|floatformat(8) if record[3] else '0.00000000' }}</span>
@@ -1947,12 +1954,15 @@
                                     <span class="font-bold">฿{{ record[4]|floatformat(2) if record[4] else '0.00' }}</span>
                                 </td>
                                 <td>
-                                    {% if record[8] and record[8] != 0 %}
-                                        <span class="font-bold">{{ record[8]|floatformat(4) }}</span>
-                                        <span class="badge">{{ record[9] or 'USDT' }}</span>
+                                    {% if (record[11] and record[11] != 0) or (record[8] and record[8] != 0) %}
+                                        <span class="font-bold">{{ (record[11] if record[11] else record[8])|floatformat(4) }}</span>
+                                        <span class="badge">{{ record[9] or row_quote_asset }}</span>
                                     {% else %}
                                         <span class="opacity-75">-</span>
                                     {% endif %}
+                                </td>
+                                <td>
+                                    <span class="badge">{{ (row_exchange if row_exchange else 'binance')|upper }}</span>
                                 </td>
                                 <td>
                                     <code style="font-size: 0.75rem;">{{ record[5] if record[5] else 'N/A' }}</code>
@@ -1967,7 +1977,7 @@
                             </tr>
                             {% else %}
                             <tr>
-                                <td colspan="6" class="text-center opacity-75">
+                                <td colspan="8" class="text-center opacity-75">
                                     <i class="fas fa-inbox"></i>
                                     No purchase history yet
                                 </td>
@@ -2171,6 +2181,34 @@
                     <div class="s4-config-actions">
                         <button class="btn btn-primary btn-sm" id="save-s4-config"><i class="fas fa-save"></i> Save</button>
                         <span id="s4-config-note" class="s4-config-note">Admin token required for updates.</span>
+                    </div>
+                </div>
+            </div>
+            <div id="strategy-detail-bitkub" class="strategy-detail hidden">
+                <div class="strategy-header-bar">
+                    <div class="title-block">
+                        <h2 style="margin:0; display:flex; align-items:center; gap:0.6rem;"><i class="fas fa-landmark"></i> Bitkub DCA Strategy</h2>
+                        <div class="strategy-meta-row" id="bitkub-meta-row"></div>
+                    </div>
+                    <div id="bitkub-status-badges" style="display:flex; gap:0.5rem; flex-wrap:wrap;"></div>
+                </div>
+                <div class="strategy-exchange-grid" id="bitkub-exchange-grid"></div>
+                <div class="two-column-grid">
+                    <div class="info-card">
+                        <div class="card-title"><i class="fas fa-sliders-h"></i> Market Constraints</div>
+                        <div class="card-body" id="bitkub-market-card"></div>
+                    </div>
+                    <div class="info-card">
+                        <div class="card-title"><i class="fas fa-clock"></i> Last Order</div>
+                        <div class="card-body" id="bitkub-last-order-card"></div>
+                    </div>
+                </div>
+                <div class="info-card" style="margin-top:1.25rem;">
+                    <div class="card-title"><i class="fas fa-info-circle"></i> Notes</div>
+                    <div class="card-body">
+                        <div>Execution: market buy on <code>BTC_THB</code> at each schedule time.</div>
+                        <div>CDC dependency: <strong>disabled</strong> (pure schedule mode).</div>
+                        <div class="meta" id="bitkub-error-note">Runtime checks will appear here.</div>
                     </div>
                 </div>
             </div>
@@ -2524,7 +2562,7 @@
             </div>
             <form id="edit-form" method="POST" onsubmit="return validateEditForm(event)">
                 <div class="form-group">
-                    <label for="edit-amount">
+                    <label for="edit-amount" id="edit-amount-label">
                         <i class="fas fa-dollar-sign"></i>
                         Amount to Purchase (USDT)
                     </label>
@@ -2568,6 +2606,8 @@
                     <select id="edit-ex-mode" name="exchange_mode" class="form-control" style="max-width:220px;">
                         <option value="global">Global</option>
                         <option value="pure_dca">Pure DCA (no CDC)</option>
+                        <option value="okx_pure_dca">OKX Pure DCA (no CDC)</option>
+                        <option value="bitkub">Bitkub (BTC/THB)</option>
                         <option value="binance">Binance</option>
                         <option value="okx">OKX</option>
                         <option value="both">Both</option>
@@ -2657,6 +2697,19 @@
         }
 
         // Form Validation
+        function updateAmountLabelByMode(mode, labelId, inputId) {
+            const labelEl = document.getElementById(labelId);
+            const inputEl = document.getElementById(inputId);
+            if (!labelEl || !inputEl) return;
+            if (mode === 'bitkub') {
+                labelEl.innerHTML = '<i class="fas fa-dollar-sign"></i> Amount to Purchase (THB)';
+                inputEl.placeholder = 'Enter amount in THB';
+            } else {
+                labelEl.innerHTML = '<i class="fas fa-dollar-sign"></i> Amount to Purchase (USDT)';
+                inputEl.placeholder = 'Enter amount in USDT';
+            }
+        }
+
         function validateAddForm(event) {
             const amount = document.getElementById('amount').value;
             const time = document.getElementById('time').value;
@@ -2687,6 +2740,7 @@
             if (mode === 'binance' && !(bz > 0)) { showAlert('Binance amount must be > 0', 'error'); event.preventDefault(); return false; }
             if (mode === 'okx' && !(ok > 0)) { showAlert('OKX amount must be > 0', 'error'); event.preventDefault(); return false; }
             if (mode === 'both' && !((bz + ok) > 0)) { showAlert('Both mode requires total amount > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'bitkub' && !(parseFloat(amount) >= 10)) { showAlert('Bitkub amount must be >= 10 THB', 'error'); event.preventDefault(); return false; }
 
             return true;
         }
@@ -2720,6 +2774,7 @@
             if (mode === 'binance' && !(bz > 0)) { showAlert('Binance amount must be > 0', 'error'); event.preventDefault(); return false; }
             if (mode === 'okx' && !(ok > 0)) { showAlert('OKX amount must be > 0', 'error'); event.preventDefault(); return false; }
             if (mode === 'both' && !((bz + ok) > 0)) { showAlert('Both mode requires total amount > 0', 'error'); event.preventDefault(); return false; }
+            if (mode === 'bitkub' && !(parseFloat(amount) >= 10)) { showAlert('Bitkub amount must be >= 10 THB', 'error'); event.preventDefault(); return false; }
 
             // Admin token for edit (optional)
             let token = sessionStorage.getItem('ADMIN_TOKEN');
@@ -2770,8 +2825,9 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
            if (m === 'both') { box.style.display=''; bz.disabled=false; ok.disabled=false; }
            else if (m === 'binance') { box.style.display=''; bz.disabled=false; ok.disabled=true; ok.value=''; }
            else if (m === 'okx') { box.style.display=''; bz.disabled=true; bz.value=''; ok.disabled=false; }
-            else if (m === 's4' || m === 'pure_dca') { box.style.display='none'; bz.disabled=true; ok.disabled=true; bz.value=''; ok.value=''; }
+            else if (m === 's4' || m === 'pure_dca' || m === 'okx_pure_dca' || m === 'bitkub') { box.style.display='none'; bz.disabled=true; ok.disabled=true; bz.value=''; ok.value=''; }
             else { box.style.display='none'; bz.disabled=false; ok.disabled=false; }
+            updateAmountLabelByMode(m, 'edit-amount-label', 'edit-amount');
         };
         exSel.onchange = apply; apply();
     }
@@ -3154,14 +3210,15 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
                     };
                     const okx = data.okx || {};
                     const binance = data.binance || {};
+                    const bitkub = data.bitkub || {};
                     setVal('wallet-okx-usdt', okx.usdt_free || 0, 2);
                     setVal('wallet-binance-usdt', binance.usdt_free || 0, 2);
                     setVal('wallet-okx-btc', okx.btc_free || 0, 8);
                     setVal('wallet-binance-btc', binance.btc_free || 0, 8);
                     setVal('wallet-okx-value', okx.portfolio_value || 0, 2);
                     setVal('wallet-binance-value', binance.portfolio_value || 0, 2);
-                    setVal('wallet-okx-reserve', okx.reserve || 0, 2);
-                    setVal('wallet-binance-reserve', binance.reserve || 0, 2);
+                    setVal('wallet-bitkub-thb', bitkub.quote_free || 0, 2);
+                    setVal('wallet-bitkub-value', bitkub.portfolio_value || 0, 2);
                     if (data.totals && typeof data.totals.reserve !== 'undefined') {
                         setVal('wallet-total-reserve', data.totals.reserve || 0, 2);
                     }
@@ -3303,8 +3360,11 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             if (exposureBreakdownEl) {
                 exposureBreakdownEl.textContent = `BTC ${btcPct.toFixed(1)}% (${Number(btcInfo.notional_usd || 0).toFixed(2)} USDT) • GOLD ${goldPct.toFixed(1)}% (${Number(goldInfo.notional_usd || 0).toFixed(2)} USDT)`;
             }
-            const activeAsset = runtime.active_asset ? String(runtime.active_asset).toUpperCase() : (statusText === 'UP' ? 'BTC' : (statusText === 'DOWN' ? 'GOLD' : '—'));
-            if (exposureActiveEl) exposureActiveEl.textContent = `Active Asset: ${activeAsset}`;
+            const holdingAsset = runtime.holding_asset
+                ? String(runtime.holding_asset).toUpperCase()
+                : (runtime.active_asset ? String(runtime.active_asset).toUpperCase() : (statusText === 'UP' ? 'BTC' : (statusText === 'DOWN' ? 'GOLD' : '—')));
+            const targetAsset = String(runtime.signal_target_asset || holdingAsset).toUpperCase();
+            if (exposureActiveEl) exposureActiveEl.textContent = `Holding: ${holdingAsset} • Target: ${targetAsset}`;
 
             if (capitalAmountEl) {
                 const capitalPool = Number(strategyStore.capitalPool || 0);
@@ -3504,22 +3564,32 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             const selected = getSelectedStrategy();
             const cdcSection = document.getElementById('strategy-detail-cdc');
             const s4Section = document.getElementById('strategy-detail-s4');
+            const bitkubSection = document.getElementById('strategy-detail-bitkub');
             if (!selected) {
                 if (cdcSection) cdcSection.classList.add('hidden');
                 if (s4Section) s4Section.classList.add('hidden');
+                if (bitkubSection) bitkubSection.classList.add('hidden');
                 return;
             }
             if (selected.id === 'cdc_dca_v1') {
                 if (cdcSection) cdcSection.classList.remove('hidden');
                 if (s4Section) s4Section.classList.add('hidden');
+                if (bitkubSection) bitkubSection.classList.add('hidden');
                 renderCdcSection(selected);
             } else if (selected.id === 's4_multi_leg') {
                 if (cdcSection) cdcSection.classList.add('hidden');
                 if (s4Section) s4Section.classList.remove('hidden');
+                if (bitkubSection) bitkubSection.classList.add('hidden');
                 renderS4Section(selected);
+            } else if (selected.id === 'bitkub_dca_v1') {
+                if (cdcSection) cdcSection.classList.add('hidden');
+                if (s4Section) s4Section.classList.add('hidden');
+                if (bitkubSection) bitkubSection.classList.remove('hidden');
+                renderBitkubSection(selected);
             } else {
                 if (cdcSection) cdcSection.classList.add('hidden');
                 if (s4Section) s4Section.classList.add('hidden');
+                if (bitkubSection) bitkubSection.classList.add('hidden');
             }
             renderStrategySummaryCards();
         }
@@ -3627,6 +3697,12 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             if (!hasData) {
                 const wallet = strategyStore.wallet && strategyStore.wallet[exchange];
                 if (wallet) {
+                    const quoteAsset = String(wallet.quote_asset || 'USDT').toUpperCase();
+                    const quoteTotal = Number(wallet.quote_free || 0) + Number(wallet.quote_locked || 0);
+                    if (quoteTotal) {
+                        lines.push(`<div>${quoteAsset}: ${formatNumber(quoteTotal, quoteAsset === 'THB' ? 2 : 2)}</div>`);
+                        hasData = true;
+                    }
                     const usdtTotal = Number(wallet.usdt_free || 0) + Number(wallet.usdt_locked || 0);
                     if (usdtTotal) {
                         lines.push(`<div>USDT: ${formatNumber(usdtTotal, 2)}</div>`);
@@ -3763,11 +3839,13 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             const metaRow = document.getElementById('s4-meta-row');
             if (metaRow) {
                 const runtime = selected.runtime || {};
-                const activeAsset = String(runtime.active_asset || 'BTC').toUpperCase();
+                const holdingAsset = String(runtime.holding_asset || runtime.active_asset || 'BTC').toUpperCase();
+                const targetAsset = String(runtime.signal_target_asset || holdingAsset).toUpperCase();
                 const lastRotation = runtime.last_flip_at || selected.last_run_at || 'n/a';
                 const signalSource = formatCdcSourceLabel(runtime.signal_source || 'binance_cdc');
                 metaRow.innerHTML = `
-                    <span><i class="fas fa-info-circle"></i> Active Asset: ${activeAsset}</span>
+                    <span><i class="fas fa-info-circle"></i> Holding: ${holdingAsset}</span>
+                    <span><i class="fas fa-bullseye"></i> Target: ${targetAsset}</span>
                     <span><i class="fas fa-broadcast-tower"></i> Source: ${signalSource}</span>
                     <span><i class="fas fa-clock"></i> Last Rotation: ${lastRotation}</span>
                 `;
@@ -3802,6 +3880,85 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             if (s4Badge) {
                 s4Badge.textContent = `S4 Trading: ${selected.enabled ? 'ON' : 'OFF'}`;
                 s4Badge.className = `badge ${selected.enabled ? 'badge-success' : 'badge-danger'}`;
+            }
+        }
+
+        function renderBitkubSection(selected) {
+            const runtime = selected.runtime || {};
+            const metaRow = document.getElementById('bitkub-meta-row');
+            if (metaRow) {
+                const lastRun = runtime.last_order?.time || selected.last_run_at || 'n/a';
+                const schedules = Number(runtime.active_schedules || 0);
+                const totalThb = Number(runtime.active_total_thb || 0);
+                metaRow.innerHTML = `
+                    <span><i class="fas fa-clock"></i> Last Run: ${lastRun}</span>
+                    <span><i class="fas fa-calendar-alt"></i> Active Schedules: ${schedules}</span>
+                    <span><i class="fas fa-coins"></i> Planned THB: ${formatNumber(totalThb, 2)} THB</span>
+                `;
+            }
+
+            const badges = document.getElementById('bitkub-status-badges');
+            if (badges) {
+                const enabled = !!selected.enabled;
+                const apiReady = !!runtime.api_configured;
+                badges.innerHTML = `
+                    <span class="status-badge ${enabled ? 'up' : 'hold'}">Schedules: ${enabled ? 'ACTIVE' : 'IDLE'}</span>
+                    <span class="status-badge ${apiReady ? 'up' : 'down'}">API: ${apiReady ? 'READY' : 'MISSING'}</span>
+                    <span class="status-badge hold">Pair: BTC/THB</span>
+                `;
+            }
+
+            const exchangeGrid = document.getElementById('bitkub-exchange-grid');
+            if (exchangeGrid) {
+                const holdingsEntry = getHoldingsSnapshot('bitkub');
+                exchangeGrid.innerHTML = `
+                    <div class="exchange-column">
+                        <div class="exchange-column-header">
+                            <div class="exchange-name"><i class="fas fa-landmark"></i>BITKUB</div>
+                            <span class="gate-badge gate-open">Mode: PURE DCA</span>
+                        </div>
+                        <div class="info-card">
+                            <div class="card-title"><i class="fas fa-wallet"></i> Holdings</div>
+                            <div class="card-body">
+                                ${holdingsEntry.lines.join('')}
+                                <span class="meta">${holdingsEntry.meta}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const filters = runtime.market_filters || {};
+            const marketCard = document.getElementById('bitkub-market-card');
+            if (marketCard) {
+                marketCard.innerHTML = `
+                    <div>Min Notional: ${formatNumber(filters.min_notional || 0, 2)} THB</div>
+                    <div>Tick Size: ${formatNumber(filters.tick_size || 0, 8)}</div>
+                    <div>Step Size: ${formatNumber(filters.step_size || 0, 8)}</div>
+                    <div>Min Qty: ${formatNumber(filters.min_qty || 0, 8)} BTC</div>
+                `;
+            }
+
+            const lastOrder = runtime.last_order || null;
+            const lastOrderCard = document.getElementById('bitkub-last-order-card');
+            if (lastOrderCard) {
+                if (!lastOrder) {
+                    lastOrderCard.innerHTML = '<div class="meta">No Bitkub order yet.</div>';
+                } else {
+                    lastOrderCard.innerHTML = `
+                        <div>Time: ${lastOrder.time || 'n/a'}</div>
+                        <div>Spend: ${formatNumber(lastOrder.quote_amount || 0, 2)} ${lastOrder.quote_asset || 'THB'}</div>
+                        <div>Filled: ${formatNumber(lastOrder.filled_btc || 0, 8)} BTC</div>
+                        <div>Avg Price: ${formatNumber(lastOrder.avg_price || 0, 2)} THB</div>
+                        <div>Fee: ${formatNumber(lastOrder.fee_amount || 0, 4)} ${lastOrder.fee_asset || 'THB'}</div>
+                        <div class="meta">Order ID: ${lastOrder.order_id || 'n/a'}</div>
+                    `;
+                }
+            }
+
+            const errNote = document.getElementById('bitkub-error-note');
+            if (errNote) {
+                errNote.textContent = runtime.last_error ? `Runtime warning: ${runtime.last_error}` : 'Runtime checks healthy.';
             }
         }
 
@@ -3858,6 +4015,8 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
             if (selected && selected.id === 's4_multi_leg') {
                 const cfgExchange = String(selected.metadata?.config?.exchange || 'okx').toUpperCase();
                 activeExchange = cfgExchange;
+            } else if (selected && selected.id === 'bitkub_dca_v1') {
+                activeExchange = 'BITKUB';
             }
             const reserves = strategyStore.reserves || {};
             const totalReserve = Number(reserves.total || (Number(reserves.binance || 0) + Number(reserves.okx || 0)) || 0);
@@ -3887,11 +4046,6 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
                     <div class="label">FEES (BUY / SELL)</div>
                     <div class="value">${formatNumber(buyFees, 2)} / ${formatNumber(sellFees, 2)}</div>
                     <div class="meta">Updated ${feeAge}</div>
-                </div>
-                <div class="global-summary-card">
-                    <div class="label">RECENT ALERTS</div>
-                    <div class="value">${topAlert ? topAlert.label : 'None'}</div>
-                    <div class="meta">${topAlert ? topAlert.time : 'No alerts captured'}</div>
                 </div>
             `;
             renderStrategyStatusChips();
@@ -4966,8 +5120,9 @@ function openEditModal(id, time, days, amount, isActive, exMode, bzAmt, okxAmt) 
                 if (m === 'both') { exBox.style.display = ''; bz.disabled = false; okx.disabled = false; }
                 else if (m === 'binance') { exBox.style.display = ''; bz.disabled = false; okx.disabled = true; okx.value=''; }
                 else if (m === 'okx') { exBox.style.display = ''; bz.disabled = true; bz.value=''; okx.disabled = false; }
-                else if (m === 's4' || m === 'pure_dca') { exBox.style.display = 'none'; bz.disabled = true; okx.disabled = true; if (bz) bz.value=''; if (okx) okx.value=''; }
+                else if (m === 's4' || m === 'pure_dca' || m === 'okx_pure_dca' || m === 'bitkub') { exBox.style.display = 'none'; bz.disabled = true; okx.disabled = true; if (bz) bz.value=''; if (okx) okx.value=''; }
                 else { exBox.style.display = 'none'; if (bz) bz.disabled=false; if (okx) okx.disabled=false; }
+                updateAmountLabelByMode(m, 'amount-label', 'amount');
             };
             modeSel.addEventListener('change', applyMode);
             applyMode();

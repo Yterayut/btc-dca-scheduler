@@ -159,6 +159,8 @@ def _normalize_exchanges(exchanges: Sequence[str]) -> list[str]:
             key = "binance"
         elif slug.startswith("okx"):
             key = "okx"
+        elif slug.startswith("bitkub"):
+            key = "bitkub"
         else:
             raise ValueError(f"Unsupported exchange '{raw}'")
         unique.setdefault(key, None)

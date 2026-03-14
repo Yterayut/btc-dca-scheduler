@@ -15,6 +15,16 @@ _OKX_RATIO_CACHE: dict[str, Any] = {"data": None, "expires": 0}
 _OKX_RATIO_SERIES_CACHE: dict[str, Any] = {"data": None, "expires": 0}
 
 
+def get_s4_dca_target_asset(cdc_status: str | None) -> str:
+    """Return DCA target asset for S4 DCA-first lane.
+
+    Rule:
+    - CDC up   -> BTC
+    - CDC down -> GOLD
+    """
+    return "BTC" if str(cdc_status or "").lower() == "up" else "GOLD"
+
+
 def _clamp_ratio(value: float) -> float:
     return min(max(value, 0.0), 1.0)
 

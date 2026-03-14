@@ -2,6 +2,7 @@ import os
 from collections.abc import Sequence
 
 from .binance import BinanceAdapter
+from .bitkub import BitkubAdapter
 from .okx import OkxAdapter
 
 
@@ -9,6 +10,8 @@ def get_adapter(exchange: str | None = None, testnet: bool = False, dry_run: boo
     ex = (exchange or os.getenv("EXCHANGE") or "binance").strip().lower()
     if ex == "okx":
         return OkxAdapter(testnet=testnet, dry_run=dry_run)
+    if ex == "bitkub":
+        return BitkubAdapter(testnet=testnet, dry_run=dry_run)
     return BinanceAdapter(testnet=testnet, dry_run=dry_run)
 
 
@@ -38,7 +41,9 @@ def get_adapters(
             )
         elif slug == "okx" and "okx" not in adapters:
             adapters["okx"] = OkxAdapter(testnet=testnet, dry_run=dry_run, **adapter_kwargs)
+        elif slug == "bitkub" and "bitkub" not in adapters:
+            adapters["bitkub"] = BitkubAdapter(testnet=testnet, dry_run=dry_run, **adapter_kwargs)
         else:
-            if slug not in ("binance", "okx"):
+            if slug not in ("binance", "okx", "bitkub"):
                 raise ValueError(f"Unsupported exchange '{raw}'")
     return adapters

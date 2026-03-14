@@ -1,5 +1,11 @@
 import unittest
+import os
+import sys
 from unittest.mock import patch
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from notify import (
     _format_holdings_line,
@@ -113,8 +119,24 @@ class NotifyS4FormatTest(unittest.TestCase):
         self.assertIn('Amount: 15.00 USDT', message)
         self.assertIn('Qty: 0.003537 XAUT @ 4,240.00', message)
         self.assertIn('Schedule: #20', message)
-        self.assertIn('CDC: DOWN', message)
+        self.assertTrue(('CDC: DOWN' in message) or ('CDC Signal: DOWN' in message))
         self.assertIn('Mode: DRY RUN', message)
+
+    def test_s4_rotation_text_includes_holding_and_target(self):
+        payload = {
+            'timestamp': '2025-01-01T00:25:00Z',
+            'exchange': 'okx',
+            'amount_usd': 5000.0,
+            'holding_asset': 'BTC',
+            'target_asset': 'GOLD',
+            'cdc_status': 'down',
+        }
+        with patch('notify.flex_allowed', return_value=False), \
+                patch('notify.send_line_message_with_retry') as mock_send:
+            notify_s4_rotation(payload)
+        message = mock_send.call_args[0][0]
+        self.assertIn('Holding: BTC | Target: GOLD | 5,000.00 USDT', message)
+        self.assertIn('CDC Signal: DOWN', message)
 
 
 class NotifyFlexRoutingTest(unittest.TestCase):
@@ -214,8 +236,8 @@ class NotifyFlexRoutingTest(unittest.TestCase):
             'timestamp': '2025-01-01T00:25:00Z',
             'exchange': 'okx',
             'amount_usd': 5000.0,
-            'from': 'BTC',
-            'to': 'GOLD',
+            'holding_asset': 'BTC',
+            'target_asset': 'GOLD',
             'cdc_status': 'down',
         }
         with patch('notify.flex_allowed', return_value=True), \
@@ -224,6 +246,25 @@ class NotifyFlexRoutingTest(unittest.TestCase):
             notify_s4_rotation(payload)
         mock_flex.assert_called_once()
         mock_text.assert_not_called()
+
+    def test_s4_rotation_flex_sections_use_holding_and_target_labels(self):
+        payload = {
+            'timestamp': '2025-01-01T00:25:00Z',
+            'exchange': 'okx',
+            'amount_usd': 5000.0,
+            'holding_asset': 'BTC',
+            'target_asset': 'GOLD',
+            'cdc_status': 'down',
+        }
+        with patch('notify.flex_allowed', return_value=True), \
+                patch('notify.build_basic_bubble') as mock_bubble, \
+                patch('notify.make_flex_message', return_value={'altText': 'S4 Rotation'}), \
+                patch('notify.send_line_flex_with_retry', return_value=True), \
+                patch('notify._send_trade_email_best_effort', return_value=False):
+            notify_s4_rotation(payload)
+        sections = mock_bubble.call_args.args[1]
+        self.assertIn(('Holding', 'BTC'), sections)
+        self.assertIn(('Target', 'GOLD'), sections)
 
 if __name__ == '__main__':
     unittest.main()

@@ -82,6 +82,26 @@
         font-family: "Courier New", monospace;
         font-size: 0.95em;
       }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.92em;
+      }
+      th, td {
+        border-bottom: 1px solid var(--line);
+        padding: 8px 6px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        font-size: 0.75em;
+      }
     </style>
   </head>
   <body>
@@ -100,10 +120,11 @@
       <div class="card">
         <div class="row">
           <div>
-            <div class="label">Active Asset</div>
-            <div class="value {{ 'text-red' if data.active_asset == 'GOLD' else 'text-green' }}">
-              {{ data.active_asset }}
+            <div class="label">Holding Asset</div>
+            <div class="value {{ 'text-red' if data.holding_asset == 'GOLD' else 'text-green' }}">
+              {{ data.holding_asset or data.active_asset }}
             </div>
+            <div class="text-muted">target={{ data.signal_target_asset or data.holding_asset or data.active_asset }}</div>
             <div class="label" style="margin-top:5px;">Exchange</div>
             <div class="value">{{ data.exchange }}</div>
           </div>
@@ -114,6 +135,37 @@
             </div>
             <div class="label" style="margin-top:5px;">Signal Time</div>
             <div class="value time-format">{{ data.signal_time }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Signal Layers</h3>
+        {% set layers = data.signal_layers or {} %}
+        {% set eod = layers.eod or {} %}
+        {% set rt = layers.runtime or {} %}
+        {% set mismatch = layers.mismatch %}
+        {% set sev = (layers.mismatch_severity or 'match') | lower %}
+        <div class="row">
+          <div>
+            <div class="label">Alignment</div>
+            <div class="value {{ 'text-green' if not mismatch else ('text-red' if sev == 'critical' else 'text-yellow') }}">
+              {{ 'MATCH' if not mismatch else 'MISMATCH' }}
+            </div>
+            <div class="text-muted">Severity: {{ (layers.mismatch_severity or 'match') | upper }} | Streak: {{ layers.mismatch_streak_days or 0 }}d</div>
+            {% if layers.mismatch_streak_event %}
+            <div class="text-muted">Event: {{ layers.mismatch_streak_event }}</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="label">EOD Analytics</div>
+            <div class="value">{{ (eod.cdc_status_eod or 'n/a') | upper }} <span class="text-muted">({{ eod.asof_date or 'n/a' }})</span></div>
+            <div class="text-muted">state={{ eod.neutral_state_eod or 'n/a' }}, slope={{ (eod.slope_pct_eod or 0) | floatformat(2) }}%, gap={{ (eod.gap_pct_eod or 0) | floatformat(2) }}%, lag={{ eod.eod_lag_days or 0 }}d</div>
+          </div>
+          <div>
+            <div class="label">Runtime Production</div>
+            <div class="value">{{ (rt.cdc_status_runtime or 'n/a') | upper }} <span class="text-muted">({{ rt.signal_source_runtime or 'n/a' }})</span></div>
+            <div class="text-muted">holding={{ rt.holding_asset_runtime or rt.active_asset_runtime or 'n/a' }}, target={{ rt.signal_target_asset_runtime or 'n/a' }}, ts=<span class="time-format">{{ rt.runtime_ts_utc or 'N/A' }}</span></div>
           </div>
         </div>
       </div>
@@ -189,6 +241,26 @@
             <div class="value {{ 'text-yellow' if pending else 'text-green' }}">{{ streak }} / {{ days }}</div>
           </div>
         </div>
+        {% set wnf = data.why_not_flip or {} %}
+        {% if wnf.reason %}
+        <hr>
+        <div class="row">
+          <div>
+            <div class="label">Why Not Flip</div>
+            <div class="value text-yellow">{{ wnf.reason }}</div>
+            <div class="text-muted">{{ wnf.decision or 'HOLD' }} | {{ wnf.holding or '-' }} -> {{ wnf.target_asset or '-' }}</div>
+          </div>
+          <div>
+            <div class="label">Next Unlock</div>
+            <div class="value">{{ wnf.next_unlock_min_days or 0 }} day(s)</div>
+            <div class="text-muted">{{ wnf.next_unlock_condition or '-' }}</div>
+          </div>
+          <div>
+            <div class="label">Days Since Last Swap</div>
+            <div class="value">{{ wnf.days_since_last_swap or 0 }}</div>
+          </div>
+        </div>
+        {% endif %}
       </div>
 
       <div class="card">
@@ -221,6 +293,72 @@
             {% endif %}
           </div>
         </div>
+      </div>
+
+      <div class="card">
+        <h3>Shadow Swap Review</h3>
+        {% set ss = data.shadow_swap or {} %}
+        <div class="row">
+          <div>
+            <div class="label">Shadow Plans (90d)</div>
+            <div class="value">{{ ss.count_90d or 0 }}</div>
+          </div>
+          <div>
+            <div class="label">Last Shadow Plan</div>
+            {% if ss.last and ss.last.executed_at %}
+            <div class="value time-format">{{ ss.last.executed_at }}</div>
+            <div class="text-muted">
+              {{ ss.last.from_asset or '-' }} -> {{ ss.last.to_asset or '-' }}
+              | ${{ (ss.last.notional_usd or 0) | floatformat(2) }}
+            </div>
+            {% else %}
+            <div class="value">N/A</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="label">API</div>
+            <div class="value">
+              <a href="/api/s4_shadow_swaps?days=90&limit=200" target="_blank" rel="noopener noreferrer">/api/s4_shadow_swaps</a>
+            </div>
+          </div>
+        </div>
+        {% if ss.recent %}
+        <div class="table-wrap" style="margin-top: 8px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Route</th>
+                <th>Decision</th>
+                <th>Notional</th>
+                <th>CDC</th>
+                <th>Gate</th>
+                <th>Unlock</th>
+                <th>Mismatch</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in ss.recent %}
+              {% set meta = row.metadata_json or {} %}
+              <tr>
+                <td class="time-format">{{ row.executed_at }}</td>
+                <td>{{ row.from_asset or '-' }} -> {{ row.to_asset or '-' }}</td>
+                <td>{{ (meta.gate.decision if meta.gate else '-') }}</td>
+                <td>${{ (row.notional_usd or 0) | floatformat(2) }}</td>
+                <td>{{ (row.cdc_status or 'N/A') | upper }}</td>
+                <td>{{ (meta.gate.reason if meta.gate else row.reason) or '-' }}</td>
+                <td>{{ (meta.gate.next_unlock_condition if meta.gate else '-') or '-' }}</td>
+                <td>{{ 'YES' if meta.analytics_runtime_mismatch else 'NO' }}</td>
+                <td>{{ meta.signal_source or '-' }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="text-muted">No shadow swap entries yet.</div>
+        {% endif %}
       </div>
     </div>
 

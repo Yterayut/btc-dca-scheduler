@@ -1,7 +1,9 @@
 import os
 import logging
 import time
+import smtplib
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from typing import Iterable
 
 import requests
@@ -36,6 +38,8 @@ def _refresh_flex_settings() -> None:
 
 _refresh_flex_settings()
 
+DEFAULT_TRADE_NOTIFY_EMAIL = "yterayut@gmail.com"
+
 
 def flex_allowed(channel: str | None) -> bool:
     """Return True if Flex message delivery is permitted for a given channel."""
@@ -51,6 +55,7 @@ def flex_allowed(channel: str | None) -> bool:
 _EXCHANGE_LABELS = {
     'binance': 'Binance',
     'okx': 'OKX',
+    'bitkub': 'Bitkub',
 }
 
 _REASON_LABELS = {
@@ -171,6 +176,22 @@ def _channel_credentials() -> tuple[str | None, str | None]:
     return token, user_id
 
 
+def _trade_email_recipient() -> str:
+    value = os.getenv("TRADE_NOTIFY_EMAIL") or os.getenv("EMAIL_TO") or DEFAULT_TRADE_NOTIFY_EMAIL
+    return str(value).strip()
+
+
+def _send_trade_email_best_effort(subject: str, message: str) -> None:
+    try:
+        ok = send_email_notification(message=message, email=_trade_email_recipient(), subject=subject)
+        if ok:
+            logging.info("Trade email sent successfully subject=%s", subject[:120])
+        else:
+            logging.warning("Trade email not sent (disabled/misconfigured) subject=%s", subject[:120])
+    except Exception as exc:
+        logging.error("Trade email send failed subject=%s error=%s", subject[:120], exc)
+
+
 def _push_line_messages(messages: list[dict]) -> bool:
     url = "https://api.line.me/v2/bot/message/push"
     token, user_id = _channel_credentials()
@@ -195,10 +216,23 @@ def _push_line_messages(messages: list[dict]) -> bool:
         "messages": messages,
     }
 
+    msg_type = ''
+    alt_text = ''
+    try:
+        if messages:
+            msg_type = str(messages[0].get('type') or '')
+            alt_text = str(messages[0].get('altText') or '')
+    except Exception:
+        msg_type = ''
+        alt_text = ''
+
     response = requests.post(url, headers=headers, json=payload, timeout=15)
 
     if response.status_code == 200:
-        logging.info("Line message sent successfully")
+        if msg_type == 'flex':
+            logging.info("Line flex sent successfully altText=%s", alt_text[:120] if alt_text else '-')
+        else:
+            logging.info("Line message sent successfully")
         return True
     elif response.status_code == 401:
         logging.error("Line Bot API: Invalid access token")
@@ -373,8 +407,8 @@ def notify_s4_rotation(payload: dict) -> bool:
         amount = float(payload.get('amount_usd') or 0.0)
     except (TypeError, ValueError):
         amount = 0.0
-    from_leg = str(payload.get('from') or 'BTC').upper()
-    to_leg = str(payload.get('to') or 'GOLD').upper()
+    from_leg = str(payload.get('holding_asset') or payload.get('from') or 'BTC').upper()
+    to_leg = str(payload.get('target_asset') or payload.get('to') or 'GOLD').upper()
     cdc_status = str(payload.get('cdc_status') or 'unknown').upper()
     cdc_source = payload.get('signal_source')
     btc_price = payload.get('btc_price')
@@ -387,12 +421,14 @@ def notify_s4_rotation(payload: dict) -> bool:
     if not cdc_source and isinstance(notes, dict):
         cdc_source = notes.get('signal_source')
     cdc_display = _format_cdc_signal_text(cdc_status, cdc_source)
+    email_subject = f"DCA Trade Success: S4 Rotation {from_leg}->{to_leg} ({exchange})"
 
     if flex_allowed('s4_rotation'):
         sections: list[tuple[str, str]] = [
             ("Exchange", exchange),
             ("Amount", f"{amount:,.2f} USDT"),
-            ("Legs", f"{from_leg} → {to_leg}"),
+            ("Holding", from_leg),
+            ("Target", to_leg),
             ("CDC Signal", cdc_display),
         ]
         try:
@@ -461,12 +497,13 @@ def notify_s4_rotation(payload: dict) -> bool:
             bubble,
         )
         if send_line_flex_with_retry(flex_message):
+            _send_trade_email_best_effort(email_subject, flex_message.get('altText', 'S4 Rotation Triggered'))
             return True
         logging.warning("Flex send failed for S4 rotation; falling back to text message")
 
     lines = [
         "🔄 S4 Rotation Triggered",
-        f"{from_leg} → {to_leg} | {amount:,.2f} USDT",
+        f"Holding: {from_leg} | Target: {to_leg} | {amount:,.2f} USDT",
         f"CDC Signal: {cdc_display} | Exchange: {exchange}",
     ]
     try:
@@ -516,7 +553,9 @@ def notify_s4_rotation(payload: dict) -> bool:
                 pass
 
     message = "\n".join(lines)
-    return send_line_message_with_retry(message)
+    line_ok = send_line_message_with_retry(message)
+    _send_trade_email_best_effort(email_subject, message)
+    return line_ok
 
 
 def notify_s4_dca_buy(payload: dict) -> bool:
@@ -557,6 +596,7 @@ def notify_s4_dca_buy(payload: dict) -> bool:
     )
     meta_entries = _meta_entries(payload)
     cdc_display = _format_cdc_signal_text(cdc_status, cdc_source)
+    email_subject = f"DCA Trade Success: S4 DCA Buy {usdt:,.2f} USDT ({exchange})"
 
     if flex_allowed('s4_dca'):
         sections = [
@@ -610,6 +650,7 @@ def notify_s4_dca_buy(payload: dict) -> bool:
             bubble,
         )
         if send_line_flex_with_retry(flex_message):
+            _send_trade_email_best_effort(email_subject, flex_message.get('altText', 'S4 DCA Buy'))
             return True
         logging.warning("Flex send failed for S4 DCA buy; falling back to text message")
 
@@ -655,7 +696,10 @@ def notify_s4_dca_buy(payload: dict) -> bool:
         lines.append(holdings_line)
     lines.extend(meta_entries)
 
-    return send_line_message_with_retry("\n".join(lines))
+    message = "\n".join(lines)
+    line_ok = send_line_message_with_retry(message)
+    _send_trade_email_best_effort(email_subject, message)
+    return line_ok
 
 
 def notify_daily_heartbeat(payload: dict) -> bool:
@@ -1044,13 +1088,58 @@ def send_webhook_notification(message: str, webhook_url: str = None) -> bool:
         logging.error(f"Webhook notification error: {e}")
         return False
 
-def send_email_notification(message: str, email: str = None) -> bool:
+def send_email_notification(message: str, email: str = None, subject: str | None = None) -> bool:
     """
-    ส่งอีเมล notification (สำหรับอนาคต)
+    ส่งอีเมล notification ผ่าน SMTP (best effort)
     """
-    # TODO: Implement email notification using SMTP
-    print(f"📧 Email notification: {message}")
-    return True
+    if not _env_flag("EMAIL_NOTIFICATIONS_ENABLED", False):
+        return False
+
+    to_email = str(email or os.getenv("TRADE_NOTIFY_EMAIL") or os.getenv("EMAIL_TO") or "").strip()
+    if not to_email:
+        logging.warning("Email notification skipped: recipient missing")
+        return False
+
+    smtp_host = str(os.getenv("SMTP_HOST") or "").strip()
+    smtp_user = str(os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_password = str(os.getenv("SMTP_PASSWORD") or "").strip()
+    if not smtp_host or not smtp_user or not smtp_password:
+        logging.warning("Email notification skipped: SMTP config missing")
+        return False
+
+    try:
+        smtp_port = int(os.getenv("SMTP_PORT") or "587")
+    except ValueError:
+        smtp_port = 587
+
+    use_ssl = _env_flag("SMTP_USE_SSL", False)
+    use_tls = _env_flag("SMTP_USE_TLS", not use_ssl)
+    from_email = str(os.getenv("EMAIL_FROM") or smtp_user).strip()
+    mail_subject = str(subject or "DCA BTC Trade Notification").strip()
+
+    msg = EmailMessage()
+    msg["Subject"] = mail_subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(str(message or ""))
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+                server.ehlo()
+                if use_tls:
+                    server.starttls()
+                    server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        return True
+    except Exception as e:
+        logging.error("Email notification error: %s", e)
+        return False
 
 # ====== Strategy notifications (stubs ready to use) ======
 def notify_cdc_transition(prev_status: str, curr_status: str, *, window: str = "1D", timestamp=None) -> bool:
@@ -1099,6 +1188,7 @@ def notify_half_sell_executed(data: dict) -> bool:
     holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
     meta_entries = _meta_entries(data)
     cdc_status = data.get('cdc_status')
+    email_subject = f"DCA Trade Success: Half Sell {data.get('usdt', 0):,.2f} USDT ({exchange_label})"
 
     if flex_allowed('half_sell'):
         sections = [
@@ -1131,6 +1221,7 @@ def notify_half_sell_executed(data: dict) -> bool:
             bubble,
         )
         if send_line_flex_with_retry(flex_message):
+            _send_trade_email_best_effort(email_subject, flex_message.get('altText', 'Half-Sell Executed'))
             return True
         logging.warning("Flex send failed for half-sell executed; falling back to text message")
 
@@ -1148,7 +1239,10 @@ def notify_half_sell_executed(data: dict) -> bool:
     if holdings_line:
         lines.append(holdings_line)
     lines.extend(meta_entries)
-    return send_line_message_with_retry("\n".join(lines))
+    message = "\n".join(lines)
+    line_ok = send_line_message_with_retry(message)
+    _send_trade_email_best_effort(email_subject, message)
+    return line_ok
 
 def notify_half_sell_skipped(data: dict) -> bool:
     pct = data.get('pct')
@@ -1224,11 +1318,15 @@ def notify_weekly_dca_buy(data: dict) -> bool:
         data.get('holdings_meta'),
     )
     meta_entries = _meta_entries(data)
+    quote_amount = float(data.get('quote_amount', data.get('usdt', 0)) or 0)
+    quote_asset = str(data.get('quote_asset') or 'USDT').upper()
+    exchange_label = format_exchange_label(data.get('exchange'))
+    email_subject = f"DCA Trade Success: Weekly Buy {quote_amount:,.2f} {quote_asset} ({exchange_label})"
 
     if flex_allowed('weekly_dca'):
         sections = [
-            ("Exchange", format_exchange_label(data.get('exchange'))),
-            ("Amount", f"{data.get('usdt', 0):,.2f} USDT"),
+            ("Exchange", exchange_label),
+            ("Amount", f"{quote_amount:,.2f} {quote_asset}"),
             ("Filled", f"{data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}"),
             ("Schedule", f"#{schedule_label}"),
             ("Order", str(data.get('order_id', 'N/A'))),
@@ -1250,18 +1348,19 @@ def notify_weekly_dca_buy(data: dict) -> bool:
             footer_note="\n".join(footer_bits) if footer_bits else None,
         )
         flex_message = make_flex_message(
-            f"Weekly DCA Buy {data.get('usdt', 0):,.2f} USDT",
+            f"Weekly DCA Buy {quote_amount:,.2f} {quote_asset}",
             bubble,
         )
         if send_line_flex_with_retry(flex_message):
+            _send_trade_email_best_effort(email_subject, flex_message.get('altText', 'Weekly DCA Buy'))
             return True
         logging.warning("Flex send failed for weekly DCA buy; falling back to text message")
 
     lines = [
         "✅ Weekly DCA Buy",
         f"Time: {_utc_stamp(data.get('timestamp'))}",
-        f"Exchange: {format_exchange_label(data.get('exchange'))}",
-        f"Amount: {data.get('usdt', 0):,.2f} USDT",
+        f"Exchange: {exchange_label}",
+        f"Amount: {quote_amount:,.2f} {quote_asset}",
         f"Filled: {data.get('btc_qty', 0):.8f} BTC @ ฿{data.get('price', 0):,.2f}",
         f"Schedule: #{schedule_label}",
         f"Order: {data.get('order_id', 'N/A')}",
@@ -1271,7 +1370,10 @@ def notify_weekly_dca_buy(data: dict) -> bool:
     if holdings_line:
         lines.append(holdings_line)
     lines.extend(meta_entries)
-    return send_line_message_with_retry("\n".join(lines))
+    message = "\n".join(lines)
+    line_ok = send_line_message_with_retry(message)
+    _send_trade_email_best_effort(email_subject, message)
+    return line_ok
 
 def notify_weekly_dca_skipped(amount: float, reserve: float, context: dict | None = None) -> bool:
     amt = float(amount or 0.0)
@@ -1391,6 +1493,7 @@ def notify_reserve_buy_executed(data: dict) -> bool:
     cdc_status = data.get('cdc_status')
     holdings_line = _format_holdings_line(data.get('holdings'), data.get('holdings_meta'))
     meta_entries = _meta_entries(data)
+    email_subject = f"DCA Trade Success: Reserve Buy {data.get('spend', 0):,.2f} USDT ({exchange_label})"
 
     if flex_allowed('reserve_buy'):
         sections = [
@@ -1421,6 +1524,7 @@ def notify_reserve_buy_executed(data: dict) -> bool:
             bubble,
         )
         if send_line_flex_with_retry(flex_message):
+            _send_trade_email_best_effort(email_subject, flex_message.get('altText', 'Reserve Buy Executed'))
             return True
         logging.warning("Flex send failed for reserve buy executed; falling back to text message")
 
@@ -1438,7 +1542,10 @@ def notify_reserve_buy_executed(data: dict) -> bool:
     if holdings_line:
         lines.append(holdings_line)
     lines.extend(meta_entries)
-    return send_line_message_with_retry("\n".join(lines))
+    message = "\n".join(lines)
+    line_ok = send_line_message_with_retry(message)
+    _send_trade_email_best_effort(email_subject, message)
+    return line_ok
 
 def notify_reserve_buy_skipped_min_notional(data: dict) -> bool:
     timestamp = _utc_stamp(data.get('timestamp'))

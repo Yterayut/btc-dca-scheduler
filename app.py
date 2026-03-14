@@ -22,6 +22,13 @@ from exchanges.factory import get_adapter
 from main import increment_reserve, increment_reserve_exchange
 from compliance import fetch_events
 from services.balance_service import fetch_balances
+from strategies.s4_observability import (
+    derive_shadow_decision,
+    mismatch_severity,
+    next_unlock_from_gate_reason,
+    normalize_reason_filter,
+    parse_bool,
+)
 from decimal import Decimal
 from pathlib import Path
 
@@ -170,6 +177,37 @@ DEFAULT_STRATEGY_METADATA = {
             {'id': 'depth_guard', 'label': 'Depth Guard', 'status': 'pending', 'description': 'Requires aggregated order book depth >= 5M USDT within 1% bands.'},
             {'id': 'twap_guard', 'label': 'TWAP Guard', 'status': 'pending', 'description': 'Ensures TWAP deviation stays within configured tolerance before staging orders.'},
             {'id': 'notional_cap', 'label': 'Notional Cap', 'status': 'planning', 'description': 'Hard caps per asset to avoid oversizing during volatile sessions.'}
+        ]
+    },
+    'bitkub_dca_v1': {
+        'display_name': 'Bitkub THB DCA',
+        'short_name': 'BITKUB',
+        'description': 'Direct BTC/THB DCA on Bitkub. Buys every schedule run without CDC gate.',
+        'category': 'dca',
+        'status': 'active',
+        'allocation': {
+            'target_pct': 0.0,
+            'capital_source': 'thb_schedule_total',
+            'buckets': [
+                {'label': 'Scheduled THB DCA', 'target_pct': 100.0}
+            ]
+        },
+        'log_filters': [
+            {'id': 'bitkub', 'label': 'Bitkub Orders'},
+            {'id': 'schedule', 'label': 'Schedule Engine'}
+        ],
+        'help_overlay': {
+            'title': 'Bitkub DCA Overview',
+            'bullets': [
+                'Places market buy on BTC_THB at each active schedule time.',
+                'No CDC dependency in this mode.',
+                'Minimum order follows Bitkub market constraints.'
+            ],
+            'links': []
+        },
+        'guards': [
+            {'id': 'min_quote_guard', 'label': 'Minimum Quote Guard', 'status': 'active', 'description': 'Rejects order if amount is below market min quote size.'},
+            {'id': 'step_guard', 'label': 'Step/Tick Guard', 'status': 'active', 'description': 'Uses exchange filters for step size and price tick compatibility.'}
         ]
     }
 }
@@ -472,9 +510,24 @@ def _s4_confirm_streak(history: list[dict], status: str | None) -> int:
     return streak
 
 
+def _normalize_s4_runtime_aliases(runtime: dict | None) -> dict:
+    if not isinstance(runtime, dict):
+        return {}
+    normalized = dict(runtime)
+    holding_asset = normalized.get("holding_asset") or normalized.get("active_asset")
+    if holding_asset:
+        normalized["holding_asset"] = holding_asset
+        normalized["active_asset"] = holding_asset
+    target_asset = normalized.get("signal_target_asset") or holding_asset
+    if target_asset:
+        normalized["signal_target_asset"] = target_asset
+    return normalized
+
+
 def _build_s4_status_data() -> dict:
     data: dict = {
         "active_asset": "UNKNOWN",
+        "holding_asset": "UNKNOWN",
         "cdc_status": "N/A",
         "signal_source": "N/A",
         "signal_time": "N/A",
@@ -484,6 +537,15 @@ def _build_s4_status_data() -> dict:
         "last_status": {},
         "last_error": {},
         "last_rotation": {},
+        "shadow_swap": {"count_90d": 0, "last": {}, "recent": []},
+        "signal_layers": {
+            "eod": {},
+            "runtime": {},
+            "mismatch": False,
+            "mismatch_streak_days": 0,
+            "mismatch_severity": "match",
+        },
+        "why_not_flip": {},
     }
     with get_db_cursor() as (cursor, _):
         cursor.execute("SELECT * FROM strategy_state WHERE mode='s4_multi_leg' LIMIT 1")
@@ -502,14 +564,35 @@ def _build_s4_status_data() -> dict:
             except Exception:
                 metadata = {}
 
-        runtime = metadata.get("runtime") or {}
+        runtime = _normalize_s4_runtime_aliases(metadata.get("runtime") or {})
         config = metadata.get("config") or {}
         confirm_days = int(os.getenv("S4_CONFIRM_DAYS", "2") or 2)
+        holding_asset = runtime.get("holding_asset") or runtime.get("active_asset") or "UNKNOWN"
         data["exchange"] = str(config.get("exchange") or "okx").lower()
-        data["active_asset"] = runtime.get("active_asset") or "UNKNOWN"
+        data["active_asset"] = holding_asset
+        data["holding_asset"] = holding_asset
+        data["signal_target_asset"] = runtime.get("signal_target_asset") or holding_asset
         data["cdc_status"] = str(runtime.get("last_cdc_status") or "N/A").upper()
         data["signal_source"] = runtime.get("signal_source") or "N/A"
         data["signal_time"] = runtime.get("last_signal_at") or "N/A"
+        data["signal_layers"]["runtime"] = {
+            "layer": "runtime_production",
+            "runtime_ts_utc": runtime.get("last_signal_at") or "",
+            "cdc_status_runtime": str(runtime.get("last_cdc_status") or "").lower(),
+            "active_asset_runtime": holding_asset,
+            "holding_asset_runtime": holding_asset,
+            "signal_target_asset_runtime": runtime.get("signal_target_asset") or holding_asset,
+            "signal_source_runtime": runtime.get("signal_source") or "",
+            "mismatch_streak_event": str(runtime.get("mismatch_streak_event") or ""),
+            "last_confirmed_status": str(runtime.get("last_confirmed_status") or "").lower(),
+            "confirm_progress": {
+                "streak": min(
+                    _s4_confirm_streak(runtime.get("signal_history") or [], runtime.get("last_cdc_status")),
+                    max(confirm_days, 0),
+                ),
+                "required_days": confirm_days,
+            },
+        }
 
         exp = runtime.get("exposure") if isinstance(runtime, dict) else {}
         total_usd = _safe_float(exp.get("total_usd"), 0.0) if isinstance(exp, dict) else 0.0
@@ -571,6 +654,41 @@ def _build_s4_status_data() -> dict:
             ),
         }
 
+        cursor.execute(
+            """
+            SELECT date, cdc_status, state, slope_pct, ema_gap_pct, eod_lag_days
+            FROM s4_neutral_zone_eod
+            ORDER BY date DESC
+            LIMIT 1
+            """
+        )
+        eod_row = cursor.fetchone()
+        eod = {}
+        if eod_row:
+            eod_cols = [d[0] for d in cursor.description]
+            eod = dict(zip(eod_cols, eod_row))
+        eod_cdc = str((eod or {}).get("cdc_status") or "").lower()
+        runtime_cdc = str(runtime.get("last_cdc_status") or "").lower()
+        eod_lag_days = int(_safe_float((eod or {}).get("eod_lag_days"), 0.0))
+        mismatch = bool(eod_cdc and runtime_cdc and eod_cdc != runtime_cdc)
+        streak = int(_safe_float(runtime.get("mismatch_streak_days"), 0.0))
+        severity = mismatch_severity(mismatch=mismatch, eod_lag_days=eod_lag_days, streak=streak)
+        data["signal_layers"]["eod"] = {
+            "layer": "eod_analytics",
+            "asof_date": (eod or {}).get("date") or "",
+            "snapshot_ts_utc": "",
+            "cdc_status_eod": eod_cdc,
+            "neutral_state_eod": str((eod or {}).get("state") or ""),
+            "slope_pct_eod": _safe_float((eod or {}).get("slope_pct"), 0.0),
+            "gap_pct_eod": _safe_float((eod or {}).get("ema_gap_pct"), 0.0),
+            "eod_lag_days": eod_lag_days,
+        }
+        data["signal_layers"]["mismatch"] = mismatch
+        data["signal_layers"]["mismatch_streak_days"] = streak
+        data["signal_layers"]["mismatch_severity"] = severity
+        fallback_event = "mismatch_detected" if mismatch else "match_state"
+        data["signal_layers"]["mismatch_streak_event"] = str(runtime.get("mismatch_streak_event") or fallback_event)
+
         last_results = runtime.get("last_action_result")
         if isinstance(last_results, list) and last_results:
             res = last_results[0] if isinstance(last_results[0], dict) else {}
@@ -601,6 +719,81 @@ def _build_s4_status_data() -> dict:
         if rot_row:
             rot_cols = [d[0] for d in cursor.description]
             data["last_rotation"] = dict(zip(rot_cols, rot_row))
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM strategy_rotation_log
+            WHERE strategy_mode='s4_multi_leg'
+              AND reason IN ('shadow_swap_plan', 'shadow_swap_heartbeat')
+              AND executed_at >= (UTC_TIMESTAMP() - INTERVAL 90 DAY)
+            """
+        )
+        cnt_row = cursor.fetchone()
+        data["shadow_swap"]["count_90d"] = int((cnt_row or [0])[0] or 0)
+
+        cursor.execute(
+            """
+            SELECT executed_at, from_asset, to_asset, notional_usd, cdc_status, reason, metadata_json
+            FROM strategy_rotation_log
+            WHERE strategy_mode='s4_multi_leg'
+              AND reason IN ('shadow_swap_plan', 'shadow_swap_heartbeat')
+            ORDER BY executed_at DESC
+            LIMIT 10
+            """
+        )
+        recent_rows = cursor.fetchall() or []
+        cols = [d[0] for d in cursor.description]
+        recent: list[dict] = []
+        for row in recent_rows:
+            entry = dict(zip(cols, row))
+            meta_raw = entry.get("metadata_json")
+            if isinstance(meta_raw, str):
+                try:
+                    entry["metadata_json"] = json.loads(meta_raw)
+                except Exception:
+                    pass
+            meta_obj = entry.get("metadata_json") if isinstance(entry.get("metadata_json"), dict) else {}
+            gate_obj = meta_obj.get("gate") if isinstance(meta_obj.get("gate"), dict) else {}
+            if gate_obj:
+                gate_reason = str(gate_obj.get("reason") or entry.get("reason") or "")
+                if not gate_obj.get("next_unlock_condition") or gate_obj.get("next_unlock_min_days") is None:
+                    cond, min_days = next_unlock_from_gate_reason(
+                        gate_reason,
+                        btc_confirm_days=max(int(os.getenv("S4_SHADOW_BTC_CONFIRM_DAYS", "3") or 3), 0),
+                        xau_confirm_days=max(int(os.getenv("S4_SHADOW_XAU_CONFIRM_DAYS", "5") or 5), 0),
+                    )
+                    gate_obj["next_unlock_condition"] = cond
+                    gate_obj["next_unlock_min_days"] = min_days
+                meta_obj["gate"] = gate_obj
+                entry["metadata_json"] = meta_obj
+            recent.append(entry)
+        if recent:
+            data["shadow_swap"]["last"] = recent[0]
+            data["shadow_swap"]["recent"] = recent
+            latest_heartbeat = next((r for r in recent if str(r.get("reason") or "") == "shadow_swap_heartbeat"), recent[0])
+            hb_meta = latest_heartbeat.get("metadata_json") if isinstance(latest_heartbeat.get("metadata_json"), dict) else {}
+            hb_gate = hb_meta.get("gate") if isinstance(hb_meta, dict) and isinstance(hb_meta.get("gate"), dict) else {}
+            hb_reason = str(hb_gate.get("reason") or latest_heartbeat.get("reason") or "")
+            unlock_cond = hb_gate.get("next_unlock_condition")
+            unlock_days_raw = hb_gate.get("next_unlock_min_days")
+            if not unlock_cond or unlock_days_raw is None:
+                unlock_cond, unlock_days = next_unlock_from_gate_reason(
+                    hb_reason,
+                    btc_confirm_days=max(int(os.getenv("S4_SHADOW_BTC_CONFIRM_DAYS", "3") or 3), 0),
+                    xau_confirm_days=max(int(os.getenv("S4_SHADOW_XAU_CONFIRM_DAYS", "5") or 5), 0),
+                )
+            else:
+                unlock_days = int(_safe_float(unlock_days_raw, 0.0))
+            data["why_not_flip"] = {
+                "decision": hb_gate.get("decision") or "HOLD",
+                "reason": hb_reason,
+                "next_unlock_condition": unlock_cond,
+                "next_unlock_min_days": unlock_days,
+                "days_since_last_swap": int(_safe_float(hb_gate.get("days_since_last_swap"), 0.0)),
+                "holding": hb_gate.get("holding") or latest_heartbeat.get("from_asset"),
+                "target_asset": hb_gate.get("target_asset") or latest_heartbeat.get("to_asset"),
+            }
 
     return data
 
@@ -1180,7 +1373,7 @@ def migrate_data_if_needed():
                 db_name = os.getenv('DB_NAME')
                 if not has_col:
                     logging.info("Adding columns exchange_mode/binance_amount/okx_amount to schedules...")
-                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca') NOT NULL DEFAULT 'global' AFTER purchase_amount")
+                    cursor.execute("ALTER TABLE schedules ADD COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca','okx_pure_dca','bitkub') NOT NULL DEFAULT 'global' AFTER purchase_amount")
                     db.commit()
                 else:
                     try:
@@ -1192,9 +1385,14 @@ def migrate_data_if_needed():
                             (db_name,)
                         )
                         col_type = cursor.fetchone()
-                        if col_type and ('s4' not in (col_type[0] or '') or 'pure_dca' not in (col_type[0] or '')):
-                            logging.info("Extending schedules.exchange_mode enum to include 's4' and 'pure_dca'...")
-                            cursor.execute("ALTER TABLE schedules MODIFY COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca') NOT NULL DEFAULT 'global'")
+                        if col_type and (
+                            's4' not in (col_type[0] or '')
+                            or 'pure_dca' not in (col_type[0] or '')
+                            or 'bitkub' not in (col_type[0] or '')
+                            or 'okx_pure_dca' not in (col_type[0] or '')
+                        ):
+                            logging.info("Extending schedules.exchange_mode enum to include 's4', 'pure_dca', 'okx_pure_dca' and 'bitkub'...")
+                            cursor.execute("ALTER TABLE schedules MODIFY COLUMN exchange_mode ENUM('global','binance','okx','both','s4','pure_dca','okx_pure_dca','bitkub') NOT NULL DEFAULT 'global'")
                             db.commit()
                     except Exception as sub_exc:
                         logging.warning(f"Could not extend exchange_mode enum: {sub_exc}")
@@ -1494,6 +1692,8 @@ def get_total_active_amount():
                             WHEN exchange_mode = 'okx' THEN COALESCE(okx_amount,0)
                             WHEN exchange_mode = 's4' THEN COALESCE(purchase_amount,0)
                             WHEN exchange_mode = 'pure_dca' THEN COALESCE(purchase_amount,0)
+                            WHEN exchange_mode = 'okx_pure_dca' THEN COALESCE(purchase_amount,0)
+                            WHEN exchange_mode = 'bitkub' THEN COALESCE(purchase_amount,0)
                             ELSE COALESCE(purchase_amount,0)
                         END
                     ) AS total
@@ -1607,7 +1807,7 @@ def index():
             cursor.execute("""
                 SELECT ph.id, ph.purchase_time, ph.usdt_amount, ph.btc_quantity, 
                        ph.btc_price, ph.order_id, ph.schedule_id, s.schedule_time,
-                       ph.fee_buy_usdt, ph.fee_buy_asset
+                       ph.fee_buy_usdt, ph.fee_buy_asset, COALESCE(ph.exchange, ''), ph.fee_buy_asset_amount
                 FROM purchase_history ph
                 LEFT JOIN schedules s ON ph.schedule_id = s.id
                 ORDER BY ph.purchase_time DESC
@@ -1920,7 +2120,7 @@ def add_schedule():
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both','s4','pure_dca'):
+    if ex_mode not in ('global','binance','okx','both','s4','pure_dca','okx_pure_dca','bitkub'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:
@@ -1940,6 +2140,9 @@ def add_schedule():
             if (bz + ok) <= 0: raise ValueError()
         except Exception:
             flash('Both-mode requires total amount > 0', 'error'); return redirect('/')
+    elif ex_mode == 'bitkub':
+        if float_amount < 10:
+            flash('Bitkub amount must be >= 10 THB', 'error'); return redirect('/')
     schedule_day = ",".join([d.lower() for d in days])
 
     with get_db_cursor() as (cursor, db):
@@ -2016,7 +2219,7 @@ def edit_schedule(schedule_id):
 
     float_amount = float(amount) if amount is not None and amount != '' else 0.0
     # Validate exchange amounts
-    if ex_mode not in ('global','binance','okx','both','s4','pure_dca'):
+    if ex_mode not in ('global','binance','okx','both','s4','pure_dca','okx_pure_dca','bitkub'):
         flash('Invalid exchange mode', 'error'); return redirect('/')
     if ex_mode == 'binance':
         try:
@@ -2036,6 +2239,9 @@ def edit_schedule(schedule_id):
             if (bz + ok) <= 0: raise ValueError()
         except Exception:
             flash('Both-mode requires total amount > 0', 'error'); return redirect('/')
+    elif ex_mode == 'bitkub':
+        if float_amount < 10:
+            flash('Bitkub amount must be >= 10 THB', 'error'); return redirect('/')
     schedule_day = ",".join([d.lower() for d in days])
 
     with get_db_cursor() as (cursor, db):
@@ -2224,6 +2430,166 @@ def s4_status():
         logging.error(f"Error in /s4 route: {exc}")
         return render_template('s4_status.html', data={"error": str(exc)})
 
+
+@app.route('/api/s4_shadow_swaps')
+def api_s4_shadow_swaps():
+    """Return shadow swap plans for S4 (read-only diagnostics)."""
+    try:
+        limit_raw = request.args.get('limit', '100')
+        days_raw = request.args.get('days', '90')
+        reason_raw = request.args.get('reason', 'all')
+        decision_raw = str(request.args.get('decision', 'all') or 'all').strip().upper()
+        include_mismatch = parse_bool(request.args.get('include_mismatch'), False)
+        try:
+            limit = max(1, min(int(limit_raw), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            days = max(1, min(int(days_raw), 3650))
+        except (TypeError, ValueError):
+            days = 90
+        allowed_reasons = normalize_reason_filter(reason_raw)
+        if decision_raw not in {'ALL', 'HOLD', 'SWAP_TO_BTC', 'SWAP_TO_XAU'}:
+            decision_raw = 'ALL'
+
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT executed_at, from_asset, to_asset, notional_usd, cdc_status, reason, metadata_json
+                FROM strategy_rotation_log
+                WHERE strategy_mode='s4_multi_leg'
+                  AND reason IN ('shadow_swap_plan', 'shadow_swap_heartbeat')
+                  AND executed_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
+                ORDER BY executed_at DESC
+                LIMIT %s
+                """,
+                (days, limit),
+            )
+            rows = cursor.fetchall() or []
+            cols = [d[0] for d in cursor.description]
+
+        items: list[dict] = []
+        filtered_out_reason = 0
+        filtered_out_decision = 0
+        filtered_out_mismatch = 0
+        for row in rows:
+            entry = dict(zip(cols, row))
+            meta_raw = entry.get('metadata_json')
+            if isinstance(meta_raw, str):
+                try:
+                    entry['metadata_json'] = json.loads(meta_raw)
+                except Exception:
+                    pass
+            if str(entry.get('reason') or '') not in allowed_reasons:
+                filtered_out_reason += 1
+                continue
+
+            decision = derive_shadow_decision(entry).upper()
+            if decision_raw != 'ALL' and decision != decision_raw:
+                filtered_out_decision += 1
+                continue
+
+            meta = entry.get('metadata_json') if isinstance(entry.get('metadata_json'), dict) else {}
+            mismatch = bool((meta or {}).get('analytics_runtime_mismatch'))
+            if include_mismatch and not mismatch:
+                filtered_out_mismatch += 1
+                continue
+
+            gate = meta.get('gate') if isinstance(meta.get('gate'), dict) else {}
+            gate_reason = str(gate.get('reason') or entry.get('reason') or '')
+            unlock_cond = gate.get('next_unlock_condition')
+            unlock_days_raw = gate.get('next_unlock_min_days')
+            if not unlock_cond or unlock_days_raw is None:
+                unlock_cond, unlock_days = next_unlock_from_gate_reason(
+                    gate_reason,
+                    btc_confirm_days=max(int(os.getenv("S4_SHADOW_BTC_CONFIRM_DAYS", "3") or 3), 0),
+                    xau_confirm_days=max(int(os.getenv("S4_SHADOW_XAU_CONFIRM_DAYS", "5") or 5), 0),
+                )
+            else:
+                unlock_days = int(_safe_float(unlock_days_raw, 0.0))
+
+            entry['decision'] = decision
+            entry['analytics_runtime_mismatch'] = mismatch
+            entry['mismatch_severity'] = str((meta or {}).get('mismatch_severity') or '')
+            entry['mismatch_streak_days'] = int(_safe_float((meta or {}).get('mismatch_streak_days'), 0.0))
+            entry['eod_asof_date'] = (meta or {}).get('eod_asof_date')
+            entry['runtime_signal_ts'] = (meta or {}).get('runtime_signal_ts')
+            entry['next_unlock_condition'] = unlock_cond
+            entry['next_unlock_min_days'] = unlock_days
+            items.append(entry)
+
+        return jsonify({
+            'window_days': days,
+            'limit': limit,
+            'reason': str(reason_raw or 'all'),
+            'decision': decision_raw,
+            'include_mismatch': include_mismatch,
+            'count': len(items),
+            'filtered_out_reason': filtered_out_reason,
+            'filtered_out_decision': filtered_out_decision,
+            'filtered_out_mismatch': filtered_out_mismatch,
+            'items': items,
+        })
+    except Exception as exc:
+        logging.error(f"Error in /api/s4_shadow_swaps route: {exc}")
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/s4_shadow_swaps_summary')
+def api_s4_shadow_swaps_summary():
+    """Return compact 30/60/90-day shadow diagnostics for operators."""
+    try:
+        windows = (30, 60, 90)
+        summary: dict[str, dict] = {}
+        with get_db_cursor() as (cursor, _):
+            for days in windows:
+                cursor.execute(
+                    """
+                    SELECT reason, metadata_json
+                    FROM strategy_rotation_log
+                    WHERE strategy_mode='s4_multi_leg'
+                      AND reason IN ('shadow_swap_plan', 'shadow_swap_heartbeat')
+                      AND executed_at >= (UTC_TIMESTAMP() - INTERVAL %s DAY)
+                    ORDER BY executed_at DESC
+                    """,
+                    (days,),
+                )
+                rows = cursor.fetchall() or []
+                reason_idx = 0
+                meta_idx = 1
+                mismatch_count = 0
+                decision_counts = {'HOLD': 0, 'SWAP_TO_BTC': 0, 'SWAP_TO_XAU': 0}
+                reason_counts = {'shadow_swap_heartbeat': 0, 'shadow_swap_plan': 0}
+                for row in rows:
+                    reason = str(row[reason_idx] or '')
+                    meta_raw = row[meta_idx]
+                    meta = {}
+                    if isinstance(meta_raw, str):
+                        try:
+                            meta = json.loads(meta_raw)
+                        except Exception:
+                            meta = {}
+                    elif isinstance(meta_raw, dict):
+                        meta = meta_raw
+                    entry = {'reason': reason, 'metadata_json': meta}
+                    decision = derive_shadow_decision(entry).upper()
+                    if decision in decision_counts:
+                        decision_counts[decision] += 1
+                    if reason in reason_counts:
+                        reason_counts[reason] += 1
+                    if bool(meta.get('analytics_runtime_mismatch')):
+                        mismatch_count += 1
+                summary[str(days)] = {
+                    'count': len(rows),
+                    'reason_counts': reason_counts,
+                    'decision_counts': decision_counts,
+                    'mismatch_count': mismatch_count,
+                }
+        return jsonify({'windows': list(windows), 'summary': summary})
+    except Exception as exc:
+        logging.error(f"Error in /api/s4_shadow_swaps_summary route: {exc}")
+        return jsonify({'error': str(exc)}), 500
+
 @app.route('/health')
 def health_check():
     """Health check endpoint"""
@@ -2401,7 +2767,7 @@ def internal_error(error):
 # ====== Wallet API ======
 @app.route('/api/wallet')
 def api_wallet():
-    """Return wallet snapshots for Binance and OKX plus totals."""
+    """Return wallet snapshots for Binance/OKX/Bitkub plus totals."""
 
     def _safe_float(val, default=0.0):
         try:
@@ -2412,9 +2778,13 @@ def api_wallet():
             return default
 
     def _snapshot(exchange: str, reserve_value: float, testnet: bool, dry_run: bool) -> dict:
+        quote_asset = 'THB' if exchange.lower() == 'bitkub' else 'USDT'
         snap = {
             'usdt_free': 0.0,
             'usdt_locked': 0.0,
+            'quote_asset': quote_asset,
+            'quote_free': 0.0,
+            'quote_locked': 0.0,
             'btc_free': 0.0,
             'btc_locked': 0.0,
             'price': 0.0,
@@ -2430,7 +2800,7 @@ def api_wallet():
             logging.warning(f"wallet snapshot init {exchange}: {exc}")
             return snap
 
-        asset_plan = ['USDT', 'BTC']
+        asset_plan = [quote_asset, 'BTC']
         if exchange.lower() == 'okx':
             asset_plan.append('XAUT')
         if exchange.lower() == 'binance':
@@ -2441,12 +2811,17 @@ def api_wallet():
                 bal = adapter.get_balance(asset)
                 free = _safe_float(bal.get('free'))
                 locked = _safe_float(bal.get('locked'))
+                if asset == quote_asset:
+                    snap['quote_free'] = free
+                    snap['quote_locked'] = locked
                 if asset == 'USDT':
                     snap['usdt_free'] = free
                     snap['usdt_locked'] = locked
                 elif asset in ('BTC',):
                     snap['btc_free'] = free
                     snap['btc_locked'] = locked
+                elif asset == quote_asset:
+                    continue
                 else:
                     snap['extra_assets'][asset] = {'free': free, 'locked': locked}
         except Exception as exc:
@@ -2461,7 +2836,7 @@ def api_wallet():
                 snap['error'] = str(exc)
             logging.warning(f"wallet snapshot price {exchange}: {exc}")
         snap['price'] = price
-        snap['portfolio_value'] = snap['usdt_free'] + snap['btc_free'] * price
+        snap['portfolio_value'] = snap['quote_free'] + snap['btc_free'] * price
         return snap
 
     payload = {
@@ -2469,8 +2844,10 @@ def api_wallet():
         'timestamp': datetime.utcnow().isoformat() + 'Z',
         'binance': {},
         'okx': {},
+        'bitkub': {},
         'totals': {
             'usdt_free': 0.0,
+            'thb_free': 0.0,
             'btc_free': 0.0,
             'portfolio_value': 0.0,
             'reserve': 0.0,
@@ -2501,12 +2878,15 @@ def api_wallet():
 
         binance_snapshot = _snapshot('binance', reserve_binance, testnet, dry_run)
         okx_snapshot = _snapshot('okx', reserve_okx, testnet, dry_run)
+        bitkub_snapshot = _snapshot('bitkub', 0.0, testnet, dry_run)
 
         payload['binance'] = binance_snapshot
         payload['okx'] = okx_snapshot
+        payload['bitkub'] = bitkub_snapshot
 
         payload['totals']['usdt_free'] = binance_snapshot['usdt_free'] + okx_snapshot['usdt_free']
-        payload['totals']['btc_free'] = binance_snapshot['btc_free'] + okx_snapshot['btc_free']
+        payload['totals']['thb_free'] = bitkub_snapshot.get('quote_free', 0.0)
+        payload['totals']['btc_free'] = binance_snapshot['btc_free'] + okx_snapshot['btc_free'] + bitkub_snapshot['btc_free']
         payload['totals']['portfolio_value'] = binance_snapshot['portfolio_value'] + okx_snapshot['portfolio_value']
         payload['totals']['reserve'] = total_reserve if total_reserve else (reserve_binance + reserve_okx)
 
@@ -2735,7 +3115,7 @@ def api_strategies():
 
         runtime_data = {}
         if isinstance(raw_metadata, dict):
-            runtime_data = raw_metadata.get('runtime') or {}
+            runtime_data = _normalize_s4_runtime_aliases(raw_metadata.get('runtime') or {})
 
         strategies.append({
             'id': row['mode'],
@@ -2766,6 +3146,107 @@ def api_strategies():
             }
         })
 
+    # Append virtual Bitkub strategy card sourced from schedules + purchase history.
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(purchase_amount), 0)
+                FROM schedules
+                WHERE is_active = 1 AND exchange_mode = 'bitkub'
+                """
+            )
+            sched_row = cursor.fetchone() or (0, 0)
+            active_count = int(sched_row[0] or 0)
+            active_total_thb = float(sched_row[1] or 0.0)
+
+            cursor.execute(
+                """
+                SELECT purchase_time, usdt_amount, btc_quantity, btc_price, order_id,
+                       fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount
+                FROM purchase_history
+                WHERE COALESCE(exchange, '') = 'bitkub'
+                ORDER BY purchase_time DESC
+                LIMIT 1
+                """
+            )
+            last_buy = cursor.fetchone()
+    except Exception as exc:
+        logging.warning(f"bitkub strategy summary load failed: {exc}")
+        active_count = 0
+        active_total_thb = 0.0
+        last_buy = None
+
+    api_configured = bool(os.getenv('BITKUB_API_KEY')) and bool(os.getenv('BITKUB_API_SECRET'))
+    market_filters = {}
+    last_error = None
+    if api_configured:
+        try:
+            ad = get_adapter('bitkub', testnet=False, dry_run=True)
+            market_filters = ad.get_filters() or {}
+        except Exception as exc:
+            last_error = str(exc)
+            logging.warning(f"bitkub market filter fetch failed: {exc}")
+
+    bitkub_metadata = _strategy_metadata_for('bitkub_dca_v1', None)
+    last_run_at = _dt_to_iso(last_buy[0]) if last_buy and last_buy[0] else None
+    last_order = None
+    if last_buy:
+        quote_spent = float(last_buy[1] or 0.0)
+        filled_btc = float(last_buy[2] or 0.0)
+        avg_price = float(last_buy[3] or 0.0)
+        fee_asset = (last_buy[6] or 'THB')
+        fee_amount = float(last_buy[7] if last_buy[7] is not None else (last_buy[5] or 0.0))
+        last_order = {
+            'time': _dt_to_iso(last_buy[0]),
+            'quote_amount': quote_spent,
+            'quote_asset': 'THB',
+            'filled_btc': filled_btc,
+            'avg_price': avg_price,
+            'order_id': str(last_buy[4]) if last_buy[4] is not None else None,
+            'fee_asset': fee_asset,
+            'fee_amount': fee_amount,
+        }
+
+    if not any(s.get('id') == 'bitkub_dca_v1' for s in strategies):
+        strategies.append({
+        'id': 'bitkub_dca_v1',
+        'display_name': bitkub_metadata.get('display_name', 'Bitkub THB DCA'),
+        'short_name': bitkub_metadata.get('short_name', 'BITKUB'),
+        'category': bitkub_metadata.get('category', 'dca'),
+        'status': 'active' if active_count > 0 else 'idle',
+        'enabled': active_count > 0,
+        'last_status': 'pure_dca',
+        'last_transition_at': None,
+        'last_run_at': last_run_at,
+        'reserves': {'total': 0.0, 'binance': 0.0, 'okx': 0.0},
+        'allocation': {
+            'target_pct': 0.0,
+            'actual_pct': 0.0,
+            'capital_hint_usdt': 0.0
+        },
+        'guards': bitkub_metadata.get('guards', []),
+        'log_filters': bitkub_metadata.get('log_filters', []),
+        'help_overlay': bitkub_metadata.get('help_overlay'),
+        'metadata': bitkub_metadata,
+        'runtime': {
+            'symbol': 'BTC_THB',
+            'quote_asset': 'THB',
+            'api_configured': api_configured,
+            'active_schedules': active_count,
+            'active_total_thb': round(active_total_thb, 2),
+            'market_filters': {
+                'min_notional': _safe_float(market_filters.get('minNotional')),
+                'tick_size': _safe_float(market_filters.get('tickSize')),
+                'step_size': _safe_float(market_filters.get('stepSize')),
+                'min_qty': _safe_float(market_filters.get('minQty')),
+            },
+            'last_order': last_order,
+            'last_error': last_error,
+        },
+        'parameters': {}
+        })
+
     active_strategy = next((s['id'] for s in strategies if s['enabled']), None)
     response = {
         'strategies': strategies,
@@ -2786,6 +3267,7 @@ def api_strategy_holdings():
     exchanges = set()
     assets = {'BTC', 'USDT'}
     s4_gold_asset = None
+    bitkub_enabled = False
 
     try:
         with get_db_cursor() as (cursor, _):
@@ -2814,6 +3296,17 @@ def api_strategy_holdings():
                     s4_gold_asset = 'PAXG' if exch == 'binance' else 'XAUT'
     except Exception as exc:
         logging.debug(f"strategy_holdings: s4 metadata lookup failed: {exc}")
+
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute("SELECT COUNT(*) FROM schedules WHERE is_active=1 AND exchange_mode='bitkub'")
+            bitkub_enabled = int((cursor.fetchone() or [0])[0] or 0) > 0
+    except Exception as exc:
+        logging.debug(f"strategy_holdings: bitkub schedule lookup failed: {exc}")
+
+    if bitkub_enabled:
+        exchanges.add('bitkub')
+        assets.add('THB')
 
     if not exchanges:
         exchanges.add('binance')
@@ -3552,16 +4045,18 @@ def api_sell_history():
 
 @app.route('/api/purchase_history_export')
 def api_purchase_history_export():
-    """Export purchase_history as CSV. Optional query: exchange=binance|okx|all (default all)."""
+    """Export purchase_history as CSV. Optional query: exchange=binance|okx|bitkub|all (default all)."""
     try:
         exch = (request.args.get('exchange') or 'all').strip().lower()
         q = (
-            "SELECT purchase_time, COALESCE(exchange,''), usdt_amount, btc_quantity, btc_price, order_id, schedule_id, "
+            "SELECT purchase_time, COALESCE(exchange,''), usdt_amount, "
+            "CASE WHEN COALESCE(exchange,'')='bitkub' THEN 'THB' ELSE 'USDT' END AS quote_asset, "
+            "usdt_amount AS quote_amount, btc_quantity, btc_price, order_id, schedule_id, "
             "fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount "
             "FROM purchase_history"
         )
         params = []
-        if exch in ('binance','okx'):
+        if exch in ('binance','okx','bitkub'):
             q += " WHERE exchange = %s"
             params.append(exch)
         q += " ORDER BY purchase_time DESC"
@@ -3572,19 +4067,21 @@ def api_purchase_history_export():
         import io, csv
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['time','exchange','usdt_amount','btc_quantity','btc_price','order_id','schedule_id','fee_buy_usdt','fee_buy_asset','fee_buy_asset_amount'])
+        writer.writerow(['time','exchange','quote_asset','quote_amount','usdt_amount','btc_quantity','btc_price','order_id','schedule_id','fee_buy_usdt','fee_buy_asset','fee_buy_asset_amount'])
         for r in rows:
             writer.writerow([
                 str(r[0]) if r[0] else '',
                 r[1] or '',
-                float(r[2] or 0.0),
-                float(r[3] or 0.0),
+                r[3] or 'USDT',
                 float(r[4] or 0.0),
-                r[5] or '',
-                r[6] or '',
-                float(r[7] or 0.0),
+                float(r[2] or 0.0),
+                float(r[5] or 0.0),
+                float(r[6] or 0.0),
+                r[7] or '',
                 r[8] or '',
                 float(r[9] or 0.0),
+                r[10] or '',
+                float(r[11] or 0.0),
             ])
         csv_data = output.getvalue().encode('utf-8')
         from flask import Response
@@ -3594,6 +4091,70 @@ def api_purchase_history_export():
     except Exception as e:
         logging.error(f"purchase_history_export error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/bitkub_strategy_status')
+def api_bitkub_strategy_status():
+    """Return Bitkub strategy metadata/runtime for dashboard widgets."""
+    response = {
+        'ok': True,
+        'api_configured': bool(os.getenv('BITKUB_API_KEY')) and bool(os.getenv('BITKUB_API_SECRET')),
+        'symbol': 'BTC_THB',
+        'quote_asset': 'THB',
+        'active_schedules': 0,
+        'active_total_thb': 0.0,
+        'market_filters': {'min_notional': 0.0, 'tick_size': 0.0, 'step_size': 0.0, 'min_qty': 0.0},
+        'last_order': None,
+        'last_error': None,
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                "SELECT COUNT(*), COALESCE(SUM(purchase_amount), 0) FROM schedules WHERE is_active=1 AND exchange_mode='bitkub'"
+            )
+            row = cursor.fetchone() or (0, 0)
+            response['active_schedules'] = int(row[0] or 0)
+            response['active_total_thb'] = float(row[1] or 0.0)
+            cursor.execute(
+                """
+                SELECT purchase_time, usdt_amount, btc_quantity, btc_price, order_id,
+                       fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount
+                FROM purchase_history
+                WHERE COALESCE(exchange, '')='bitkub'
+                ORDER BY purchase_time DESC
+                LIMIT 1
+                """
+            )
+            last_buy = cursor.fetchone()
+            if last_buy:
+                response['last_order'] = {
+                    'time': _dt_to_iso(last_buy[0]),
+                    'quote_amount': float(last_buy[1] or 0.0),
+                    'quote_asset': 'THB',
+                    'filled_btc': float(last_buy[2] or 0.0),
+                    'avg_price': float(last_buy[3] or 0.0),
+                    'order_id': str(last_buy[4]) if last_buy[4] is not None else None,
+                    'fee_asset': last_buy[6] or 'THB',
+                    'fee_amount': float(last_buy[7] if last_buy[7] is not None else (last_buy[5] or 0.0)),
+                }
+
+        if response['api_configured']:
+            try:
+                ad = get_adapter('bitkub', testnet=False, dry_run=True)
+                filters = ad.get_filters() or {}
+                response['market_filters'] = {
+                    'min_notional': _safe_float(filters.get('minNotional')),
+                    'tick_size': _safe_float(filters.get('tickSize')),
+                    'step_size': _safe_float(filters.get('stepSize')),
+                    'min_qty': _safe_float(filters.get('minQty')),
+                }
+            except Exception as exc:
+                response['last_error'] = str(exc)
+    except Exception as exc:
+        logging.error(f"bitkub_strategy_status error: {exc}")
+        response['ok'] = False
+        response['last_error'] = str(exc)
+    return jsonify(response)
 
 @app.route('/api/sell_history_export')
 def api_sell_history_export():
