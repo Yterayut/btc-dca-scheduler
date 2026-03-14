@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from logging.handlers import RotatingFileHandler
 import MySQLdb
 import asyncio
@@ -39,6 +40,7 @@ from strategies.base import StrategyActionType, ActionStatus, ActionResult, Stra
 from strategies.cdc import CdcDcaStrategy, WeeklyDcaDecisionInput, TransitionDecisionInput
 from strategies.runtime import StrategyOrchestrator
 from strategies.s4_utils import (
+    get_s4_dca_target_asset as _s4_dca_target_asset,
     plan_s4_rotation as _plan_s4_rotation,
     resolve_s4_target_allocations as _resolve_s4_target_allocations,
     fetch_okx_ratio_signal as _fetch_okx_ratio_signal,
@@ -46,6 +48,10 @@ from strategies.s4_utils import (
     compute_ema_series as _compute_ema_series,
 )
 from strategies.s4_neutral_zone import calculate_state as _s4_neutral_state, DEFAULT_NEUTRAL_CONFIG
+from strategies.s4_observability import (
+    mismatch_severity as _s4_mismatch_severity,
+    next_unlock_from_gate_reason as _s4_next_unlock_from_gate_reason,
+)
 from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from contextlib import contextmanager
@@ -86,7 +92,8 @@ client = Client(
     required_env_vars['BINANCE_API_KEY'],
     required_env_vars['BINANCE_API_SECRET'],
     testnet=USE_TESTNET,
-    requests_params={'timeout': 15}
+    requests_params={'timeout': 15},
+    ping=False,
 )
 
 def is_dry_run() -> bool:
@@ -127,6 +134,17 @@ S4_LIMIT_FIRST_SECONDS = int(os.getenv('S4_LIMIT_FIRST_SECONDS', '45') or 45)
 S4_IOC_FALLBACK_ENABLED = _env_flag('S4_IOC_FALLBACK_ENABLED', False)
 S4_MAX_SPREAD_PCT_BTC = float(os.getenv('S4_MAX_SPREAD_PCT_BTC', '0.60') or 0.60)
 S4_MAX_SPREAD_PCT_XAUT = float(os.getenv('S4_MAX_SPREAD_PCT_XAUT', '0.50') or 0.50)
+# --- S4 DCA-first mode ---
+S4_DCA_FOLLOW_CDC_ONLY = _env_flag('S4_DCA_FOLLOW_CDC_ONLY', True)
+S4_SWAP_EXEC_ENABLED = _env_flag('S4_SWAP_EXEC_ENABLED', False)
+S4_SHADOW_SWAP_LOG_ENABLED = _env_flag('S4_SHADOW_SWAP_LOG_ENABLED', True)
+S4_SHADOW_BTC_CONFIRM_DAYS = int(os.getenv('S4_SHADOW_BTC_CONFIRM_DAYS', '3') or 3)
+S4_SHADOW_XAU_CONFIRM_DAYS = int(os.getenv('S4_SHADOW_XAU_CONFIRM_DAYS', '5') or 5)
+S4_SHADOW_BTC_SLOPE_MIN = float(os.getenv('S4_SHADOW_BTC_SLOPE_MIN', '2.0') or 2.0)
+S4_SHADOW_XAU_SLOPE_MAX = float(os.getenv('S4_SHADOW_XAU_SLOPE_MAX', '-0.5') or -0.5)
+S4_SHADOW_BTC_GAP_MAX = float(os.getenv('S4_SHADOW_BTC_GAP_MAX', '2.0') or 2.0)
+S4_SHADOW_COOLDOWN_DAYS = int(os.getenv('S4_SHADOW_COOLDOWN_DAYS', '7') or 7)
+S4_SHADOW_REQUIRE_NEUTRAL = _env_flag('S4_SHADOW_REQUIRE_NEUTRAL', True)
 
 
 def ensure_action_dedupe_table() -> None:
@@ -282,7 +300,7 @@ def maybe_send_daily_heartbeat(now: datetime) -> None:
         if record and isinstance(runtime, dict):
             s4_cdc = str(runtime.get('last_cdc_status') or '').lower() or None
             s4_signal_source = runtime.get('signal_source')
-            s4_asset = runtime.get('active_asset')
+            s4_asset = _s4_runtime_holding_asset(runtime)
             if not s4_asset:
                 s4_asset = 'BTC' if (s4_cdc or 'up') == 'up' else 'GOLD'
             cooldown_text, confirm_text = _compute_s4_gates_summary(now, runtime)
@@ -982,6 +1000,23 @@ def _s4_hold(
     save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
 
 
+def _s4_runtime_holding_asset(runtime: dict | None, default: str | None = None) -> str | None:
+    if not isinstance(runtime, dict):
+        return default
+    asset = runtime.get('holding_asset') or runtime.get('active_asset') or default
+    if asset is None:
+        return None
+    text = str(asset).upper()
+    return text or default
+
+
+def _s4_set_runtime_holding_asset(runtime: dict, asset: str | None) -> str | None:
+    normalized = str(asset).upper() if asset else None
+    runtime['holding_asset'] = normalized
+    runtime['active_asset'] = normalized
+    return normalized
+
+
 def _s4_asof_date(value: str | None) -> str | None:
     dt = parse_iso_dt(value)
     if not dt:
@@ -1105,7 +1140,7 @@ def _s4_log_neutral_state(
                         slope,
                         state,
                         runtime.get('last_cdc_status'),
-                        runtime.get('active_asset'),
+                        _s4_runtime_holding_asset(runtime),
                         lag_days,
                     ),
                 )
@@ -1135,6 +1170,113 @@ def _s4_confirmed(history: list[dict], *, days: int) -> bool:
         if (curr - prev).days != 1:
             return False
     return True
+
+
+def _s4_shadow_swap_gate_decision(
+    *,
+    runtime: dict,
+    cdc_status: str,
+    now: datetime,
+) -> dict:
+    """Evaluate shadow swap gate status (log-only, no execution)."""
+    holding = str(_s4_runtime_holding_asset(runtime, _s4_dca_target_asset(cdc_status)) or _s4_dca_target_asset(cdc_status)).upper()
+    if holding not in ('BTC', 'GOLD'):
+        holding = _s4_dca_target_asset(cdc_status)
+
+    history = runtime.get('signal_history') if isinstance(runtime.get('signal_history'), list) else []
+    neutral_state = str(runtime.get('neutral_state') or '')
+    slope_pct = _safe_float(runtime.get('neutral_slope_pct'), 0.0)
+    gap_pct = _safe_float(runtime.get('neutral_ema_gap_pct'), 0.0)
+    last_flip_dt = parse_iso_dt(runtime.get('last_flip_at')) if isinstance(runtime.get('last_flip_at'), str) else None
+    days_since_last_swap = 9999
+    if last_flip_dt:
+        days_since_last_swap = int((now.astimezone(utc) - last_flip_dt).total_seconds() // 86400)
+
+    decision = 'HOLD'
+    reason = 'no_gate'
+    target_asset = holding
+
+    if holding == 'GOLD':
+        target_asset = 'BTC'
+        if cdc_status != 'up':
+            reason = 'gate_cdc_up_required'
+        elif history and not _s4_confirmed(history, days=max(S4_SHADOW_BTC_CONFIRM_DAYS, 1)):
+            reason = 'gate_cdc_confirm'
+        elif S4_SHADOW_REQUIRE_NEUTRAL and neutral_state != 'btc_signal':
+            reason = 'gate_neutral'
+        elif slope_pct < S4_SHADOW_BTC_SLOPE_MIN:
+            reason = 'gate_slope'
+        elif gap_pct > S4_SHADOW_BTC_GAP_MAX:
+            reason = 'gate_gap'
+        elif days_since_last_swap < max(S4_SHADOW_COOLDOWN_DAYS, 0):
+            reason = 'gate_cooldown'
+        else:
+            decision = 'SWAP_TO_BTC'
+            reason = 'all_gates_passed'
+    else:
+        target_asset = 'GOLD'
+        if cdc_status != 'down':
+            reason = 'gate_cdc_down_required'
+        elif history and not _s4_confirmed(history, days=max(S4_SHADOW_XAU_CONFIRM_DAYS, 1)):
+            reason = 'gate_cdc_confirm'
+        elif slope_pct > S4_SHADOW_XAU_SLOPE_MAX:
+            reason = 'gate_slope'
+        elif days_since_last_swap < max(S4_SHADOW_COOLDOWN_DAYS, 0):
+            reason = 'gate_cooldown'
+        else:
+            decision = 'SWAP_TO_XAU'
+            reason = 'all_gates_passed'
+
+    next_unlock_condition, next_unlock_min_days = _s4_next_unlock_from_gate_reason(
+        reason,
+        btc_confirm_days=max(S4_SHADOW_BTC_CONFIRM_DAYS, 0),
+        xau_confirm_days=max(S4_SHADOW_XAU_CONFIRM_DAYS, 0),
+    )
+
+    return {
+        'holding': holding,
+        'target_asset': target_asset,
+        'decision': decision,
+        'reason': reason,
+        'cdc_status': cdc_status,
+        'neutral_state': neutral_state,
+        'slope_pct': slope_pct,
+        'gap_pct': gap_pct,
+        'days_since_last_swap': days_since_last_swap,
+        'next_unlock_condition': next_unlock_condition,
+        'next_unlock_min_days': next_unlock_min_days,
+        'config': {
+            'btc_confirm_days': S4_SHADOW_BTC_CONFIRM_DAYS,
+            'xau_confirm_days': S4_SHADOW_XAU_CONFIRM_DAYS,
+            'btc_slope_min': S4_SHADOW_BTC_SLOPE_MIN,
+            'xau_slope_max': S4_SHADOW_XAU_SLOPE_MAX,
+            'btc_gap_max': S4_SHADOW_BTC_GAP_MAX,
+            'cooldown_days': S4_SHADOW_COOLDOWN_DAYS,
+            'require_neutral': S4_SHADOW_REQUIRE_NEUTRAL,
+        },
+    }
+
+
+def _s4_latest_eod_snapshot() -> dict | None:
+    """Fetch latest EOD analytics snapshot for observability alignment."""
+    try:
+        with db_transaction() as (cursor, _):
+            cursor.execute(
+                """
+                SELECT date, cdc_status, state, slope_pct, ema_gap_pct, eod_lag_days
+                FROM s4_neutral_zone_eod
+                ORDER BY date DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+    except Exception:
+        logging.debug("S4 latest EOD snapshot unavailable", exc_info=True)
+        return None
 
 
 def _s4_count_successful_flips_30d() -> int:
@@ -1285,9 +1427,12 @@ def execute_s4_dca(now: datetime, amount: float, schedule_id: int) -> dict | Non
     adapter_name, exchange_label, btc_symbol, gold_symbol, gold_asset = _s4_exchange_artifacts(exchange_code)
 
     last_status = str(runtime.get('last_cdc_status') or 'up').lower()
-    active_asset = runtime.get('active_asset')
-    if not active_asset:
-        active_asset = 'BTC' if last_status == 'up' else 'GOLD'
+    dca_target_asset = _s4_dca_target_asset(last_status)
+    active_asset = _s4_runtime_holding_asset(runtime)
+    if S4_DCA_FOLLOW_CDC_ONLY:
+        active_asset = dca_target_asset
+    elif not active_asset:
+        active_asset = dca_target_asset
 
     symbol = btc_symbol if active_asset == 'BTC' else gold_symbol
     asset_label = 'BTC' if active_asset == 'BTC' else gold_asset
@@ -2162,9 +2307,10 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
             from exchanges.okx import OkxAdapter
             maxu = float(state.get('okx_max_usdt', 0) or 0)
             adapter = OkxAdapter(testnet=USE_TESTNET, dry_run=is_dry_run(), max_usdt=maxu if maxu > 0 else None)
+        skip_liquidity_guards = str((context or {}).get('cdc_status') or '').lower() == 'okx_pure_dca'
         price = float(adapter.get_price())
         depth_ok, depth_info = evaluate_depth_guard(adapter, exchange, price)
-        if not depth_ok:
+        if not depth_ok and not skip_liquidity_guards:
             payload = {
                 'exchange': exchange,
                 'reason': depth_info.get('reason', 'depth_guard'),
@@ -2177,10 +2323,19 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                     val = context.get(key)
                     if val:
                         payload[key] = val
+            logging.warning(
+                "DCA buy liquidity block (depth) exchange=%s schedule_id=%s amount=%.2f reason=%s detail=%s",
+                exchange, schedule_id, float(amount or 0.0), depth_info.get('reason', 'depth_guard'), depth_info
+            )
             notify_liquidity_blocked('dca_buy', payload)
             return {'skipped': True, 'reason': depth_info.get('reason', 'depth_guard'), 'exchange': exchange, 'detail': depth_info}
+        if not depth_ok and skip_liquidity_guards:
+            logging.warning(
+                "Bypassing depth guard for okx_pure_dca exchange=%s schedule_id=%s amount=%.2f detail=%s",
+                exchange, schedule_id, float(amount or 0.0), depth_info
+            )
         twap_ok, twap_info = evaluate_twap_guard(adapter, exchange, price)
-        if not twap_ok:
+        if not twap_ok and not skip_liquidity_guards:
             payload = {
                 'exchange': exchange,
                 'reason': twap_info.get('reason', 'twap_guard'),
@@ -2193,10 +2348,19 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                     val = context.get(key)
                     if val:
                         payload[key] = val
+            logging.warning(
+                "DCA buy liquidity block (twap) exchange=%s schedule_id=%s amount=%.2f reason=%s detail=%s",
+                exchange, schedule_id, float(amount or 0.0), twap_info.get('reason', 'twap_guard'), twap_info
+            )
             notify_liquidity_blocked('dca_buy', payload)
             return {'skipped': True, 'reason': twap_info.get('reason', 'twap_guard'), 'exchange': exchange, 'detail': twap_info}
+        if not twap_ok and skip_liquidity_guards:
+            logging.warning(
+                "Bypassing twap guard for okx_pure_dca exchange=%s schedule_id=%s amount=%.2f detail=%s",
+                exchange, schedule_id, float(amount or 0.0), twap_info
+            )
         cap_ok, cap_info = evaluate_notional_cap(exchange, amount, state)
-        if not cap_ok:
+        if not cap_ok and not skip_liquidity_guards:
             payload = {
                 'exchange': exchange,
                 'reason': 'notional_cap',
@@ -2204,17 +2368,141 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                 'attempt': cap_info.get('attempt'),
                 'timestamp': now,
             }
+            logging.warning(
+                "DCA buy liquidity block (notional_cap) exchange=%s schedule_id=%s amount=%.2f cap=%s attempt=%s",
+                exchange, schedule_id, float(amount or 0.0), cap_info.get('cap'), cap_info.get('attempt')
+            )
             notify_liquidity_blocked('dca_buy', payload)
             return {'skipped': True, 'reason': 'notional_cap', 'exchange': exchange, 'detail': cap_info}
+        if not cap_ok and skip_liquidity_guards:
+            logging.warning(
+                "Bypassing notional cap for okx_pure_dca exchange=%s schedule_id=%s amount=%.2f detail=%s",
+                exchange, schedule_id, float(amount or 0.0), cap_info
+            )
+
+        pre_btc = None
+        pre_quote = None
+        quote_asset = 'THB' if exchange == 'bitkub' else 'USDT'
+        if exchange == 'bitkub':
+            # Bitkub may return acceptance before fill fields are hydrated.
+            # Capture balances so we can infer executed fill from delta.
+            try:
+                pre_btc = float((adapter.get_balance('BTC') or {}).get('free') or 0.0)
+                pre_quote = float((adapter.get_balance(quote_asset) or {}).get('free') or 0.0)
+            except Exception as bal_exc:
+                logging.warning("Bitkub pre-balance snapshot failed: %s", bal_exc)
 
         res = adapter.place_market_buy_quote(amount)
         ex_qty = float(res.executed_qty);
         cqq = float(res.cummulative_quote_qty);
         avg = float(res.avg_price)
-        order_id = res.order_id
+        order_id_raw = res.order_id
+        order_id_db = None
+        try:
+            if order_id_raw is not None and str(order_id_raw).strip() != '':
+                order_id_db = int(str(order_id_raw))
+        except Exception:
+            # Bitkub may return non-numeric identifiers (e.g., hash). Keep DB insert resilient.
+            order_id_db = None
+            logging.warning(
+                "Non-numeric order_id from %s adapter: %s (store NULL in purchase_history)",
+                exchange,
+                order_id_raw,
+            )
         fee_buy_usdt = float(getattr(res, 'fee_usd', 0.0) or 0.0)
         fee_buy_asset = getattr(res, 'fee_asset', None)
         fee_buy_asset_amount = float(getattr(res, 'fee_asset_amount', 0.0) or 0.0)
+
+        if exchange == 'bitkub':
+            def _apply_exec_info(info: dict | None, source: str) -> bool:
+                nonlocal ex_qty, cqq, avg, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount
+                if not isinstance(info, dict):
+                    return False
+                exec_qty = float(info.get('qty') or 0.0)
+                exec_avg = float(info.get('avg_price') or 0.0)
+                exec_spent = float(info.get('quote_spent') or 0.0)
+                exec_fee = float(info.get('fee_quote') or 0.0)
+                if exec_qty <= 0 or exec_avg <= 0:
+                    return False
+                ex_qty = exec_qty
+                avg = exec_avg
+                if exec_spent > 0:
+                    cqq = exec_spent
+                if exec_fee > 0:
+                    fee_buy_usdt = exec_fee
+                    fee_buy_asset = quote_asset
+                    fee_buy_asset_amount = exec_fee
+                logging.info(
+                    "Bitkub fill confirmed source=%s qty=%.8f %s=%.8f avg=%.2f schedule=%s order=%s",
+                    source,
+                    ex_qty,
+                    quote_asset,
+                    cqq,
+                    avg,
+                    schedule_id,
+                    order_id_raw,
+                )
+                return True
+
+            # Settlement window: wait a few seconds for exchange fill metadata to propagate.
+            settle_timeout = max(float(os.getenv('BITKUB_SETTLE_TIMEOUT_SEC', '10')), 1.0)
+            settle_sleep = max(float(os.getenv('BITKUB_SETTLE_POLL_SEC', '0.8')), 0.2)
+            settle_deadline = time.time() + settle_timeout
+            attempts = 0
+
+            while (ex_qty <= 0 or cqq <= 0) and time.time() <= settle_deadline:
+                attempts += 1
+                if order_id_raw not in (None, ''):
+                    try:
+                        info = adapter.get_order_execution_symbol(
+                            adapter.symbol(),
+                            order_id_raw,
+                            side='buy',
+                            retries=1,
+                            retry_sleep_sec=0.2,
+                        )
+                        if _apply_exec_info(info, 'order_info'):
+                            break
+                    except Exception as order_info_exc:
+                        logging.warning("Bitkub order-info lookup failed (attempt=%s): %s", attempts, order_info_exc)
+
+                    try:
+                        info = adapter.get_order_execution_from_history_symbol(
+                            adapter.symbol(),
+                            order_id_raw,
+                            limit=50,
+                        )
+                        if _apply_exec_info(info, 'order_history'):
+                            break
+                    except Exception as hist_exc:
+                        logging.warning("Bitkub order-history lookup failed (attempt=%s): %s", attempts, hist_exc)
+
+                # Final fallback: infer from wallet delta if exchange has not surfaced fill fields yet.
+                try:
+                    post_btc = float((adapter.get_balance('BTC') or {}).get('free') or 0.0)
+                    post_quote = float((adapter.get_balance(quote_asset) or {}).get('free') or 0.0)
+                    if pre_btc is not None and pre_quote is not None:
+                        delta_btc = max(post_btc - pre_btc, 0.0)
+                        delta_quote = max(pre_quote - post_quote, 0.0)
+                        if delta_btc > 0 and delta_quote > 0:
+                            ex_qty = delta_btc
+                            cqq = delta_quote
+                            avg = (cqq / ex_qty) if ex_qty > 0 else avg
+                            logging.warning(
+                                "Bitkub fill inferred from balance delta: qty=%.8f %s=%.8f schedule=%s attempts=%s",
+                                ex_qty,
+                                quote_asset,
+                                cqq,
+                                schedule_id,
+                                attempts,
+                            )
+                            break
+                except Exception as infer_exc:
+                    logging.warning("Bitkub post-balance infer failed (attempt=%s): %s", attempts, infer_exc)
+
+                if ex_qty <= 0 or cqq <= 0:
+                    time.sleep(settle_sleep)
+
         if ex_qty <= 0 or cqq <= 0:
             raise ValueError('not filled')
         with db_transaction() as (cursor, _):
@@ -2227,7 +2515,7 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                     cqq,
                     ex_qty,
                     avg,
-                    order_id,
+                    order_id_db,
                     schedule_id,
                     exchange,
                     fee_buy_usdt if fee_buy_usdt is not None else None,
@@ -2238,10 +2526,12 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
         try:
             notify_payload = {
                 'usdt': cqq,
+                'quote_amount': cqq,
+                'quote_asset': quote_asset,
                 'btc_qty': ex_qty,
                 'price': avg,
                 'schedule_id': schedule_id,
-                'order_id': order_id,
+                'order_id': order_id_raw,
                 'exchange': exchange,
                 'timestamp': now,
             }
@@ -2253,19 +2543,43 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
             _attach_holdings_snapshot(
                 notify_payload,
                 exchange,
-                assets=("BTC", "USDT"),
+                assets=("BTC", quote_asset),
                 force_refresh=True,
             )
-            notify_weekly_dca_buy(notify_payload)
-        except Exception:
-            pass
+            sent = notify_weekly_dca_buy(notify_payload)
+            if sent:
+                logging.info(
+                    "Weekly DCA notify sent (%s) schedule=%s order=%s amount=%.2f %s",
+                    exchange,
+                    schedule_id,
+                    order_id_raw,
+                    cqq,
+                    quote_asset,
+                )
+            else:
+                logging.error(
+                    "Weekly DCA notify failed (%s) schedule=%s order=%s amount=%.2f %s",
+                    exchange,
+                    schedule_id,
+                    order_id_raw,
+                    cqq,
+                    quote_asset,
+                )
+        except Exception as notify_exc:
+            logging.exception(
+                "Weekly DCA notify exception (%s) schedule=%s order=%s: %s",
+                exchange,
+                schedule_id,
+                order_id_raw,
+                notify_exc,
+            )
 
         record_fee_totals('cdc_weekly_dca', exchange, 'buy', fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
 
         try:
             meta = {
                 'schedule_id': schedule_id,
-                'order_id': order_id,
+                'order_id': order_id_raw,
             }
             if context:
                 for key in ('request_id', 'dedupe_key', 'cdc_status'):
@@ -2273,19 +2587,28 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                     if val:
                         meta[key] = val
             log_compliance_event(now, 'buy', exchange, cqq, ex_qty, avg, 0.0, metadata=meta)
-            if cqq >= ANOMALY_NOTIONAL_THRESHOLD_USDT:
+            if exchange in ('binance', 'okx') and cqq >= ANOMALY_NOTIONAL_THRESHOLD_USDT:
                 notify_security_alert(
                     "High notional DCA buy",
                     {
                         'exchange': exchange.upper(),
                         'notional': f"{cqq:,.2f} USDT",
                         'threshold': f"{ANOMALY_NOTIONAL_THRESHOLD_USDT:,.2f} USDT",
-                        'order_id': order_id,
+                        'order_id': order_id_raw,
                     },
                 )
         except Exception:
             logging.debug("Compliance log skipped for buy", exc_info=True)
-        result_payload = {'executed': True, 'exchange': exchange, 'qty': ex_qty, 'usdt': cqq, 'price': avg, 'order_id': order_id}
+        result_payload = {
+            'executed': True,
+            'exchange': exchange,
+            'qty': ex_qty,
+            'usdt': cqq,
+            'quote_amount': cqq,
+            'quote_asset': quote_asset,
+            'price': avg,
+            'order_id': order_id_raw,
+        }
         if context:
             for key in ('request_id', 'dedupe_key', 'cdc_status'):
                 val = context.get(key)
@@ -2293,6 +2616,13 @@ def purchase_on_exchange(now: datetime, exchange: str, amount: float, schedule_i
                     result_payload[key] = val
         return result_payload
     except Exception as e:
+        logging.exception(
+            "purchase_on_exchange failed exchange=%s schedule_id=%s amount=%.8f: %s",
+            exchange,
+            schedule_id,
+            float(amount or 0.0),
+            e,
+        )
         send_line_message(f"❌ Weekly DCA {exchange.upper()} error: {e}")
         return {'error': str(e), 'exchange': exchange}
 def get_symbol_filters(symbol: str = 'BTCUSDT', exchange: str | None = None) -> dict:
@@ -3131,10 +3461,14 @@ async def run_s4_tick(now: datetime) -> None:
             signal_source = 'binance_cdc'
 
     cdc_status = str(cdc_snapshot.get('status') or 'down').lower()
-    target_asset = 'BTC' if cdc_status == 'up' else 'GOLD'
+    target_asset = _s4_dca_target_asset(cdc_status)
     previous_confirmed = str(runtime.get('last_confirmed_status') or runtime.get('last_cdc_status') or '').lower() or None
     runtime['last_cdc_status'] = cdc_status
     runtime['signal_source'] = signal_source
+    runtime['signal_target_asset'] = target_asset
+    current_holding = _s4_runtime_holding_asset(runtime)
+    if current_holding in ('BTC', 'GOLD'):
+        _s4_set_runtime_holding_asset(runtime, current_holding)
     runtime['last_signal_snapshot'] = {
         'status': cdc_status,
         'updated_at': cdc_snapshot.get('updated_at'),
@@ -3272,7 +3606,7 @@ async def run_s4_tick(now: datetime) -> None:
             "S4 transition with unknown previous CDC state (%s); skipping rotation and persisting current state",
             previous_confirmed,
         )
-        runtime['active_asset'] = target_asset
+        _s4_set_runtime_holding_asset(runtime, target_asset)
         runtime['last_action'] = {
             'result': 'noop_unknown_prev',
             'dry_run': dry_run_mode or adapter is None,
@@ -3292,6 +3626,191 @@ async def run_s4_tick(now: datetime) -> None:
             target_btc_pct=target_btc_pct,
             min_usd=max(min_flip_usd, 0.0),
         )
+
+    # DCA-first mode: no live full-swap execution. Keep DCA target in sync with CDC
+    # and optionally log shadow swap decisions for later review.
+    if not S4_SWAP_EXEC_ENABLED:
+        active_asset = str(_s4_runtime_holding_asset(runtime) or '').upper()
+        if active_asset not in ('BTC', 'GOLD'):
+            _s4_set_runtime_holding_asset(runtime, target_asset)
+        eod_snapshot = _s4_latest_eod_snapshot() or {}
+        eod_cdc_status = str(eod_snapshot.get('cdc_status') or '').lower()
+        eod_asof_date = str(eod_snapshot.get('date') or '')
+        eod_lag_days = int(_safe_float(eod_snapshot.get('eod_lag_days'), 0.0))
+        mismatch = bool(eod_cdc_status and eod_cdc_status != cdc_status)
+        # Count mismatch streak once per EOD snapshot date (not every 5-minute tick).
+        streak_event = 'unchanged'
+        if runtime.get('mismatch_counter_mode') != 'daily_eod':
+            runtime['mismatch_counter_mode'] = 'daily_eod'
+            runtime['mismatch_streak_days'] = 0
+            runtime.pop('mismatch_last_counted_date', None)
+            streak_event = 'counter_mode_reset'
+        count_key = eod_asof_date or now.astimezone(utc).date().isoformat()
+        already_counted = str(runtime.get('mismatch_last_counted_date') or '') == str(count_key)
+        prior_streak = int(_safe_float(runtime.get('mismatch_streak_days'), 0.0))
+        if already_counted:
+            current_streak = prior_streak
+            streak_event = 'same_eod_date_no_recount'
+        else:
+            current_streak = (prior_streak + 1) if mismatch else 0
+            runtime['mismatch_last_counted_date'] = count_key
+            if mismatch:
+                streak_event = 'new_eod_mismatch_counted'
+            elif prior_streak > 0:
+                streak_event = 'match_recovered_reset'
+            else:
+                streak_event = 'new_eod_match_still_zero'
+        if mismatch:
+            runtime['mismatch_last_seen_at'] = now.isoformat()
+        else:
+            runtime.pop('mismatch_last_seen_at', None)
+        severity = _s4_mismatch_severity(
+            mismatch=mismatch,
+            eod_lag_days=eod_lag_days,
+            streak=current_streak,
+        )
+        runtime['mismatch_streak_days'] = current_streak
+        runtime['analytics_runtime_mismatch'] = mismatch
+        runtime['mismatch_severity'] = severity
+        runtime['mismatch_eod_status'] = eod_cdc_status or None
+        runtime['mismatch_eod_date'] = eod_asof_date or None
+        runtime['mismatch_eod_lag_days'] = eod_lag_days
+        runtime['mismatch_streak_event'] = streak_event
+        if mismatch and eod_lag_days == 0 and severity in ('warn', 'critical'):
+            alert_interval_seconds = 43200 if severity == 'warn' else 10800
+            last_alert = parse_iso_dt(runtime.get('mismatch_last_alert_at')) if isinstance(runtime.get('mismatch_last_alert_at'), str) else None
+            should_alert = True
+            if last_alert:
+                should_alert = (now.astimezone(utc) - last_alert).total_seconds() >= alert_interval_seconds
+            if should_alert:
+                notify_security_alert(
+                    "S4 fresh-EOD analytics/runtime mismatch",
+                    {
+                        "severity": severity.upper(),
+                        "runtime_cdc": cdc_status,
+                        "eod_cdc": eod_cdc_status or "n/a",
+                        "eod_asof_date": eod_asof_date or "n/a",
+                        "eod_lag_days": eod_lag_days,
+                        "streak_days": current_streak,
+                        "signal_source": signal_source,
+                        "note": "Fresh EOD snapshot disagrees with runtime signal.",
+                    },
+                )
+                runtime['mismatch_last_alert_at'] = now.isoformat()
+        asof_date = _s4_asof_date(str(cdc_snapshot.get('updated_at')) if cdc_snapshot.get('updated_at') else None)
+        should_log_heartbeat = bool(asof_date) and runtime.get('last_shadow_heartbeat_date') != asof_date
+        if should_log_heartbeat:
+            gate = _s4_shadow_swap_gate_decision(
+                runtime=runtime,
+                cdc_status=cdc_status,
+                now=now,
+            )
+            heartbeat_entry = {
+                'at': now.isoformat(),
+                'asof_date': asof_date,
+                'holding': gate['holding'],
+                'holding_asset': gate['holding'],
+                'target_asset': gate['target_asset'],
+                'decision': gate['decision'],
+                'reason': gate['reason'],
+                'cdc_status': cdc_status,
+                'neutral_state': gate['neutral_state'],
+                'slope_pct': gate['slope_pct'],
+                'gap_pct': gate['gap_pct'],
+                'days_since_last_swap': gate['days_since_last_swap'],
+                'next_unlock_condition': gate.get('next_unlock_condition'),
+                'next_unlock_min_days': gate.get('next_unlock_min_days'),
+                'analytics_runtime_mismatch': mismatch,
+                'mismatch_severity': severity,
+                'mismatch_streak_days': current_streak,
+                'mismatch_streak_event': streak_event,
+                'eod_asof_date': eod_asof_date,
+                'runtime_signal_ts': now.isoformat(),
+            }
+            shadow_log = runtime.setdefault('shadow_swap_log', [])
+            shadow_log.append(heartbeat_entry)
+            runtime['shadow_swap_log'] = shadow_log[-120:]
+            runtime['last_shadow_heartbeat_date'] = asof_date
+            runtime['last_shadow_heartbeat'] = heartbeat_entry
+            record_rotation_event(
+                executed_at=now,
+                strategy_mode='s4_multi_leg',
+                from_asset=str(gate['holding']),
+                to_asset=str(gate['target_asset']),
+                notional_usd=float(rotation_plan.get('rotate_usd') or 0.0) if rotation_plan else 0.0,
+                cdc_status=cdc_status,
+                delta_pct=rotation_plan.get('delta_btc_pct') if rotation_plan else None,
+                reason='shadow_swap_heartbeat',
+                metadata={
+                    'shadow': True,
+                    'heartbeat': True,
+                    'holding_asset': gate['holding'],
+                    'target_asset': gate['target_asset'],
+                    'signal_source': signal_source,
+                    'target_btc_pct': target_btc_pct,
+                    'target_gold_pct': target_gold_pct,
+                    'swap_exec_enabled': False,
+                    'analytics_runtime_mismatch': mismatch,
+                    'mismatch_severity': severity,
+                    'mismatch_streak_days': current_streak,
+                    'mismatch_streak_event': streak_event,
+                    'eod_asof_date': eod_asof_date,
+                    'runtime_signal_ts': now.isoformat(),
+                    'gate': gate,
+                },
+            )
+        if rotation_plan and S4_SHADOW_SWAP_LOG_ENABLED:
+            shadow_entry = {
+                'at': now.isoformat(),
+                'holding_asset': rotation_plan.get('from_asset'),
+                'from': rotation_plan.get('from_asset'),
+                'target_asset': rotation_plan.get('to_asset'),
+                'to': rotation_plan.get('to_asset'),
+                'planned_usd': round(float(rotation_plan.get('rotate_usd') or 0.0), 2),
+                'delta_btc_pct': rotation_plan.get('delta_btc_pct'),
+                'cdc_status': cdc_status,
+                'signal_source': signal_source,
+                'target_btc_pct': target_btc_pct,
+                'target_gold_pct': target_gold_pct,
+                'swap_exec_enabled': False,
+            }
+            shadow_log = runtime.setdefault('shadow_swap_log', [])
+            shadow_log.append(shadow_entry)
+            runtime['shadow_swap_log'] = shadow_log[-120:]
+            runtime['last_shadow_swap'] = shadow_entry
+            record_rotation_event(
+                executed_at=now,
+                strategy_mode='s4_multi_leg',
+                from_asset=str(rotation_plan.get('from_asset') or ''),
+                to_asset=str(rotation_plan.get('to_asset') or ''),
+                notional_usd=float(rotation_plan.get('rotate_usd') or 0.0),
+                cdc_status=cdc_status,
+                delta_pct=rotation_plan.get('delta_btc_pct'),
+                reason='shadow_swap_plan',
+                metadata={
+                    'shadow': True,
+                    'holding_asset': rotation_plan.get('from_asset'),
+                    'target_asset': rotation_plan.get('to_asset'),
+                    'signal_source': signal_source,
+                    'target_btc_pct': target_btc_pct,
+                    'target_gold_pct': target_gold_pct,
+                    'swap_exec_enabled': False,
+                },
+            )
+
+        runtime['last_action'] = {
+            'result': 'shadow_swap_plan' if rotation_plan else 'dca_target_only',
+            'dry_run': True,
+            'holding_asset': _s4_runtime_holding_asset(runtime, target_asset),
+            'target_asset': target_asset,
+            'target_btc_pct': target_btc_pct,
+            'target_gold_pct': target_gold_pct,
+            'signal_source': signal_source,
+        }
+        runtime['last_action_result'] = [{'status': 'SHADOW' if rotation_plan else 'NOOP'}]
+        runtime.pop('last_error', None)
+        save_strategy_metadata('s4_multi_leg', metadata, {'last_run_at': now})
+        return
 
     if rotation_plan:
         from_asset = str(rotation_plan['from_asset'])
@@ -3510,6 +4029,8 @@ async def run_s4_tick(now: datetime) -> None:
                             'spent_usd': float(buy_total_quote),
                             'executed_ok': executed_ok,
                         }
+                        executed_ok = True
+                        executed_meta['executed_ok'] = True
                     else:
                         sell_res = adapter.place_market_sell_qty_symbol(symbol_from, sell_units_target)
                         rotation_amount_usd = float(sell_res.cummulative_quote_qty or 0.0)
@@ -3667,10 +4188,12 @@ async def run_s4_tick(now: datetime) -> None:
             # Only lock in a flip timestamp after successful execution (prevents cooldown on unfilled/aborted attempts).
             if (adapter is not None) and (not dry_run_mode) and bool(executed_ok):
                 runtime['last_flip_at'] = now.astimezone(utc).isoformat()
-                runtime['active_asset'] = target_asset
+                _s4_set_runtime_holding_asset(runtime, target_asset)
             runtime['last_action'] = {
                 'result': 'rotation',
+                'holding_asset': from_asset,
                 'from': from_asset,
+                'target_asset': to_asset,
                 'to': to_asset,
                 'amount_usd': round(rotation_amount_usd or plan_usd, 2),
                 'dry_run': dry_run_mode or adapter is None,
@@ -3682,6 +4205,8 @@ async def run_s4_tick(now: datetime) -> None:
             rotation_meta = {
                 'dry_run': dry_run_mode or adapter is None,
                 'exchange': exchange_label,
+                'holding_asset': from_asset,
+                'target_asset': to_asset,
                 'executed': executed_meta,
                 'executed_ok': bool(executed_meta.get('executed_ok')) if isinstance(executed_meta, dict) and 'executed_ok' in executed_meta else bool(executed_meta),
                 'target_btc_pct': target_btc_pct,
@@ -3717,6 +4242,8 @@ async def run_s4_tick(now: datetime) -> None:
                 notify_s4_rotation({
                     'from': from_asset,
                     'to': to_asset,
+                    'holding_asset': from_asset,
+                    'target_asset': to_asset,
                     'amount_usd': round(rotation_amount_usd or plan_usd, 2),
                     'cdc_status': cdc_status,
                     'signal_source': signal_source,
@@ -3731,9 +4258,11 @@ async def run_s4_tick(now: datetime) -> None:
             rotation_executed = True
 
     if not rotation_executed:
-        runtime['active_asset'] = target_asset
+        _s4_set_runtime_holding_asset(runtime, target_asset)
         runtime['last_action'] = {
             'result': 'noop',
+            'holding_asset': _s4_runtime_holding_asset(runtime, target_asset),
+            'target_asset': target_asset,
             'total_usd': exposure['total_usd'],
             'dry_run': dry_run_mode or adapter is None,
             'target_btc_pct': target_btc_pct,
@@ -3786,6 +4315,89 @@ async def gate_weekly_dca(now: datetime, schedule_id: int, amount: float, extra:
             'cdc': 'ignored',
             'request_id': request_id,
             'dedupe_key': dedupe_key,
+        }
+
+    if mode == 'okx_pure_dca':
+        day_key = now.astimezone(timezone('Asia/Bangkok')).date().isoformat()
+        dedupe_key = f"okx_pure_dca:{day_key}:{schedule_id or 0}"
+        request_id = f"{dedupe_key}:{int(now.timestamp())}:{os.getpid()}"
+        if not claim_dedupe_key(dedupe_key, request_id):
+            return {
+                'decision': 'noop',
+                'mode': mode,
+                'reason': 'duplicate_action_db',
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+            }
+        result = purchase_on_exchange(
+            now,
+            'okx',
+            float(amount or 0),
+            schedule_id,
+            context={
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+                'cdc_status': 'okx_pure_dca',
+                'timestamp': now,
+            },
+        )
+        if result.get('executed'):
+            return {
+                'decision': 'buy',
+                'mode': mode,
+                'amount': float(amount or 0),
+                'cdc': 'ignored',
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+                'result': result,
+            }
+        return {
+            'decision': 'noop',
+            'mode': mode,
+            'request_id': request_id,
+            'dedupe_key': dedupe_key,
+            'result': result,
+        }
+
+    if mode == 'bitkub':
+        day_key = now.astimezone(timezone('Asia/Bangkok')).date().isoformat()
+        dedupe_key = f"bitkub_pure_dca:{day_key}:{schedule_id or 0}"
+        request_id = f"{dedupe_key}:{int(now.timestamp())}:{os.getpid()}"
+        if not claim_dedupe_key(dedupe_key, request_id):
+            return {
+                'decision': 'noop',
+                'mode': mode,
+                'reason': 'duplicate_action_db',
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+            }
+        result = purchase_on_exchange(
+            now,
+            'bitkub',
+            float(amount or 0),
+            schedule_id,
+            context={
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+                'cdc_status': 'bitkub_pure_dca',
+                'timestamp': now,
+            },
+        )
+        if result.get('executed'):
+            return {
+                'decision': 'buy',
+                'mode': mode,
+                'amount': float(amount or 0),
+                'request_id': request_id,
+                'dedupe_key': dedupe_key,
+                'result': result,
+            }
+        return {
+            'decision': 'noop',
+            'mode': mode,
+            'request_id': request_id,
+            'dedupe_key': dedupe_key,
+            'result': result,
         }
 
     strategy = CdcDcaStrategy(
@@ -4155,7 +4767,8 @@ async def run_loop_scheduler():
                 logging.debug(f"Time diff for Schedule ID {schedule_id}: {time_diff} seconds")
 
                 # Check if this schedule should run
-                if current_day in schedule_days and time_diff <= 15:
+                schedule_match_window_sec = max(int(float(os.getenv('SCHEDULE_MATCH_WINDOW_SEC', '59'))), 15)
+                if current_day in schedule_days and time_diff <= schedule_match_window_sec:
                     last_run = last_run_times.get(schedule_id)
                     current_schedule_time = f"{now.strftime('%Y-%m-%d')} {schedule_time_str}"
                     if last_run != current_schedule_time:
