@@ -32,6 +32,8 @@ scheduler.pid
 *.out
 codex.gpt
 backup_files/
+ψ
+bun-linux-x64-baseline/
 
 # Backup files
 *.backup
@@ -51,3 +53,6 @@ backup_files/
 # OS
 .DS_Store
 Thumbs.db
+
+# Binary docs / exports
+docs/*.docx
