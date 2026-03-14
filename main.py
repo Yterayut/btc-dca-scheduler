@@ -66,6 +66,7 @@ from services.state import (
     save_strategy_state_with_connection as _save_strategy_state,
 )
 from services.trading import (
+    execute_half_sell_for_exchange_with_dependencies as _execute_half_sell,
     increment_reserve_exchange_with_transaction as _increment_reserve_exchange,
     increment_reserve_with_transaction as _increment_reserve,
     purchase_on_exchange_with_dependencies as _purchase_on_exchange,
@@ -1869,248 +1870,37 @@ def _execute_half_sell_for_exchange(
     state: dict | None = None,
     context: dict | None = None,
 ) -> dict:
-    ex = exchange.lower()
-    pct = int(pct or 0)
-    try:
-        adapter = get_adapter(ex, testnet=USE_TESTNET, dry_run=is_dry_run())
-        if ex == 'okx':
-            try:
-                from exchanges.okx import OkxAdapter
-                maxu = float((state or {}).get('okx_max_usdt', 0) or 0)
-                adapter = OkxAdapter(testnet=USE_TESTNET, dry_run=is_dry_run(), max_usdt=maxu if maxu > 0 else None)
-            except Exception:
-                pass
+    from exchanges.okx import OkxAdapter
 
-        if pct <= 0:
-            payload = {
-                'reason': 'sell_percent_zero',
-                'btc_free': 0,
-                'step': '-',
-                'min_notional': '-',
-                'pct': pct,
-                'exchange': ex,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_half_sell_skipped(payload)
-            return {'skipped': True, 'reason': 'sell_percent_zero', 'exchange': ex, 'pct': pct}
-
-        balance = adapter.get_balance(asset='BTC')
-        btc_free = float(balance.get('free') or 0)
-        if btc_free <= 0:
-            payload = {
-                'reason': 'no_balance',
-                'btc_free': btc_free,
-                'step': '-',
-                'min_notional': '-',
-                'pct': pct,
-                'exchange': ex,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_half_sell_skipped(payload)
-            return {'skipped': True, 'reason': 'no_balance', 'exchange': ex, 'pct': pct}
-
-        filters = get_symbol_filters('BTCUSDT', exchange=ex)
-        step = float(filters['stepSize'])
-        min_qty = float(filters['minQty'])
-        min_notional = float(filters['minNotional'])
-
-        sell_target = btc_free * (pct / 100.0)
-        qty = adjust_qty_to_step(sell_target, step)
-        if qty < min_qty:
-            payload = {
-                'reason': 'below_minQty',
-                'btc_free': btc_free,
-                'step': step,
-                'min_notional': min_notional,
-                'pct': pct,
-                'exchange': ex,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_half_sell_skipped(payload)
-            return {'skipped': True, 'reason': 'below_minQty', 'exchange': ex, 'pct': pct}
-
-        price = float(adapter.get_price())
-        depth_ok, depth_info = evaluate_depth_guard(adapter, ex, price)
-        if not depth_ok:
-            payload = {
-                'exchange': ex,
-                'reason': depth_info.get('reason', 'depth_guard'),
-                'depth': depth_info,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_liquidity_blocked('half_sell', payload)
-            depth_info['skipped'] = True
-            return {'skipped': True, 'reason': depth_info.get('reason', 'depth_guard'), 'exchange': ex, 'pct': pct, 'detail': depth_info}
-
-        twap_ok, twap_info = evaluate_twap_guard(adapter, ex, price)
-        if not twap_ok:
-            payload = {
-                'exchange': ex,
-                'reason': twap_info.get('reason', 'twap_guard'),
-                'twap': twap_info,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_liquidity_blocked('half_sell', payload)
-            twap_info['skipped'] = True
-            return {'skipped': True, 'reason': twap_info.get('reason', 'twap_guard'), 'exchange': ex, 'pct': pct, 'detail': twap_info}
-
-        notional = qty * price
-        cap_ok, cap_info = evaluate_notional_cap(ex, notional, state)
-        if not cap_ok:
-            payload = {
-                'exchange': ex,
-                'reason': 'notional_cap',
-                'cap': cap_info.get('cap'),
-                'attempt': cap_info.get('attempt'),
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_liquidity_blocked('half_sell', payload)
-            return {'skipped': True, 'reason': 'notional_cap', 'exchange': ex, 'pct': pct, 'detail': cap_info}
-
-        ok, liquidity = assess_liquidity(adapter, ex, context=context)
-        if not ok:
-            payload = {
-                'exchange': ex,
-                'reason': liquidity.get('reason'),
-                'spread_pct': liquidity.get('spread_pct'),
-                'threshold_pct': liquidity.get('threshold_pct'),
-                'expected_notional': notional,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_liquidity_blocked('half_sell', payload)
-            payload.update({'skipped': True})
-            return {'skipped': True, 'reason': liquidity.get('reason', 'liquidity_guard'), 'exchange': ex, 'pct': pct}
-        if notional < min_notional:
-            payload = {
-                'reason': 'below_minNotional',
-                'btc_free': btc_free,
-                'step': step,
-                'min_notional': min_notional,
-                'pct': pct,
-                'exchange': ex,
-                'timestamp': now,
-            }
-            if context:
-                for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                    val = context.get(key)
-                    if val:
-                        payload[key] = val
-            notify_half_sell_skipped(payload)
-            return {'skipped': True, 'reason': 'below_minNotional', 'exchange': ex, 'pct': pct}
-
-        res = adapter.place_market_sell_qty(qty)
-        order_id = res.order_id
-        executed_qty = float(res.executed_qty)
-        cummulative_quote_qty = float(res.cummulative_quote_qty)
-        if executed_qty <= 0 or cummulative_quote_qty <= 0:
-            raise ValueError('Sell order not filled or zero quantities')
-        avg_price = cummulative_quote_qty / executed_qty if executed_qty else 0.0
-        pnl_value, pnl_meta = compute_realized_pnl(ex, executed_qty, cummulative_quote_qty)
-        fee_sell_usdt = float(getattr(res, 'fee_usd', 0.0) or 0.0)
-        fee_sell_asset = getattr(res, 'fee_asset', None)
-        fee_sell_asset_amount = float(getattr(res, 'fee_asset_amount', 0.0) or 0.0)
-
-        with db_transaction() as (cursor, _):
-            cursor.execute(
-                """
-                INSERT INTO sell_history (sell_time, symbol, btc_quantity, usdt_received, price, order_id, sell_percent, note, exchange, fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    'BTCUSDT',
-                    executed_qty,
-                    cummulative_quote_qty,
-                    avg_price,
-                    order_id,
-                    pct,
-                    'sell via CDC',
-                    ex,
-                    fee_sell_usdt if fee_sell_usdt is not None else None,
-                    fee_sell_asset,
-                    fee_sell_asset_amount if fee_sell_asset_amount is not None else None,
-                )
-            )
-
-        notify_payload = {
-            'btc_qty': executed_qty,
-            'price': avg_price,
-            'usdt': cummulative_quote_qty,
-            'order_id': order_id,
-            'pct': pct,
-            'exchange': ex,
-            'timestamp': now,
-        }
-        if context:
-            for key in ('request_id', 'dedupe_key', 'cdc_status'):
-                val = context.get(key)
-                if val:
-                    notify_payload[key] = val
-        notify_half_sell_executed(notify_payload)
-
-        record_fee_totals('cdc_half_sell', ex, 'sell', fee_sell_usdt, fee_sell_asset, fee_sell_asset_amount)
-
-        try:
-            meta = dict(pnl_meta)
-            meta.update({
-                'order_id': order_id,
-                'pct': pct,
-                'cdc_status': context.get('cdc_status') if context else None,
-                'request_id': context.get('request_id') if context else None,
-                'dedupe_key': context.get('dedupe_key') if context else None,
-            })
-            log_compliance_event(now, 'sell', ex, cummulative_quote_qty, executed_qty, avg_price, pnl_value, metadata=meta)
-            if abs(pnl_value) >= ANOMALY_PNL_THRESHOLD_USDT:
-                notify_security_alert(
-                    "Realized PnL exceeded threshold",
-                    {
-                        'exchange': ex.upper(),
-                        'pnl_usdt': f"{pnl_value:,.2f}",
-                        'threshold': f"{ANOMALY_PNL_THRESHOLD_USDT:,.2f}",
-                        'order_id': order_id,
-                    },
-                )
-        except Exception:
-            logging.debug("Compliance log skipped for half-sell", exc_info=True)
-        return {'executed': True, 'exchange': ex, 'qty': executed_qty, 'usdt': cummulative_quote_qty, 'price': avg_price, 'order_id': order_id, 'pct': pct}
-    except Exception as e:
-        logging.error(f"Half-sell {ex} error: {e}")
-        send_line_message(f"❌ Half-sell {ex.upper()} error: {e}")
-        return {'error': str(e), 'exchange': ex, 'pct': pct}
+    return _execute_half_sell(
+        now,
+        exchange,
+        pct,
+        state,
+        context,
+        deps={
+            "get_adapter": get_adapter,
+            "USE_TESTNET": USE_TESTNET,
+            "is_dry_run": is_dry_run,
+            "OkxAdapter": OkxAdapter,
+            "get_symbol_filters": get_symbol_filters,
+            "adjust_qty_to_step": adjust_qty_to_step,
+            "evaluate_depth_guard": evaluate_depth_guard,
+            "evaluate_twap_guard": evaluate_twap_guard,
+            "evaluate_notional_cap": evaluate_notional_cap,
+            "assess_liquidity": assess_liquidity,
+            "notify_half_sell_skipped": notify_half_sell_skipped,
+            "notify_liquidity_blocked": notify_liquidity_blocked,
+            "compute_realized_pnl": compute_realized_pnl,
+            "db_transaction": db_transaction,
+            "notify_half_sell_executed": notify_half_sell_executed,
+            "record_fee_totals": record_fee_totals,
+            "log_compliance_event": log_compliance_event,
+            "ANOMALY_PNL_THRESHOLD_USDT": ANOMALY_PNL_THRESHOLD_USDT,
+            "notify_security_alert": notify_security_alert,
+            "send_line_message": send_line_message,
+        },
+    )
 
 def execute_half_sell(now: datetime) -> dict:
     """Sell configurable percent of BTC on supported exchanges."""
