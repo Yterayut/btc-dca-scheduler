@@ -52,6 +52,10 @@ from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from services.bootstrap import create_binance_client, env_flag, load_required_env_vars
 from services.db import db_transaction as _db_transaction, get_db_connection as _get_db_connection
+from services.pnl import (
+    compute_realized_pnl_with_transaction as _compute_realized_pnl,
+    load_fifo_open_lots_with_transaction as _load_fifo_open_lots_tx,
+)
 from services.schedule_context import fetch_schedule_context_with_connection as _fetch_schedule_context
 from services.state import (
     load_strategy_record_with_connection as _load_strategy_record,
@@ -1773,101 +1777,10 @@ def save_strategy_state(patch: dict) -> None:
     return _save_strategy_state(patch, get_db_connection)
 
 def _load_fifo_open_lots(exchange: str) -> list[dict]:
-    lots: list[dict] = []
-    try:
-        with db_transaction() as (cursor, _):
-            cursor.execute(
-                """
-                SELECT purchase_time, btc_quantity, usdt_amount
-                FROM purchase_history
-                WHERE exchange = %s
-                ORDER BY purchase_time ASC
-                """,
-                (exchange,),
-            )
-            purchases = cursor.fetchall()
-            cursor.execute(
-                """
-                SELECT btc_quantity
-                FROM sell_history
-                WHERE exchange = %s
-                ORDER BY sell_time ASC
-                """,
-                (exchange,),
-            )
-            sells = cursor.fetchall()
-    except Exception as exc:
-        logging.warning(f"FIFO lot load failed for {exchange}: {exc}")
-        purchases = []
-        sells = []
-
-    for purchase_time, qty, notional in purchases:
-        qty_f = float(qty or 0.0)
-        if qty_f <= 0:
-            continue
-        notional_f = float(notional or 0.0)
-        cost_per_unit = notional_f / qty_f if qty_f else 0.0
-        lots.append(
-            {
-                'qty': qty_f,
-                'cost': cost_per_unit,
-                'timestamp': purchase_time,
-            }
-        )
-
-    for (sell_qty,) in sells:
-        remaining = float(sell_qty or 0.0)
-        idx = 0
-        while remaining > 0 and idx < len(lots):
-            lot = lots[idx]
-            available = float(lot.get('qty') or 0.0)
-            if available <= 0:
-                idx += 1
-                continue
-            consume = min(available, remaining)
-            lot['qty'] = max(0.0, available - consume)
-            remaining -= consume
-            if lot['qty'] <= 1e-9:
-                lot['qty'] = 0.0
-            else:
-                idx += 1
-    return [lot for lot in lots if lot.get('qty', 0.0) > 1e-9]
+    return _load_fifo_open_lots_tx(exchange, db_transaction)
 
 def compute_realized_pnl(exchange: str, sell_qty: float, proceeds: float) -> tuple[float, dict]:
-    lots = _load_fifo_open_lots(exchange)
-    remaining = float(sell_qty or 0.0)
-    cost = 0.0
-    contributions: list[dict] = []
-    for lot in lots:
-        if remaining <= 0:
-            break
-        available = float(lot.get('qty') or 0.0)
-        if available <= 0:
-            continue
-        consume = min(available, remaining)
-        cost += consume * float(lot.get('cost') or 0.0)
-        contributions.append(
-            {
-                'qty': consume,
-                'cost_per_unit': float(lot.get('cost') or 0.0),
-                'source_time': str(lot.get('timestamp')) if lot.get('timestamp') else None,
-            }
-        )
-        remaining -= consume
-    metadata = {
-        'method': 'fifo',
-        'consumed_qty': float(sell_qty) - remaining,
-        'remaining_qty': max(0.0, remaining),
-        'lots_used': len(contributions),
-        'lots_total': len(lots),
-        'contributions': contributions[:5],
-    }
-    metadata['cost_basis'] = cost
-    metadata['proceeds'] = float(proceeds)
-    pnl = float(proceeds) - cost
-    if remaining > 1e-6:
-        metadata['note'] = 'Sold more BTC than available FIFO lots; excess treated as zero-cost'
-    return pnl, metadata
+    return _compute_realized_pnl(exchange, sell_qty, proceeds, db_transaction)
 
 def increment_reserve(amount: float, *, reason: str | None = None, note: str | None = None) -> float:
     """Increase global reserve_usdt by amount and return new value."""
