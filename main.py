@@ -63,6 +63,14 @@ from services.pnl import (
     compute_realized_pnl_with_transaction as _compute_realized_pnl,
     load_fifo_open_lots_with_transaction as _load_fifo_open_lots_tx,
 )
+from services.scheduler_runtime import (
+    acquire_scheduler_lock_with_connection as _acquire_scheduler_lock,
+    claim_dedupe_key_with_transaction as _claim_dedupe_key,
+    cleanup_action_dedupe_with_transaction as _cleanup_action_dedupe,
+    ensure_action_dedupe_table_with_transaction as _ensure_action_dedupe_table,
+    maybe_send_daily_heartbeat_with_dependencies as _maybe_send_daily_heartbeat,
+    release_scheduler_lock_connection as _release_scheduler_lock,
+)
 from services.schedule_context import fetch_schedule_context_with_connection as _fetch_schedule_context
 from services.state import (
     load_strategy_record_with_connection as _load_strategy_record,
@@ -149,63 +157,20 @@ S4_SHADOW_REQUIRE_NEUTRAL = _env_flag('S4_SHADOW_REQUIRE_NEUTRAL', True)
 
 
 def ensure_action_dedupe_table() -> None:
-    """Create action_dedupe table when DB dedupe is enabled."""
-    if not DB_DEDUPE_ENABLED:
-        return
-    try:
-        with db_transaction() as (cursor, _):
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS action_dedupe (
-                    dedupe_key VARCHAR(128) PRIMARY KEY,
-                    request_id VARCHAR(64) NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    KEY idx_action_dedupe_created (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                """
-            )
-        logging.info("DB dedupe enabled: ensured action_dedupe table exists.")
-    except Exception as exc:
-        logging.warning(f"ensure_action_dedupe_table failed: {exc}")
+    return _ensure_action_dedupe_table(enabled=DB_DEDUPE_ENABLED, transaction_ctx=db_transaction)
 
 
 def claim_dedupe_key(dedupe_key: str, request_id: str) -> bool:
-    """Try to claim a dedupe key in DB. Returns True if new, False if duplicate."""
-    if not DB_DEDUPE_ENABLED or not dedupe_key:
-        return True
-    try:
-        with db_transaction() as (cursor, _):
-            cursor.execute(
-                "INSERT IGNORE INTO action_dedupe (dedupe_key, request_id) VALUES (%s, %s)",
-                (dedupe_key, request_id),
-            )
-            claimed = cursor.rowcount > 0
-        if not claimed:
-            logging.warning("DB dedupe hit: skipping action dedupe_key=%s request_id=%s", dedupe_key, request_id)
-        return claimed
-    except Exception as exc:
-        logging.warning("claim_dedupe_key failed (allowing action): %s", exc)
-        return True
+    return _claim_dedupe_key(dedupe_key, request_id, enabled=DB_DEDUPE_ENABLED, transaction_ctx=db_transaction)
 
 
 def cleanup_action_dedupe() -> int:
-    """Delete old action_dedupe rows older than configured retention days."""
-    if not (DB_DEDUPE_ENABLED and DEDUPE_CLEANUP_ENABLED):
-        return 0
-    days = max(DEDUPE_CLEANUP_DAYS, 1)
-    try:
-        with db_transaction() as (cursor, _):
-            cursor.execute(
-                "DELETE FROM action_dedupe WHERE created_at < (NOW() - INTERVAL %s DAY)",
-                (days,),
-            )
-            deleted = cursor.rowcount or 0
-        if deleted:
-            logging.info("DB dedupe cleanup: deleted %s rows older than %s days.", deleted, days)
-        return int(deleted)
-    except Exception as exc:
-        logging.warning("DB dedupe cleanup failed: %s", exc)
-        return 0
+    return _cleanup_action_dedupe(
+        dedupe_enabled=DB_DEDUPE_ENABLED,
+        cleanup_enabled=DEDUPE_CLEANUP_ENABLED,
+        cleanup_days=DEDUPE_CLEANUP_DAYS,
+        transaction_ctx=db_transaction,
+    )
 
 
 def _format_dt_local(dt: datetime) -> str:
@@ -261,149 +226,34 @@ def _compute_s4_gates_summary(now: datetime, runtime: dict) -> tuple[str | None,
     return cooldown_text, confirm_text
 
 
-_LAST_HEARTBEAT_DAY_SENT: str | None = None
-
-
 def maybe_send_daily_heartbeat(now: datetime) -> None:
-    """Send a daily heartbeat LINE message once per day (08:00–08:15 Asia/Bangkok)."""
-    if now.tzinfo is None:
-        now = timezone('Asia/Bangkok').localize(now)
-    if now.hour != 8 or now.minute > 15:
-        return
-
-    day_key = now.strftime("%Y-%m-%d")
-    dedupe_key = f"heartbeat:{day_key}"
-    request_id = f"heartbeat-{day_key.replace('-', '')}-{os.getpid()}"
-    global _LAST_HEARTBEAT_DAY_SENT
-    if not DB_DEDUPE_ENABLED:
-        if _LAST_HEARTBEAT_DAY_SENT == day_key:
-            return
-        _LAST_HEARTBEAT_DAY_SENT = day_key
-    else:
-        if not claim_dedupe_key(dedupe_key, request_id):
-            return
-
-    cdc_status = None
-    try:
-        cdc_status = load_strategy_state().get('last_cdc_status')
-    except Exception:
-        cdc_status = None
-
-    s4_asset = None
-    s4_cdc = None
-    s4_signal_source = None
-    cooldown_text = None
-    confirm_text = None
-    last_flip_text = None
-    portfolio_text = None
-    try:
-        record, _, _, runtime = get_s4_state()
-        if record and isinstance(runtime, dict):
-            s4_cdc = str(runtime.get('last_cdc_status') or '').lower() or None
-            s4_signal_source = runtime.get('signal_source')
-            s4_asset = _s4_runtime_holding_asset(runtime)
-            if not s4_asset:
-                s4_asset = 'BTC' if (s4_cdc or 'up') == 'up' else 'GOLD'
-            cooldown_text, confirm_text = _compute_s4_gates_summary(now, runtime)
-            last_flip_text = _format_dt_local_from_iso(runtime.get('last_flip_at'))
-            exposure = runtime.get('exposure') if isinstance(runtime, dict) else None
-            if isinstance(exposure, dict):
-                total_usd = exposure.get('total_usd')
-                if isinstance(total_usd, (int, float)) and total_usd > 0:
-                    portfolio_text = f"{total_usd:,.2f} USDT"
-    except Exception as exc:
-        logging.debug("Heartbeat S4 state read failed: %s", exc)
-
-    effective_cdc = (s4_cdc or cdc_status or 'unknown')
-    signal_source = s4_signal_source or ('binance_cdc' if cdc_status else None)
-    asset_text = s4_asset or 'unknown'
-
-    lines = [
-        "Daily Heartbeat",
-        "Status: RUNNING",
-        f"Time: {_format_dt_local(now)} (Asia/Bangkok) | PID: {os.getpid()}",
-        f"S4: Asset={asset_text} | CDC={effective_cdc}",
-    ]
-    gates_bits = []
-    if cooldown_text:
-        gates_bits.append(f"cooldown={cooldown_text}")
-    if confirm_text:
-        gates_bits.append(f"confirm_pending={confirm_text}")
-    if gates_bits:
-        lines.append("Gates: " + " | ".join(gates_bits))
-    if last_flip_text:
-        lines.append(f"Last Flip: {last_flip_text} (Asia/Bangkok)")
-    if portfolio_text:
-        lines.append(f"Portfolio: {portfolio_text}")
-
-    payload = {
-        "status": "RUNNING",
-        "time": _format_dt_local(now) + " (Asia/Bangkok)",
-        "pid": os.getpid(),
-        "asset": asset_text,
-        "cdc": effective_cdc,
-        "signal_source": signal_source,
-        "gates": " | ".join(gates_bits) if gates_bits else "",
-        "last_flip": last_flip_text or "",
-        "portfolio": portfolio_text or "",
-    }
-    try:
-        notify_daily_heartbeat(payload)
-        logging.info("Daily heartbeat sent dedupe_key=%s", dedupe_key)
-    except Exception as exc:
-        logging.warning("Daily heartbeat notify failed: %s", exc)
+    return _maybe_send_daily_heartbeat(
+        now,
+        deps={
+            "DB_DEDUPE_ENABLED": DB_DEDUPE_ENABLED,
+            "claim_dedupe_key": claim_dedupe_key,
+            "load_strategy_state": load_strategy_state,
+            "get_s4_state": get_s4_state,
+            "_s4_runtime_holding_asset": _s4_runtime_holding_asset,
+            "_compute_s4_gates_summary": _compute_s4_gates_summary,
+            "_format_dt_local_from_iso": _format_dt_local_from_iso,
+            "_format_dt_local": _format_dt_local,
+            "notify_daily_heartbeat": notify_daily_heartbeat,
+        },
+    )
 
 
 def acquire_scheduler_lock() -> object | None:
-    """Acquire a DB-level lock to ensure single scheduler instance."""
-    if not SCHEDULER_DB_LOCK_ENABLED:
-        return None
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT GET_LOCK(%s, %s)", (SCHEDULER_DB_LOCK_NAME, SCHEDULER_DB_LOCK_TIMEOUT))
-        row = cursor.fetchone()
-        got = bool(row and row[0] == 1)
-        if not got:
-            logging.error("Failed to acquire scheduler lock '%s'. Another instance may be running.", SCHEDULER_DB_LOCK_NAME)
-            cursor.close()
-            conn.close()
-            return None
-        logging.info("Acquired scheduler lock '%s'.", SCHEDULER_DB_LOCK_NAME)
-        cursor.close()
-        return conn
-    except Exception as exc:
-        logging.error("Scheduler lock acquisition error: %s", exc)
-        try:
-            if cursor:
-                cursor.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-        return None
+    return _acquire_scheduler_lock(
+        enabled=SCHEDULER_DB_LOCK_ENABLED,
+        lock_name=SCHEDULER_DB_LOCK_NAME,
+        lock_timeout=SCHEDULER_DB_LOCK_TIMEOUT,
+        get_connection=get_db_connection,
+    )
 
 
 def release_scheduler_lock(conn: object | None) -> None:
-    if not conn or not SCHEDULER_DB_LOCK_ENABLED:
-        return
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT RELEASE_LOCK(%s)", (SCHEDULER_DB_LOCK_NAME,))
-        conn.commit()
-        cursor.close()
-        logging.info("Released scheduler lock '%s'.", SCHEDULER_DB_LOCK_NAME)
-    except Exception:
-        pass
-    try:
-        conn.close()
-    except Exception:
-        pass
+    return _release_scheduler_lock(conn, enabled=SCHEDULER_DB_LOCK_ENABLED, lock_name=SCHEDULER_DB_LOCK_NAME)
 
 
 def assess_liquidity(adapter, exchange: str, *, context: dict | None = None) -> tuple[bool, dict]:
