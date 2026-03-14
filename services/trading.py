@@ -609,3 +609,369 @@ def execute_half_sell_for_exchange_with_dependencies(
         logging.error("Half-sell %s error: %s", ex, exc)
         deps["send_line_message"](f"❌ Half-sell {ex.upper()} error: {exc}")
         return {"error": str(exc), "exchange": ex, "pct": pct}
+
+
+def execute_reserve_buy_with_dependencies(
+    now: datetime,
+    context: dict | None = None,
+    *,
+    deps: dict,
+) -> dict:
+    """Use global reserve balance to buy BTC using injected dependencies."""
+    try:
+        state = deps["load_strategy_state"]()
+        reserve = float(state.get("reserve_usdt", 0) or 0)
+        if reserve <= 0:
+            return {"skipped": True, "reason": "no_reserve"}
+
+        current_state = deps["load_strategy_state"]()
+        exchange = current_state.get("exchange", "binance")
+        adapter = deps["get_adapter"](exchange, testnet=deps["USE_TESTNET"], dry_run=deps["is_dry_run"]())
+        balance = adapter.get_balance(asset="USDT")
+        available_usdt = float(balance.get("free") or 0)
+        spend = min(available_usdt, reserve)
+        filters = deps["get_symbol_filters"]("BTCUSDT", exchange=exchange)
+        min_notional = float(filters["minNotional"])
+        if spend < min_notional:
+            payload = {"spend": spend, "min_notional": min_notional, "reserve": reserve, "timestamp": now}
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_reserve_buy_skipped_min_notional"](payload)
+            return {"skipped": True, "reason": "below_minNotional", "spend": spend}
+
+        price = float(adapter.get_price())
+        depth_ok, depth_info = deps["evaluate_depth_guard"](adapter, exchange, price)
+        if not depth_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": depth_info.get("reason", "depth_guard"),
+                "depth": depth_info,
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": depth_info.get("reason", "depth_guard"), "exchange": exchange, "detail": depth_info}
+
+        twap_ok, twap_info = deps["evaluate_twap_guard"](adapter, exchange, price)
+        if not twap_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": twap_info.get("reason", "twap_guard"),
+                "twap": twap_info,
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": twap_info.get("reason", "twap_guard"), "exchange": exchange, "detail": twap_info}
+
+        cap_ok, cap_info = deps["evaluate_notional_cap"](exchange, spend, state)
+        if not cap_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": "notional_cap",
+                "cap": cap_info.get("cap"),
+                "attempt": cap_info.get("attempt"),
+                "timestamp": now,
+            }
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": "notional_cap", "exchange": exchange, "detail": cap_info}
+
+        ok, liquidity = deps["assess_liquidity"](adapter, exchange, context=context)
+        if not ok:
+            payload = {
+                "exchange": exchange,
+                "reason": liquidity.get("reason"),
+                "spread_pct": liquidity.get("spread_pct"),
+                "threshold_pct": liquidity.get("threshold_pct"),
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": liquidity.get("reason", "liquidity_guard"), "exchange": exchange}
+
+        res = adapter.place_market_buy_quote(spend)
+        order_id = res.order_id
+        executed_qty = float(res.executed_qty)
+        cummulative_quote_qty = float(res.cummulative_quote_qty)
+        fee_buy_usdt = float(getattr(res, "fee_usd", 0.0) or 0.0)
+        fee_buy_asset = getattr(res, "fee_asset", None)
+        fee_buy_asset_amount = float(getattr(res, "fee_asset_amount", 0.0) or 0.0)
+        if executed_qty <= 0 or cummulative_quote_qty <= 0:
+            raise ValueError("Reserve buy not filled or zero quantities")
+        avg_price = cummulative_quote_qty / executed_qty
+
+        with deps["db_transaction"]() as (cursor, _):
+            cursor.execute(
+                """
+                INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id, exchange, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    cummulative_quote_qty,
+                    executed_qty,
+                    avg_price,
+                    order_id,
+                    None,
+                    exchange,
+                    fee_buy_usdt if fee_buy_usdt is not None else None,
+                    fee_buy_asset,
+                    fee_buy_asset_amount if fee_buy_asset_amount is not None else None,
+                ),
+            )
+            cursor.execute("UPDATE strategy_state SET reserve_usdt = GREATEST(reserve_usdt - %s, 0) WHERE mode='cdc_dca_v1'", (cummulative_quote_qty,))
+            cursor.execute("SELECT reserve_usdt FROM strategy_state WHERE mode='cdc_dca_v1' LIMIT 1")
+            new_reserve = float(cursor.fetchone()[0] or 0)
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO reserve_log (event_time, change_usdt, reserve_after, reason, note)
+                    VALUES (NOW(), %s, %s, %s, %s)
+                    """,
+                    (-cummulative_quote_qty, new_reserve, "reserve_buy", "Auto reserve buy on CDC GREEN"),
+                )
+            except Exception:
+                pass
+
+        notify_payload = {
+            "spend": cummulative_quote_qty,
+            "btc_qty": executed_qty,
+            "price": avg_price,
+            "reserve_left": new_reserve,
+            "order_id": order_id,
+            "exchange": exchange,
+            "timestamp": now,
+        }
+        if context:
+            for key in ("request_id", "dedupe_key"):
+                val = context.get(key)
+                if val:
+                    notify_payload[key] = val
+        if context and context.get("cdc_status"):
+            notify_payload["cdc_status"] = context.get("cdc_status")
+        deps["notify_reserve_buy_executed"](notify_payload)
+        deps["record_fee_totals"]("cdc_reserve_buy", exchange, "buy", fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+
+        try:
+            meta = {
+                "reserve_after": new_reserve,
+                "cdc_status": context.get("cdc_status") if context else None,
+                "request_id": context.get("request_id") if context else None,
+                "dedupe_key": context.get("dedupe_key") if context else None,
+                "mode": "global",
+            }
+            deps["log_compliance_event"](now, "reserve_buy", exchange, cummulative_quote_qty, executed_qty, avg_price, 0.0, metadata=meta)
+            if cummulative_quote_qty >= deps["ANOMALY_NOTIONAL_THRESHOLD_USDT"]:
+                deps["notify_security_alert"](
+                    "High notional reserve deployment",
+                    {
+                        "exchange": exchange.upper(),
+                        "notional": f"{cummulative_quote_qty:,.2f} USDT",
+                        "threshold": f"{deps['ANOMALY_NOTIONAL_THRESHOLD_USDT']:,.2f} USDT",
+                        "mode": "global",
+                    },
+                )
+        except Exception:
+            logging.debug("Compliance log skipped for reserve buy", exc_info=True)
+        return {"executed": True, "spend": cummulative_quote_qty, "qty": executed_qty, "price": avg_price, "order_id": order_id}
+    except Exception as exc:
+        logging.error("Reserve buy error: %s", exc)
+        deps["send_line_message"](f"❌ Reserve buy error: {exc}")
+        return {"error": str(exc)}
+
+
+def execute_reserve_buy_exchange_with_dependencies(
+    now: datetime,
+    exchange: str,
+    context: dict | None = None,
+    *,
+    deps: dict,
+) -> dict:
+    """Use per-exchange reserve to buy BTC on a specific exchange."""
+    try:
+        state = deps["load_strategy_state"]()
+        reserve = float(state.get(f"reserve_{exchange}_usdt", 0) or 0)
+        if reserve <= 0:
+            return {"skipped": True, "reason": "no_reserve", "exchange": exchange}
+
+        adapter = deps["get_adapter"](exchange, testnet=deps["USE_TESTNET"], dry_run=deps["is_dry_run"]())
+        if exchange == "okx":
+            maxu = float(state.get("okx_max_usdt", 0) or 0)
+            adapter = deps["OkxAdapter"](testnet=deps["USE_TESTNET"], dry_run=deps["is_dry_run"](), max_usdt=maxu if maxu > 0 else None)
+        balance = adapter.get_balance("USDT")
+        available_usdt = float(balance.get("free") or 0)
+        spend = min(available_usdt, reserve)
+        filters = deps["get_symbol_filters"]("BTCUSDT", exchange=exchange)
+        min_notional = float(filters.get("minNotional") or 10.0)
+        if spend < min_notional:
+            payload = {"spend": spend, "min_notional": min_notional, "reserve": reserve, "exchange": exchange, "timestamp": now}
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_reserve_buy_skipped_min_notional"](payload)
+            return {"skipped": True, "reason": "below_minNotional", "exchange": exchange, "spend": spend}
+
+        price = float(adapter.get_price())
+        depth_ok, depth_info = deps["evaluate_depth_guard"](adapter, exchange, price)
+        if not depth_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": depth_info.get("reason", "depth_guard"),
+                "depth": depth_info,
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": depth_info.get("reason", "depth_guard"), "exchange": exchange, "detail": depth_info}
+
+        twap_ok, twap_info = deps["evaluate_twap_guard"](adapter, exchange, price)
+        if not twap_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": twap_info.get("reason", "twap_guard"),
+                "twap": twap_info,
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": twap_info.get("reason", "twap_guard"), "exchange": exchange, "detail": twap_info}
+
+        cap_ok, cap_info = deps["evaluate_notional_cap"](exchange, spend, state)
+        if not cap_ok:
+            payload = {
+                "exchange": exchange,
+                "reason": "notional_cap",
+                "cap": cap_info.get("cap"),
+                "attempt": cap_info.get("attempt"),
+                "timestamp": now,
+            }
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": "notional_cap", "exchange": exchange, "detail": cap_info}
+
+        ok, liquidity = deps["assess_liquidity"](adapter, exchange, context=context)
+        if not ok:
+            payload = {
+                "exchange": exchange,
+                "reason": liquidity.get("reason"),
+                "spread_pct": liquidity.get("spread_pct"),
+                "threshold_pct": liquidity.get("threshold_pct"),
+                "expected_notional": spend,
+                "timestamp": now,
+            }
+            if context:
+                for key in ("request_id", "dedupe_key"):
+                    val = context.get(key)
+                    if val:
+                        payload[key] = val
+            deps["notify_liquidity_blocked"]("reserve_buy", payload)
+            return {"skipped": True, "reason": liquidity.get("reason", "liquidity_guard"), "exchange": exchange}
+
+        res = adapter.place_market_buy_quote(spend)
+        executed_qty = float(res.executed_qty)
+        cummulative_quote_qty = float(res.cummulative_quote_qty)
+        avg_price = float(res.avg_price)
+        fee_buy_usdt = float(getattr(res, "fee_usd", 0.0) or 0.0)
+        fee_buy_asset = getattr(res, "fee_asset", None)
+        fee_buy_asset_amount = float(getattr(res, "fee_asset_amount", 0.0) or 0.0)
+        if executed_qty <= 0 or cummulative_quote_qty <= 0:
+            raise ValueError("not filled")
+
+        with deps["db_transaction"]() as (cursor, _):
+            cursor.execute(
+                """
+                INSERT INTO purchase_history (purchase_time, usdt_amount, btc_quantity, btc_price, order_id, schedule_id, exchange, fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    cummulative_quote_qty,
+                    executed_qty,
+                    avg_price,
+                    res.order_id,
+                    None,
+                    exchange,
+                    fee_buy_usdt if fee_buy_usdt is not None else None,
+                    fee_buy_asset,
+                    fee_buy_asset_amount if fee_buy_asset_amount is not None else None,
+                ),
+            )
+            if exchange == "binance":
+                cursor.execute("UPDATE strategy_state SET reserve_binance_usdt = GREATEST(reserve_binance_usdt - %s, 0) WHERE mode='cdc_dca_v1'", (cummulative_quote_qty,))
+            else:
+                cursor.execute("UPDATE strategy_state SET reserve_okx_usdt = GREATEST(reserve_okx_usdt - %s, 0) WHERE mode='cdc_dca_v1'", (cummulative_quote_qty,))
+
+        reserve_left = max(0.0, reserve - cummulative_quote_qty)
+        notify_payload = {
+            "spend": cummulative_quote_qty,
+            "btc_qty": executed_qty,
+            "price": avg_price,
+            "reserve_left": reserve_left,
+            "order_id": res.order_id,
+            "exchange": exchange,
+            "timestamp": now,
+        }
+        if context:
+            for key in ("request_id", "dedupe_key"):
+                val = context.get(key)
+                if val:
+                    notify_payload[key] = val
+        if context and context.get("cdc_status"):
+            notify_payload["cdc_status"] = context.get("cdc_status")
+        deps["notify_reserve_buy_executed"](notify_payload)
+        deps["record_fee_totals"]("cdc_reserve_buy", exchange, "buy", fee_buy_usdt, fee_buy_asset, fee_buy_asset_amount)
+
+        try:
+            meta = {
+                "reserve_before": reserve,
+                "reserve_after": reserve_left,
+                "cdc_status": context.get("cdc_status") if context else None,
+                "request_id": context.get("request_id") if context else None,
+                "dedupe_key": context.get("dedupe_key") if context else None,
+                "mode": "per_exchange",
+            }
+            deps["log_compliance_event"](now, "reserve_buy", exchange, cummulative_quote_qty, executed_qty, avg_price, 0.0, metadata=meta)
+            if cummulative_quote_qty >= deps["ANOMALY_NOTIONAL_THRESHOLD_USDT"]:
+                deps["notify_security_alert"](
+                    "High notional reserve deployment",
+                    {
+                        "exchange": exchange.upper(),
+                        "notional": f"{cummulative_quote_qty:,.2f} USDT",
+                        "threshold": f"{deps['ANOMALY_NOTIONAL_THRESHOLD_USDT']:,.2f} USDT",
+                        "mode": "per_exchange",
+                    },
+                )
+        except Exception:
+            logging.debug("Compliance log skipped for reserve buy exchange", exc_info=True)
+        return {"executed": True, "exchange": exchange, "spend": cummulative_quote_qty, "qty": executed_qty, "price": avg_price}
+    except Exception as exc:
+        logging.error("Reserve buy %s error: %s", exchange, exc)
+        deps["send_line_message"](f"❌ Reserve buy {exchange.upper()} error: {exc}")
+        return {"error": str(exc), "exchange": exchange}
