@@ -52,6 +52,13 @@ from compliance import record_event as log_compliance_event
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from services.bootstrap import create_binance_client, env_flag, load_required_env_vars
 from services.db import db_transaction as _db_transaction, get_db_connection as _get_db_connection
+from services.guards import (
+    assess_liquidity_with_threshold as _assess_liquidity,
+    depth_band_limits,
+    evaluate_depth_guard_with_config as _evaluate_depth_guard,
+    evaluate_notional_cap_with_state as _evaluate_notional_cap,
+    evaluate_twap_guard_with_config as _evaluate_twap_guard,
+)
 from services.pnl import (
     compute_realized_pnl_with_transaction as _compute_realized_pnl,
     load_fifo_open_lots_with_transaction as _load_fifo_open_lots_tx,
@@ -400,127 +407,36 @@ def release_scheduler_lock(conn: object | None) -> None:
 
 
 def assess_liquidity(adapter, exchange: str, *, context: dict | None = None) -> tuple[bool, dict]:
-    """Check top-of-book spread vs threshold."""
-    try:
-        tob = adapter.get_top_of_book()
-        bid = float(tob.get('bid') or 0.0)
-        ask = float(tob.get('ask') or 0.0)
-        if bid <= 0 or ask <= 0:
-            return False, {'reason': 'invalid_top_of_book'}
-        mid = (bid + ask) / 2
-        spread_pct = ((ask - bid) / mid) * 100 if mid > 0 else 999.0
-        metrics = {
-            'spread_pct': spread_pct,
-            'threshold_pct': LIQUIDITY_MAX_SPREAD_PCT,
-            'bid': bid,
-            'ask': ask,
-        }
-        if spread_pct > LIQUIDITY_MAX_SPREAD_PCT:
-            metrics['reason'] = 'spread_high'
-            return False, metrics
-        return True, metrics
-    except NotImplementedError:
-        return True, {'reason': 'not_supported'}
-    except Exception as exc:
-        return False, {'reason': 'liquidity_error', 'error': str(exc)}
+    return _assess_liquidity(adapter, max_spread_pct=LIQUIDITY_MAX_SPREAD_PCT)
 
 def _depth_band_limits(price: float) -> tuple[float, float]:
-    band = DEPTH_GUARD_BAND_PCT / 100.0
-    lower = price * (1.0 - band)
-    upper = price * (1.0 + band)
-    return lower, upper
+    return depth_band_limits(price, band_pct=DEPTH_GUARD_BAND_PCT)
 
 def evaluate_depth_guard(adapter, exchange: str, price: float) -> tuple[bool, dict]:
-    if not ENABLE_DEPTH_GUARD or price <= 0:
-        return True, {}
-    try:
-        snapshot = adapter.get_depth_snapshot(limit=DEPTH_GUARD_DEPTH_LEVEL)
-    except NotImplementedError:
-        return True, {'reason': 'depth_not_supported'}
-    except Exception as exc:
-        return False, {'reason': 'depth_error', 'error': str(exc)}
-    bids = snapshot.get('bids') or []
-    asks = snapshot.get('asks') or []
-    lower, upper = _depth_band_limits(price)
-    bid_notional = sum(p * q for p, q in bids if p >= lower)
-    ask_notional = sum(p * q for p, q in asks if p <= upper)
-    min_notional = min(bid_notional, ask_notional)
-    metrics = {
-        'bid_notional': bid_notional,
-        'ask_notional': ask_notional,
-        'threshold': DEPTH_GUARD_MIN_NOTIONAL_USDT,
-        'band_pct': DEPTH_GUARD_BAND_PCT,
-        'dry_run': is_dry_run(),
-    }
-    if min_notional < DEPTH_GUARD_MIN_NOTIONAL_USDT:
-        metrics['reason'] = 'depth_insufficient'
-        metrics['min_notional'] = min_notional
-        return False, metrics
-    return True, metrics
+    return _evaluate_depth_guard(
+        adapter,
+        exchange,
+        price,
+        enabled=ENABLE_DEPTH_GUARD,
+        depth_level=DEPTH_GUARD_DEPTH_LEVEL,
+        band_pct=DEPTH_GUARD_BAND_PCT,
+        min_notional_threshold=DEPTH_GUARD_MIN_NOTIONAL_USDT,
+        is_dry_run=is_dry_run,
+    )
 
 def evaluate_twap_guard(adapter, exchange: str, price: float) -> tuple[bool, dict]:
-    if not ENABLE_TWAP_GUARD or price <= 0 or TWAP_GUARD_WINDOW_MINUTES <= 0:
-        return True, {}
-    try:
-        candles = adapter.get_recent_candles(interval="1m", limit=TWAP_GUARD_WINDOW_MINUTES)
-    except NotImplementedError:
-        return True, {'reason': 'twap_not_supported'}
-    except Exception as exc:
-        return False, {'reason': 'twap_error', 'error': str(exc)}
-    closes = [float(c.get('close') or 0.0) for c in candles if c.get('close')]
-    if not closes:
-        return True, {'reason': 'twap_no_data'}
-    twap = sum(closes) / len(closes)
-    if twap <= 0:
-        return True, {'reason': 'twap_invalid'}
-    deviation_pct = abs(price - twap) / twap * 100.0
-    metrics = {
-        'twap': twap,
-        'window_minutes': len(closes),
-        'deviation_pct': deviation_pct,
-        'threshold_pct': TWAP_GUARD_MAX_DEVIATION_PCT,
-        'dry_run': is_dry_run(),
-    }
-    if deviation_pct > TWAP_GUARD_MAX_DEVIATION_PCT:
-        metrics['reason'] = 'twap_deviation'
-        return False, metrics
-    return True, metrics
+    return _evaluate_twap_guard(
+        adapter,
+        exchange,
+        price,
+        enabled=ENABLE_TWAP_GUARD,
+        window_minutes=TWAP_GUARD_WINDOW_MINUTES,
+        max_deviation_pct=TWAP_GUARD_MAX_DEVIATION_PCT,
+        is_dry_run=is_dry_run,
+    )
 
 def evaluate_notional_cap(exchange: str, notional: float, state: dict | None = None) -> tuple[bool, dict]:
-    st = state or {}
-    cap = 0.0
-    ex = exchange.lower()
-    if ex == 'okx':
-        cap_val = st.get('okx_max_usdt')
-        if cap_val is None:
-            env_val = os.getenv('OKX_MAX_USDT')
-            try:
-                cap = float(env_val) if env_val not in (None, '') else 0.0
-            except (TypeError, ValueError):
-                cap = 0.0
-        else:
-            try:
-                cap = float(cap_val)
-            except (TypeError, ValueError):
-                cap = 0.0
-    elif ex == 'binance':
-        cap_val = st.get('binance_max_usdt')
-        if cap_val is None:
-            env_val = os.getenv('BINANCE_MAX_USDT')
-            try:
-                cap = float(env_val) if env_val not in (None, '') else 0.0
-            except (TypeError, ValueError):
-                cap = 0.0
-        else:
-            try:
-                cap = float(cap_val)
-            except (TypeError, ValueError):
-                cap = 0.0
-    if is_dry_run():
-        return True, {'reason': 'dry_run', 'cap': cap, 'attempt': notional}
-    if cap and cap > 0 and notional > cap:
-        return False, {'reason': 'notional_cap', 'cap': cap, 'attempt': notional}
-    return True, {'cap': cap, 'attempt': notional}
+    return _evaluate_notional_cap(exchange, notional, state, is_dry_run=is_dry_run)
 
 async def handle_half_sell_action(now: datetime, action: StrategyAction, *, state: dict | None = None) -> ActionResult:
     """Execute a HALF_SELL strategy action and return result metadata."""
